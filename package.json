@@ -1,0 +1,26 @@
+{
+  "name": "e3d-agent-trading-floor",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "start": "node pipeline.js",
+    "loop": "node pipeline.js --loop",
+    "dashboard": "node server.js",
+    "setup": "bash ./install.sh",
+    "package:macos": "bash ./scripts/macos/make-pkg.sh",
+    "db:up": "sh -lc 'if command -v docker-compose >/dev/null 2>&1; then docker-compose up -d mongo clickhouse; else docker compose up -d mongo clickhouse; fi'",
+    "db:down": "sh -lc 'if command -v docker-compose >/dev/null 2>&1; then docker-compose down; else docker compose down; fi'",
+    "db:logs": "sh -lc 'if command -v docker-compose >/dev/null 2>&1; then docker-compose logs -f mongo clickhouse; else docker compose logs -f mongo clickhouse; fi'",
+    "db:ps": "sh -lc 'if command -v docker-compose >/dev/null 2>&1; then docker-compose ps; else docker compose ps; fi'",
+    "check": "node --check pipeline.js",
+    "test": "npm run check"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "node-fetch": "^3.3.2"
+  }
+}
