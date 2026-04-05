@@ -1,6 +1,7 @@
 import fs from "fs";
 import http from "http";
 import path from "path";
+import os from "os";
 import { fileURLToPath } from "url";
 import { execFileSync, spawn } from "child_process";
 
@@ -23,6 +24,29 @@ const CLICKHOUSE_TABLE_NAME = process.env.E3D_CLICKHOUSE_TABLE || "training_even
 const TOKEN_METADATA_CACHE = new Map();
 const TOKEN_METADATA_TTL_MS = 6 * 60 * 60 * 1000;
 const PIPELINE_ENTRYPOINT = path.join(ROOT, "pipeline.js");
+const OPENCLAW_CONFIG_FILE = path.join(os.homedir(), ".openclaw", "openclaw.json");
+const OPENCLAW_AGENT_WORKSPACES = {
+  scout: path.join(ROOT, "scout"),
+  harvest: path.join(ROOT, "harvest"),
+  risk: path.join(ROOT, "risk"),
+  executor: path.join(ROOT, "executor")
+};
+const DEFAULT_INITIAL_CASH_USD = 100000;
+const DEFAULT_PORTFOLIO_STATE = {
+  cash_usd: DEFAULT_INITIAL_CASH_USD,
+  positions: {},
+  closed_trades: [],
+  action_history: [],
+  cooldowns: {},
+  stats: {
+    realized_pnl_usd: 0,
+    unrealized_pnl_usd: 0,
+    equity_usd: DEFAULT_INITIAL_CASH_USD,
+    peak_equity_usd: DEFAULT_INITIAL_CASH_USD,
+    max_drawdown_pct: 0,
+    market_regime: "unknown"
+  }
+};
 let pipelineProcess = null;
 let pipelineState = {
   running: false,
@@ -45,6 +69,105 @@ function readJsonFile(filePath, fallback = null) {
   }
 }
 
+function nowLocalIso() {
+  const date = new Date();
+  const offsetMinutes = -date.getTimezoneOffset();
+  const sign = offsetMinutes >= 0 ? "+" : "-";
+  const absMinutes = Math.abs(offsetMinutes);
+  const hours = String(Math.floor(absMinutes / 60)).padStart(2, "0");
+  const minutes = String(absMinutes % 60).padStart(2, "0");
+  return `${date.toISOString().slice(0, 19)}${sign}${hours}:${minutes}`;
+}
+
+function logExternalApi(stage, data) {
+  fs.appendFileSync(
+    PIPELINE_LOG,
+    JSON.stringify({ ts: nowLocalIso(), stage, data }) + "\n"
+  );
+}
+
+function writeEmptyFile(filePath) {
+  ensureDir(filePath);
+  fs.writeFileSync(filePath, "", "utf8");
+}
+
+function removeFileIfExists(filePath) {
+  try {
+    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+  } catch {
+  }
+}
+
+function ensureDir(filePath) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+}
+
+function readOpenClawConfig() {
+  return readJsonFile(OPENCLAW_CONFIG_FILE, null) || {};
+}
+
+function writeOpenClawConfig(config) {
+  ensureDir(OPENCLAW_CONFIG_FILE);
+  fs.writeFileSync(OPENCLAW_CONFIG_FILE, `${JSON.stringify(config, null, 2)}\n`, "utf8");
+}
+
+function autoConfigureOpenClaw(openaiApiKey) {
+  const config = readOpenClawConfig();
+  const nextAgents = Array.isArray(config?.agents?.list) ? [...config.agents.list] : [];
+  const nextBindings = Array.isArray(config?.bindings) ? [...config.bindings] : [];
+  const agentMap = new Map(nextAgents.map((agent) => [agent.id, agent]));
+
+  for (const [agentId, workspace] of Object.entries(OPENCLAW_AGENT_WORKSPACES)) {
+    const existing = agentMap.get(agentId) || { id: agentId, name: `E3D ${agentId[0].toUpperCase()}${agentId.slice(1)}` };
+    agentMap.set(agentId, {
+      ...existing,
+      workspace,
+      model: {
+        ...(existing.model || {}),
+        primary: existing.model?.primary || "openai/gpt-5-mini"
+      }
+    });
+  }
+
+  config.auth = config.auth || {};
+  config.auth.profiles = config.auth.profiles || {};
+  config.auth.profiles["openai:manual"] = {
+    provider: "openai",
+    mode: "token",
+    apiKey: openaiApiKey
+  };
+
+  config.agents = config.agents || {};
+  config.agents.list = Array.from(agentMap.values());
+
+  const desiredBindings = [
+    { agentId: "scout", room: "E3D_RESEARCH_ROOM" },
+    { agentId: "risk", room: "E3D_RISK_ROOM" },
+    { agentId: "harvest", room: "E3D_HARVEST_ROOM" },
+    { agentId: "executor", room: "E3D_TRADING_ROOM" }
+  ];
+
+  for (const binding of desiredBindings) {
+    const existingIndex = nextBindings.findIndex((item) => item.agentId === binding.agentId);
+    const nextBinding = {
+      agentId: binding.agentId,
+      match: {
+        channel: "discord",
+        peer: {
+          kind: "group",
+          id: binding.room
+        }
+      }
+    };
+    if (existingIndex >= 0) nextBindings[existingIndex] = nextBinding;
+    else nextBindings.push(nextBinding);
+  }
+
+  config.bindings = nextBindings;
+  writeOpenClawConfig(config);
+  return config;
+}
+
 function readJsonLines(filePath, limit = 250) {
   try {
     if (!fs.existsSync(filePath)) return [];
@@ -59,6 +182,84 @@ function readJsonLines(filePath, limit = 250) {
   } catch {
     return [];
   }
+}
+
+function clearLocalStateFiles() {
+  fs.writeFileSync(PORTFOLIO_FILE, `${JSON.stringify(DEFAULT_PORTFOLIO_STATE, null, 2)}\n`, "utf8");
+  writeEmptyFile(PIPELINE_LOG);
+  writeEmptyFile(TRAINING_EVENT_LOG);
+}
+
+function clearMongoState() {
+  try {
+    const script = `
+      const dbName = process.env.MONGO_DATABASE_NAME || ${JSON.stringify(MONGO_DATABASE_NAME)};
+      const dbRef = db.getSiblingDB(dbName);
+      try { dbRef.dropDatabase(); } catch (err) { }
+      print(JSON.stringify({ ok: true }));
+    `;
+
+    runShell("docker", [
+      "exec",
+      "-i",
+      MONGO_CONTAINER_NAME,
+      "mongosh",
+      "--quiet",
+      "--eval",
+      script
+    ], {
+      env: {
+        ...process.env,
+        MONGO_DATABASE_NAME
+      }
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function clearClickHouseState() {
+  try {
+    const query = `TRUNCATE TABLE IF EXISTS ${CLICKHOUSE_DATABASE_NAME}.${CLICKHOUSE_TABLE_NAME}`;
+    const response = fetch(`${CLICKHOUSE_HTTP_URL}/?database=${encodeURIComponent(CLICKHOUSE_DATABASE_NAME)}&query=${encodeURIComponent(query)}`, {
+      method: "POST"
+    });
+    return Boolean(response?.ok);
+  } catch {
+    return false;
+  }
+}
+
+function clearSystemState() {
+  const pipelineWasRunning = Boolean(pipelineProcess) && pipelineState.running;
+  if (pipelineWasRunning) {
+    stopPipelineProcess("SIGINT");
+  }
+
+  clearLocalStateFiles();
+  TOKEN_METADATA_CACHE.clear();
+
+  const mongoCleared = clearMongoState();
+  const clickhouseCleared = clearClickHouseState();
+
+  pipelineProcess = null;
+  setPipelineState({
+    running: false,
+    pid: null,
+    mode: "stopped",
+    started_at: null,
+    stop_requested_at: null,
+    exit_code: null,
+    signal: null,
+    last_error: null
+  });
+
+  return {
+    mongoCleared,
+    clickhouseCleared,
+    pipelineWasRunning
+  };
 }
 
 function runShell(command, args, options = {}) {
@@ -91,7 +292,7 @@ function stopPipelineProcess(signal = "SIGINT") {
   }
 
   try {
-    pipelineState.stop_requested_at = new Date().toISOString();
+    pipelineState.stop_requested_at = nowLocalIso();
     pipelineProcess.kill(signal);
   } catch (err) {
     setPipelineState({
@@ -125,7 +326,7 @@ function startPipelineProcess(intervalSeconds = 300) {
     pid: child.pid,
     mode: "loop",
     interval_seconds: safeIntervalSeconds,
-    started_at: new Date().toISOString(),
+    started_at: nowLocalIso(),
     stop_requested_at: null,
     exit_code: null,
     signal: null,
@@ -225,16 +426,24 @@ async function fetchTokenMetadata(address) {
 
   for (const url of urls) {
     try {
+      const startedAt = Date.now();
+      logExternalApi("e3d_api_request", { url, pathname: new URL(url).pathname, query: Object.fromEntries(new URL(url).searchParams.entries()) });
       const response = await fetch(url, { method: "GET" });
-      if (!response.ok) continue;
+      const durationMs = Date.now() - startedAt;
+      if (!response.ok) {
+        logExternalApi("e3d_api_error", { url, pathname: new URL(url).pathname, status: response.status, duration_ms: durationMs });
+        continue;
+      }
       const payload = await readJsonResponse(response);
       const normalized = normalizeTokenMetadata(payload, cleanAddress);
       if (normalized) {
+        logExternalApi("e3d_api_response", { url, pathname: new URL(url).pathname, status: response.status, duration_ms: durationMs });
         TOKEN_METADATA_CACHE.set(cleanAddress, { fetched_at: Date.now(), value: normalized });
         return normalized;
       }
+      logExternalApi("e3d_api_response", { url, pathname: new URL(url).pathname, status: response.status, duration_ms: durationMs, bytes: payload ? JSON.stringify(payload).length : 0 });
     } catch {
-      // Ignore and continue to the next endpoint.
+      logExternalApi("e3d_api_error", { url, pathname: new URL(url).pathname, message: "request_failed" });
     }
   }
 
@@ -380,14 +589,7 @@ function tryLoadEventsFromClickHouse() {
 async function loadPortfolioState() {
   const fromMongo = tryLoadPortfolioFromMongo();
   if (fromMongo) return fromMongo;
-  return readJsonFile(PORTFOLIO_FILE, {
-    cash_usd: 0,
-    positions: {},
-    closed_trades: [],
-    action_history: [],
-    cooldowns: {},
-    stats: {}
-  });
+  return readJsonFile(PORTFOLIO_FILE, DEFAULT_PORTFOLIO_STATE);
 }
 
 function normalizeEvent(record) {
@@ -581,6 +783,24 @@ async function handleRequest(req, res) {
     return;
   }
 
+  if (url.pathname === "/api/openclaw/configure" && req.method === "POST") {
+    const body = await readRequestJson();
+    const openaiApiKey = String(body.openai_api_key || body.openaiApiKey || "").trim();
+    if (!openaiApiKey) {
+      sendJson(res, 400, { ok: false, error: "OPENAI_API_KEY_REQUIRED" });
+      return;
+    }
+
+    const config = autoConfigureOpenClaw(openaiApiKey);
+    sendJson(res, 200, {
+      ok: true,
+      config_path: OPENCLAW_CONFIG_FILE,
+      agent_ids: Object.keys(OPENCLAW_AGENT_WORKSPACES),
+      bindings: Array.isArray(config.bindings) ? config.bindings.length : 0
+    });
+    return;
+  }
+
   if (url.pathname === "/api/pipeline/start" && req.method === "POST") {
     const body = await readRequestJson();
     const intervalSeconds = body.interval_seconds ?? body.intervalSeconds ?? 300;
@@ -593,6 +813,17 @@ async function handleRequest(req, res) {
     const stopped = stopPipelineProcess("SIGINT");
     sendJson(res, 200, {
       ok: stopped,
+      pipeline: getPipelineStatus()
+    });
+    return;
+  }
+
+  if (url.pathname === "/api/reset-all" && req.method === "POST") {
+    const result = clearSystemState();
+    sendJson(res, 200, {
+      ok: true,
+      reset_at: nowLocalIso(),
+      ...result,
       pipeline: getPipelineStatus()
     });
     return;

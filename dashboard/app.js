@@ -202,6 +202,242 @@ function MetricCard({ label, value, sublabel, tone = "" }) {
   );
 }
 
+function summarizePortfolioIntelligence(events) {
+  const list = Array.isArray(events) ? events : [];
+  const carriers = list
+    .filter((event) => ["cycle_end", "cycle_start", "harvest_decision", "candidate"].includes(event?.type) && event?.raw?.payload?.portfolio_intelligence)
+    .sort((a, b) => String(b.ts).localeCompare(String(a.ts)))
+    .map((event) => ({
+      ts: event.ts,
+      type: event.type,
+      snapshot: event.raw.payload.portfolio_intelligence
+    }));
+
+  const currentCarrier = carriers[0] || null;
+  const previousCarrier = carriers[1] || null;
+  const current = currentCarrier?.snapshot || null;
+  const previous = previousCarrier?.snapshot || null;
+
+  const holdings = Array.isArray(current?.holdings)
+    ? current.holdings.map((item) => ({
+        prompt: item?.prompt || item || {},
+        token: item?.prompt?.token || item?.token || {},
+        thesis: item?.prompt?.thesis || item?.thesis || {},
+        recommendation: item?.prompt?.recommendation || item?.recommendation || {},
+        flow: item?.prompt?.flow || item?.flow || {},
+        market_data: item?.prompt?.market_data || item?.market_data || {},
+        story_snapshot: item?.prompt?.story_snapshot || item?.story_snapshot || {},
+        summary: item?.prompt?.summary || item?.summary || null
+      }))
+    : [];
+
+  const byOpportunity = [...holdings].sort((a, b) => Number(b?.thesis?.opportunity_score || 0) - Number(a?.thesis?.opportunity_score || 0));
+  const byDecay = [...holdings].sort((a, b) => Number(b?.thesis?.decay || 0) - Number(a?.thesis?.decay || 0));
+  const topOpportunities = byOpportunity.slice(0, 3);
+  const weakPositions = byDecay.slice(0, 3);
+
+  return {
+    current,
+    previous,
+    currentCarrier,
+    previousCarrier,
+    holdings,
+    topOpportunities,
+    weakPositions,
+    changeNote: buildIntelligenceChangeNote(current, previous, topOpportunities, weakPositions)
+  };
+}
+
+function buildIntelligenceChangeNote(current, previous, topOpportunities, weakPositions) {
+  if (!current) return "No intelligence snapshot yet.";
+  if (!previous) {
+    return `Fresh intelligence snapshot generated at ${prettyDateTime(current.generated_at || null)}.`;
+  }
+
+  const currentSnapshot = current.thesis_snapshot || {};
+  const previousSnapshot = previous.thesis_snapshot || {};
+  const strengthDelta = Number(currentSnapshot.average_thesis_strength || 0) - Number(previousSnapshot.average_thesis_strength || 0);
+  const freshnessDelta = Number(currentSnapshot.average_thesis_freshness || 0) - Number(previousSnapshot.average_thesis_freshness || 0);
+  const decayDelta = Number(currentSnapshot.average_narrative_decay || 0) - Number(previousSnapshot.average_narrative_decay || 0);
+  const topSymbol = topOpportunities[0]?.token?.symbol || "—";
+  const weakSymbol = weakPositions[0]?.token?.symbol || "—";
+  const sign = (value) => `${value >= 0 ? "+" : ""}${fmtNum.format(value)}`;
+
+  return `Since the last cycle: thesis strength ${sign(strengthDelta)}, freshness ${sign(freshnessDelta)}, narrative decay ${sign(decayDelta)}. Best new focus: ${topSymbol}. Weakest current watch: ${weakSymbol}.`;
+}
+
+function IntelligenceTokenCard({ item, rank, variant = "positive" }) {
+  const prompt = item?.prompt || {};
+  const token = prompt.token || item?.token || {};
+  const thesis = prompt.thesis || item?.thesis || {};
+  const recommendation = prompt.recommendation || item?.recommendation || {};
+  const flow = prompt.flow || item?.flow || {};
+  const marketData = prompt.market_data || item?.market_data || {};
+  const storySnapshot = prompt.story_snapshot || item?.story_snapshot || {};
+  const topStories = Array.isArray(storySnapshot.top_stories) ? storySnapshot.top_stories : [];
+  const storyRows = variant === "risk"
+    ? topStories.filter((story) => /risk|warning|exit|decay|distribution/i.test(`${story?.story_type || ""} ${story?.title || ""} ${story?.subtitle || ""}`)).slice(0, 2)
+    : topStories.slice(0, 2);
+
+  return React.createElement(
+    "div",
+    { className: cls("intelligence-card", `intelligence-card-${variant}`) },
+    React.createElement(
+      "div",
+      { className: "intelligence-card-head" },
+      React.createElement(
+        "div",
+        null,
+        React.createElement("div", { className: "intelligence-card-rank" }, `#${rank}`),
+        React.createElement("div", { className: "intelligence-card-title" }, `${String(token.symbol || token.name || "—").toUpperCase()} · ${token.name || "Unnamed"}`),
+        React.createElement("div", { className: "intelligence-card-meta" }, `${token.category || "unknown"} · ${recommendation.action || "watch"}`)
+      ),
+      React.createElement("div", { className: cls("intelligence-action-pill", variant === "risk" ? "is-risk" : "is-positive") }, recommendation.action || "watch")
+    ),
+    React.createElement(
+      "div",
+      { className: "intelligence-card-stats" },
+      React.createElement("div", { className: "intelligence-stat" }, React.createElement("span", null, "Thesis"), React.createElement("strong", null, fmtNum.format(Number(thesis.strength || 0)))),
+      React.createElement("div", { className: "intelligence-stat" }, React.createElement("span", null, "Freshness"), React.createElement("strong", null, fmtNum.format(Number(thesis.freshness || 0)))),
+      React.createElement("div", { className: "intelligence-stat" }, React.createElement("span", null, "Decay"), React.createElement("strong", null, fmtNum.format(Number(thesis.decay || 0)))),
+      React.createElement("div", { className: "intelligence-stat" }, React.createElement("span", null, "Flow"), React.createElement("strong", null, fmtNum.format(Number(thesis.flow_alignment || 0))))
+    ),
+    React.createElement(
+      "div",
+      { className: "intelligence-card-body" },
+      React.createElement("div", { className: "intelligence-card-line" }, React.createElement("span", null, "Why now"), React.createElement("strong", null, recommendation.why_now || prompt.why_now || "—")),
+      React.createElement("div", { className: "intelligence-card-line" }, React.createElement("span", null, "Invalidation"), React.createElement("strong", null, recommendation.invalidation || prompt.invalidation || "—")),
+      React.createElement("div", { className: "intelligence-card-line" }, React.createElement("span", null, "Cohort"), React.createElement("strong", null, flow.wallet_cohort?.cohort_label || flow.wallet_cohort?.label || prompt.flow?.wallet_cohort_label || "—")),
+      React.createElement("div", { className: "intelligence-card-line" }, React.createElement("span", null, "Flow"), React.createElement("strong", null, flow.flow_summary?.direction || prompt.flow?.flow_direction || "neutral"))
+    ),
+    React.createElement(
+      "div",
+      { className: "intelligence-card-section" },
+      React.createElement("div", { className: "intelligence-card-section-title" }, variant === "risk" ? "Top risk stories" : "Top opportunity stories"),
+      storyRows.length
+        ? React.createElement(
+            "div",
+            { className: "intelligence-story-list" },
+            storyRows.map((story, index) => React.createElement(
+              "div",
+              { className: "intelligence-story-item", key: story?.id || `${token.contract_address || token.symbol}-${index}` },
+              React.createElement("div", { className: "intelligence-story-title" }, story?.title || story?.story_type || "Story"),
+              React.createElement("div", { className: "intelligence-story-copy" }, story?.subtitle || story?.evidence || ""),
+              story?.source_story_id ? React.createElement("div", { className: "intelligence-story-meta" }, `Source ${story.source_story_id}`) : null
+            ))
+          )
+        : React.createElement("div", { className: "intelligence-empty" }, "No supporting stories surfaced yet.")
+    ),
+    React.createElement(
+      "div",
+      { className: "intelligence-card-footer" },
+      React.createElement("div", { className: "intelligence-footer-item" }, React.createElement("span", null, "Market"), React.createElement("strong", null, `${fmtUsd.format(Number(marketData.current_price || 0))} · ${fmtNum.format(Number(marketData.change_24h_pct || 0))}%`)),
+      React.createElement("div", { className: "intelligence-footer-item" }, React.createElement("span", null, "Confidence"), React.createElement("strong", null, fmtNum.format(Number(recommendation.confidence || thesis.opportunity_score || 0)))),
+      React.createElement("div", { className: "intelligence-footer-item" }, React.createElement("span", null, "Action"), React.createElement("strong", null, recommendation.action || "watch"))
+    )
+  );
+}
+
+function IntelligencePanel({ intelligence, floorState }) {
+  const current = intelligence?.current || null;
+  const holdings = Array.isArray(intelligence?.holdings) ? intelligence.holdings : [];
+  const topOpportunities = Array.isArray(intelligence?.topOpportunities) ? intelligence.topOpportunities : [];
+  const weakPositions = Array.isArray(intelligence?.weakPositions) ? intelligence.weakPositions : [];
+
+  if (!current) {
+    return React.createElement(
+      "div",
+      { className: "card panel intelligence-panel" },
+      React.createElement(
+        "div",
+        { className: "panel-head" },
+        React.createElement("h2", null, "Intelligence"),
+        React.createElement("span", { className: "panel-note" }, "Waiting for the first dossier snapshot")
+      ),
+      React.createElement("div", { className: "empty-state" }, "Run the pipeline to populate opportunity stories, thesis state, and wallet cohorts.")
+    );
+  }
+
+  const summary = current.portfolio || current.prompt_snapshot?.portfolio || {};
+  const thesisSnapshot = current.thesis_snapshot || current.prompt_snapshot?.thesis_snapshot || {};
+  const currentGeneratedAt = current.generated_at || current.prompt_snapshot?.generated_at || null;
+
+  return React.createElement(
+    "section",
+    { className: "card panel intelligence-panel" },
+    React.createElement(
+      "div",
+      { className: "panel-head" },
+      React.createElement("h2", null, "Manager Intelligence"),
+      React.createElement("span", { className: "panel-note" }, currentGeneratedAt ? `Refreshed ${prettyAgo(currentGeneratedAt)}` : "Live dossier snapshot")
+    ),
+    React.createElement(
+      "div",
+      { className: "intelligence-summary" },
+      React.createElement("div", { className: "intelligence-summary-copy" }, current.changeNote || ""),
+      React.createElement(
+        "div",
+        { className: "intelligence-summary-notes" },
+        React.createElement("div", { className: "intelligence-summary-note" }, React.createElement("span", null, "Why in the book"), React.createElement("strong", null, topOpportunities[0]?.token?.symbol || "—")),
+        React.createElement("div", { className: "intelligence-summary-note" }, React.createElement("span", null, "Why should stay"), React.createElement("strong", null, topOpportunities[0]?.recommendation?.why_now || topOpportunities[0]?.prompt?.recommendation?.why_now || "—")),
+        React.createElement("div", { className: "intelligence-summary-note" }, React.createElement("span", null, "Why should come out"), React.createElement("strong", null, weakPositions[0]?.recommendation?.invalidation || weakPositions[0]?.prompt?.recommendation?.invalidation || "—"))
+      )
+    ),
+    React.createElement(
+      "div",
+      { className: "intelligence-metrics" },
+      React.createElement(MetricCard, { label: "Avg thesis strength", value: fmtNum.format(Number(thesisSnapshot.average_thesis_strength || 0)), sublabel: "Book-wide conviction" }),
+      React.createElement(MetricCard, { label: "Avg freshness", value: fmtNum.format(Number(thesisSnapshot.average_thesis_freshness || 0)), sublabel: "How alive the story is" }),
+      React.createElement(MetricCard, { label: "Avg decay", value: fmtNum.format(Number(thesisSnapshot.average_narrative_decay || 0)), sublabel: "Narrative deterioration" }),
+      React.createElement(MetricCard, { label: "Avg opportunity", value: fmtNum.format(Number(thesisSnapshot.average_opportunity_score || 0)), sublabel: "Decision attractiveness" }),
+      React.createElement(MetricCard, { label: "Tracked holdings", value: String(holdings.length), sublabel: "Dossier-covered positions" }),
+      React.createElement(MetricCard, { label: "Cash / equity", value: `${fmtUsd.format(Number(summary.cash_usd || 0))} / ${fmtUsd.format(Number(summary.equity_usd || 0))}`, sublabel: String(current.market_regime || "unknown").replace(/_/g, " ") })
+    ),
+    React.createElement(
+      "div",
+      { className: "intelligence-columns" },
+      React.createElement(
+        "div",
+        { className: "intelligence-column" },
+        React.createElement("div", { className: "intelligence-column-head" }, "Best opportunities"),
+        topOpportunities.length
+          ? React.createElement("div", { className: "intelligence-card-list" }, topOpportunities.map((item, index) => React.createElement(IntelligenceTokenCard, { key: item?.token?.contract_address || item?.token?.symbol || index, item, rank: index + 1, variant: "positive" })))
+          : React.createElement("div", { className: "intelligence-empty" }, "No high-conviction opportunity surfaced yet.")
+      ),
+      React.createElement(
+        "div",
+        { className: "intelligence-column" },
+        React.createElement("div", { className: "intelligence-column-head" }, "Weakest current positions"),
+        weakPositions.length
+          ? React.createElement("div", { className: "intelligence-card-list" }, weakPositions.map((item, index) => React.createElement(IntelligenceTokenCard, { key: item?.token?.contract_address || item?.token?.symbol || index, item, rank: index + 1, variant: "risk" })))
+          : React.createElement("div", { className: "intelligence-empty" }, "No weak positions flagged yet.")
+      )
+    ),
+    React.createElement(
+      "div",
+      { className: "intelligence-footnotes" },
+      React.createElement(
+        "div",
+        { className: "intelligence-footnote" },
+        React.createElement("span", null, "Desk note"),
+        React.createElement("strong", null, floorState?.latestCycle ? `Why now: ${prettyAgo(floorState.latestCycle.ts)}.` : "Why now: waiting for the next cycle.")
+      ),
+      React.createElement(
+        "div",
+        { className: "intelligence-footnote" },
+        React.createElement("span", null, "Evidence bundle"),
+        React.createElement("strong", null, topOpportunities[0]?.prompt?.story_snapshot?.top_stories?.[0]?.subtitle || topOpportunities[0]?.prompt?.story_snapshot?.top_stories?.[0]?.title || "Top dossier evidence not yet surfaced")
+      ),
+      React.createElement(
+        "div",
+        { className: "intelligence-footnote" },
+        React.createElement("span", null, "Wallet cohort"),
+        React.createElement("strong", null, topOpportunities[0]?.flow?.wallet_cohort?.cohort_label || topOpportunities[0]?.flow?.wallet_cohort?.label || current?.holdings?.[0]?.prompt?.flow?.wallet_cohort_label || "unknown")
+      )
+    )
+  );
+}
+
 function LaneConnector({ active = false, reverse = false }) {
   return React.createElement(
     "div",
@@ -507,6 +743,51 @@ function MilestoneBadge({ item }) {
   );
 }
 
+function SettingsDialog({ open, openaiKey, onOpenaiKeyChange, onClose, onSave, saving, message, error }) {
+  if (!open) return null;
+
+  return React.createElement(
+    "div",
+    { className: "settings-backdrop", onClick: onClose },
+    React.createElement(
+      "div",
+      { className: "card settings-dialog", onClick: (event) => event.stopPropagation() },
+      React.createElement(
+        "div",
+        { className: "settings-head" },
+        React.createElement("div", null,
+          React.createElement("div", { className: "settings-title" }, "OpenClaw setup"),
+          React.createElement("div", { className: "settings-subtitle" }, "Enter your OpenAI key and write the OpenClaw config for `pipeline.js`.")
+        ),
+        React.createElement("button", { className: "button button-secondary settings-close", onClick: onClose }, "✕")
+      ),
+      React.createElement(
+        "label",
+        { className: "settings-field" },
+        React.createElement("span", { className: "settings-label" }, "OpenAI key"),
+        React.createElement("input", {
+          className: "settings-input",
+          type: "password",
+          autoComplete: "off",
+          spellCheck: "false",
+          placeholder: "sk-...",
+          value: openaiKey,
+          onChange: (event) => onOpenaiKeyChange(event.target.value)
+        })
+      ),
+      React.createElement(
+        "div",
+        { className: "settings-actions" },
+        React.createElement("button", { className: "button button-primary", onClick: onSave, disabled: saving || !openaiKey.trim() }, saving ? "Saving…" : "Auto-configure OpenClaw"),
+        React.createElement("button", { className: "button button-secondary", onClick: onClose }, "Close")
+      ),
+      message ? React.createElement("div", { className: "settings-message" }, message) : null,
+      error ? React.createElement("div", { className: "settings-error" }, error) : null,
+      React.createElement("div", { className: "settings-note" }, "The key is sent to the local dashboard server so it can write ~/.openclaw/openclaw.json with the E3D agent workspace bindings.")
+    )
+  );
+}
+
 function App() {
   const [summary, setSummary] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -517,6 +798,11 @@ function App() {
   const [intervalSeconds, setIntervalSeconds] = useState(300);
   const [pipelineMessage, setPipelineMessage] = useState(null);
   const [pipelineError, setPipelineError] = useState(null);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [openaiKey, setOpenaiKey] = useState("");
+  const [settingsSaving, setSettingsSaving] = useState(false);
+  const [settingsMessage, setSettingsMessage] = useState(null);
+  const [settingsError, setSettingsError] = useState(null);
 
   async function load() {
     try {
@@ -541,6 +827,47 @@ function App() {
       setPipelineStatus(data);
     } catch (err) {
       setPipelineError(err.message);
+    }
+  }
+
+  async function resetSystem() {
+    const confirmed = typeof window !== "undefined" ? window.confirm("Reset the entire trading floor? This will stop the pipeline, clear MongoDB, ClickHouse, and local logs.") : true;
+    if (!confirmed) return;
+
+    try {
+      setPipelineError(null);
+      setPipelineMessage(null);
+      setError(null);
+      const res = await fetch("/api/reset-all", { method: "POST" });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+      setPipelineStatus(data.pipeline || null);
+      setPipelineMessage("Trading floor reset complete.");
+      await Promise.all([load(), loadPipelineStatus()]);
+    } catch (err) {
+      setPipelineError(err.message);
+    }
+  }
+
+  async function saveOpenClawSettings() {
+    try {
+      setSettingsError(null);
+      setSettingsMessage(null);
+      setSettingsSaving(true);
+      const res = await fetch("/api/openclaw/configure", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ openai_api_key: openaiKey })
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+      setSettingsMessage(`Wrote ${data.config_path}`);
+      setOpenaiKey("");
+      setSettingsOpen(false);
+    } catch (err) {
+      setSettingsError(err.message);
+    } finally {
+      setSettingsSaving(false);
     }
   }
 
@@ -604,6 +931,7 @@ function App() {
   const positions = portfolio.positions || [];
   const history = portfolio.history || [];
   const floorState = useMemo(() => summarizeActivity(events), [events]);
+  const intelligence = useMemo(() => summarizePortfolioIntelligence(events), [events]);
   const lanes = buildTradingLanes(floorState, portfolio);
   const latestCycleAt = floorState.latestCycle?.ts ? new Date(floorState.latestCycle.ts).getTime() : 0;
   const isPipelineLive = Number.isFinite(latestCycleAt) && latestCycleAt > 0 && (Date.now() - latestCycleAt) <= 3 * 60 * 1000;
@@ -764,6 +1092,7 @@ function App() {
   const portfolioPage = React.createElement(
     React.Fragment,
     null,
+    React.createElement(IntelligencePanel, { intelligence, floorState }),
     React.createElement(
       "section",
       { className: "page-grid page-grid-portfolio" },
@@ -819,6 +1148,7 @@ function App() {
             React.createElement("button", { className: cls("button", page === "portfolio" && "button-active"), onClick: () => goToPage("portfolio") }, "Portfolio"),
             React.createElement("button", { className: cls("button", page === "orbit" && "button-active"), onClick: () => goToPage("orbit") }, "Orbit + trail"),
             React.createElement("button", { className: "button button-primary", onClick: load }, "Refresh now"),
+            React.createElement("button", { className: "button button-secondary gear-button", onClick: () => setSettingsOpen(true), title: "OpenClaw settings" }, "⚙ Settings"),
             React.createElement("a", { className: "button button-secondary", href: "/api/activity", target: "_blank", rel: "noreferrer" }, "Raw activity API")
           )
         ),
@@ -894,6 +1224,11 @@ function App() {
               "button",
               { className: "button button-secondary", onClick: stopPipeline, disabled: !pipelineRunning },
               "Stop pipeline"
+            ),
+            React.createElement(
+              "button",
+              { className: "button button-danger", onClick: resetSystem },
+              "Reset all"
             )
           ),
           React.createElement("div", { className: "pipeline-controls-note" }, "Starts `node pipeline.js --loop` with your chosen interval."),
@@ -902,7 +1237,17 @@ function App() {
           pipelineStatus?.pid ? React.createElement("div", { className: "pipeline-controls-meta" }, `PID ${pipelineStatus.pid}`) : null
         )
       ),
-      page === "orbit" ? orbitPage : portfolioPage
+      page === "orbit" ? orbitPage : portfolioPage,
+      React.createElement(SettingsDialog, {
+        open: settingsOpen,
+        openaiKey,
+        onOpenaiKeyChange: setOpenaiKey,
+        onClose: () => setSettingsOpen(false),
+        onSave: saveOpenClawSettings,
+        saving: settingsSaving,
+        message: settingsMessage,
+        error: settingsError
+      })
     )
   );
 }
