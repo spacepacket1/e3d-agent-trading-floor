@@ -1787,17 +1787,40 @@ function parseAgentWrapper(stdout, agentId) {
   }
 }
 
-function callAgent(agentId, message) {
-  const stdout = execFileSync(
-    "openclaw",
-    ["agent", "--agent", agentId, "--message", message, "--json"],
-    {
-      encoding: "utf8",
-      maxBuffer: 10 * 1024 * 1024
-    }
-  );
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
 
-  return parseAgentWrapper(stdout, agentId);
+function isRateLimitError(err) {
+  const msg = String(err?.message || err || "").toLowerCase();
+  return msg.includes("rate limit") || msg.includes("rate_limit") || msg.includes("too many requests");
+}
+
+function callAgent(agentId, message, { maxRetries = 3, retryDelayMs = 60000 } = {}) {
+  let lastErr;
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      const stdout = execFileSync(
+        "openclaw",
+        ["agent", "--agent", agentId, "--message", message, "--json"],
+        {
+          encoding: "utf8",
+          maxBuffer: 10 * 1024 * 1024
+        }
+      );
+      return parseAgentWrapper(stdout, agentId);
+    } catch (err) {
+      lastErr = err;
+      if (isRateLimitError(err) && attempt < maxRetries) {
+        const waitSec = Math.round((retryDelayMs * attempt) / 1000);
+        console.log(`⏳ ${agentId} rate limited (attempt ${attempt}/${maxRetries}). Waiting ${waitSec}s before retry...`);
+        sleepSync(retryDelayMs * attempt);
+      } else if (!isRateLimitError(err)) {
+        throw err;
+      }
+    }
+  }
+  throw lastErr;
 }
 
 function buildScoutPrompt(portfolio, portfolioIntelligence = null) {
