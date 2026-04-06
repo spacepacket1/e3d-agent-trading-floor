@@ -2642,7 +2642,6 @@ function buildDebugHandoffSnapshot(portfolio, portfolioIntelligence, runContext 
       handoff_message: scoutMessage,
       handoff_length: scoutMessage.length,
       intel_urls: scoutIntelUrls,
-      intel_debug: scoutIntel,
       candidate_debug: scoutCandidateDebug
     },
     harvest: {
