@@ -1816,35 +1816,9 @@ function buildScoutPrompt(portfolio, portfolioIntelligence = null) {
       .filter(Boolean)
   );
 
-  const marketGainers = summarizeTrendingTokens(fetchJson("/fetchTokenPricesWithHistoryAllRanges", {
-    dataSource: E3D_TOKENS_DATA_SOURCE,
-    sortBy: "change_30m_pct",
-    sortDir: "desc",
-    limit: 50
-  }), "gainers", 8)
-    .filter((token) => token?.contract_address && !heldAddresses.has(token.contract_address) && !heldSymbols.has(String(token?.symbol || "").toLowerCase()));
-
-  const marketLosers = summarizeTrendingTokens(fetchJson("/fetchTokenPricesWithHistoryAllRanges", {
-    dataSource: E3D_TOKENS_DATA_SOURCE,
-    sortBy: "change_30m_pct",
-    sortDir: "asc",
-    limit: 50
-  }), "losers", 5)
-    .filter((token) => token?.contract_address && !heldAddresses.has(token.contract_address) && !heldSymbols.has(String(token?.symbol || "").toLowerCase()));
-
-  const recentTransactions = summarizeTransactions(fetchJson("/fetchTransactionsDB", {
-    dataSource: E3D_TRANSACTIONS_DATA_SOURCE,
-    limit: 12
-  }), "fetchTransactionsDB", 8);
-
-  const marketIntel = {
-    top_gainers: marketGainers,
-    top_losers: marketLosers,
-    recent_transactions: recentTransactions,
-    exclusions: {
-      already_held_symbols: Array.from(heldSymbols).slice(0, 12),
-      already_held_addresses: Array.from(heldAddresses).slice(0, 12)
-    }
+  const exclusions = {
+    held_symbols: Array.from(heldSymbols).slice(0, 20),
+    held_addresses: Array.from(heldAddresses).slice(0, 20)
   };
 
   const holdings = dossier.holdings.slice(0, 8).map((item) => ({
@@ -1871,10 +1845,15 @@ function buildScoutPrompt(portfolio, portfolioIntelligence = null) {
     "Use story, flow, thesis, and market context. Prefer explicit opportunity evidence over raw momentum.",
     "Do not include any already-held token in candidates.",
     "If nothing qualifies, return candidates: [].",
-    "Market intel to prioritize for candidate discovery:",
-    JSON.stringify(marketIntel),
+    "EXCLUSIONS — never include these tokens in candidates:",
+    JSON.stringify(exclusions),
+    "REQUIRED RESEARCH — use WebFetch (endpoints in TOOLS.md) before producing output:",
+    "1. Fetch 30m gainers and losers. Filter against exclusions.",
+    "2. For each promising token: fetch opportunity-stories, risk-stories, and flow/summary.",
+    "3. Score candidates from evidence — use real computed values, not placeholder zeros.",
+    "4. Verify invalidation and liquidity for every candidate before including it.",
     "Requirements: lowercase 0x addresses, no spaces in addresses, valid JSON, one object only.",
-    "Required shape:",
+    "Required shape (fill all numeric fields with real values from your research):",
     JSON.stringify({
       scan_timestamp: createdAt,
       candidates: [
@@ -1946,38 +1925,45 @@ function buildHarvestPrompt(portfolio, portfolioIntelligence = null) {
     thesis: item?.thesis || null,
     recommendation: item?.recommendation || null
   }));
+  const compactHoldings = dossier.holdings.slice(0, 8).map((item) => ({
+    symbol: item?.token?.symbol || null,
+    contract_address: item?.token?.contract_address || null,
+    category: item?.token?.category || "unknown",
+    thesis_strength: item?.thesis?.strength ?? null,
+    thesis_freshness: item?.thesis?.freshness ?? null,
+    narrative_decay: item?.thesis?.decay ?? null,
+    opportunity_score: item?.thesis?.opportunity_score ?? null,
+    flow_alignment: item?.thesis?.flow_alignment ?? null,
+    fraud_risk: item?.thesis?.fraud_risk ?? null,
+    liquidity_quality: item?.thesis?.liquidity_quality ?? null,
+    recommendation_action: item?.recommendation?.action || null,
+    why_now: item?.recommendation?.why_now || null
+  }));
   const portfolioBaseline = {
     market_regime: dossier.market_regime,
     portfolio: dossier.prompt_snapshot.portfolio,
     thesis_snapshot: dossier.prompt_snapshot.thesis_snapshot,
-    holdings: dossier.holdings.map((item) => item.prompt)
+    holdings: compactHoldings
   };
 
   const taskPrompt = `
-You are Harvest.
+You are Harvest. Return STRICT JSON only.
 
 Your job:
-1. Use the shared portfolio intelligence dossier as the baseline for every held position
-2. Review every held token for profit-taking, thesis decay, liquidity deterioration, narrative exhaustion, and opportunity-cost rotation
-3. Classify every position as hold, monitor, trim, or exit using the evidence in the dossier and the live E3D token APIs
-4. Return STRICT JSON only
+1. Use the pre-computed thesis scores in the dossier as the baseline for every held position
+2. Fetch live risk stories, flow, and wallet signals via WebFetch (endpoints in TOOLS.md) for each position
+3. Classify every position as hold, monitor, trim, or exit using live evidence vs the baseline scores
+4. Return STRICT JSON only — no markdown, no questions, no buy ideas
 
-DO NOT:
-- ask questions
-- return markdown
-- return partial data
-- originate buy ideas
+REQUIRED RESEARCH — use WebFetch for each held position before classifying:
+- Risk stories:  https://e3d.ai/api/risk-stories?token_address={address}&chain=ethereum&limit=4
+- Flow summary:  https://e3d.ai/api/flow/summary?token_address={address}
+- Wallet cohort: https://e3d.ai/api/wallet-cohorts/{address}
+For ambiguous positions, also fetch opportunity-stories and token-info (see TOOLS.md for all endpoints).
+For market context: fetch 30m gainers and losers (see TOOLS.md).
 
-PRIMARY RESEARCH FEEDS:
-- Use GET /api/token/:address for each held position
-- Use the shared dossier below for story strength, thesis health, wallet flow, and comparison against the weakest current holdings
-- For market context, compare against:
-  - https://e3d.ai/api/fetchTokenPricesWithHistoryAllRanges?sortBy=change_30m_pct&sortDir=desc&limit=50&offset=0&hideNoCirc=1
-  - https://e3d.ai/api/fetchTokenPricesWithHistoryAllRanges?sortBy=change_30m_pct&sortDir=asc&limit=50&offset=0&hideNoCirc=1
-
-PORTFOLIO INTELLIGENCE DOSSIER:
-Use this as the baseline for thesis decay, flow deterioration, hold decisions, and trim/exit comparisons.
-${JSON.stringify(portfolioBaseline, null, 2)}
+PORTFOLIO INTELLIGENCE DOSSIER (pre-computed baseline scores):
+${JSON.stringify(portfolioBaseline)}
 
 DECISION PRINCIPLES:
 - hold when thesis strength, freshness, and flow remain intact
@@ -1993,160 +1979,49 @@ POSITION REVIEW RULES:
 - compare each position against the weakest holding and the strongest alternative when deciding whether to trim or exit
 - surface the single strongest invalidation condition for each position
 
-Current held positions to review:
+Current held positions (use these for position fields in your output):
 ${JSON.stringify(positions)}
 
-Return EXACTLY this shape:
-
+Return EXACTLY this shape — one JSON object, no markdown:
 {
   "scan_timestamp": "${createdAt}",
-  "portfolio_summary": {
-    "market_regime": "...",
-    "cash_usd": 0,
-    "equity_usd": 0,
-    "position_count": 0,
-    "tracked_positions": 0,
-    "average_thesis_strength": 0,
-    "average_thesis_freshness": 0,
-    "average_narrative_decay": 0,
-    "average_opportunity_score": 0
-  },
+  "portfolio_summary": { "market_regime": string, "cash_usd": number, "equity_usd": number, "position_count": number, "tracked_positions": number, "average_thesis_strength": number, "average_thesis_freshness": number, "average_narrative_decay": number, "average_opportunity_score": number },
   "position_reviews": [
     {
-      "proposal_version": "1.0",
-      "source_agent": "harvest",
-      "created_at": "${createdAt}",
-      "expires_at": "${expiresAt}",
-      "token": {
-        "symbol": "...",
-        "name": "...",
-        "chain": "ethereum",
-        "contract_address": "...",
-        "category": "..."
-      },
-      "position": {
-        "quantity": 0,
-        "avg_entry_price": 0,
-        "current_price": 0,
-        "market_value_usd": 0,
-        "cost_basis_usd": 0,
-        "unrealized_pnl_usd": 0
-      },
-      "action": "hold",
-      "thesis_state": "confirmed",
-      "thesis_summary": "...",
-      "what_changed": "...",
-      "why_now": "...",
-      "confidence": 0,
-      "conviction_score": 0,
-      "opportunity_score": 0,
-      "review_priority": 0,
-      "summary": "...",
-      "evidence": ["..."],
-      "risks": ["..."],
-      "what_would_change_my_mind": ["..."],
-      "next_best_alternative": "...",
-      "current_regime": "neutral",
-      "market_data": {
-        "current_price": 0,
-        "change_24h_pct": 0,
-        "price_timestamp": "${createdAt}",
-        "price_source": "e3d",
-        "volume_24h_usd": 0,
-        "market_cap_usd": 0
-      },
-      "liquidity_data": {
-        "liquidity_usd": 0,
-        "liquidity_timestamp": "${createdAt}",
-        "liquidity_source": "e3d"
-      },
-      "narrative_data": {
-        "story_strength": 0,
-        "thesis_health": 0,
-        "flow_direction": "neutral"
-      },
-      "portfolio_data": {
-        "current_token_exposure_pct": 0.0,
-        "current_category_exposure_pct": 0.0,
-        "current_total_exposure_pct": 0.0,
-        "portfolio_timestamp": "${createdAt}",
-        "portfolio_source": "system"
-      }
+      "proposal_version": "1.0", "source_agent": "harvest", "created_at": "${createdAt}", "expires_at": "${expiresAt}",
+      "token": { "symbol": string, "name": string, "chain": "ethereum", "contract_address": string, "category": string },
+      "position": { "quantity": number, "avg_entry_price": number, "current_price": number, "market_value_usd": number, "cost_basis_usd": number, "unrealized_pnl_usd": number },
+      "action": "hold"|"monitor"|"trim"|"exit",
+      "thesis_state": "confirmed"|"watch"|"weak"|"decaying",
+      "thesis_summary": string, "what_changed": string, "why_now": string,
+      "confidence": number(0-100), "conviction_score": number(0-100), "opportunity_score": number(0-100), "review_priority": number(1-5),
+      "summary": string, "evidence": string[], "risks": string[], "what_would_change_my_mind": string[], "next_best_alternative": string,
+      "current_regime": string,
+      "market_data": { "current_price": number, "change_24h_pct": number, "price_timestamp": string, "price_source": string, "volume_24h_usd": number, "market_cap_usd": number },
+      "liquidity_data": { "liquidity_usd": number, "liquidity_timestamp": string, "liquidity_source": string },
+      "narrative_data": { "story_strength": number(0-100), "thesis_health": number(0-100), "flow_direction": string },
+      "portfolio_data": { "current_token_exposure_pct": number, "current_category_exposure_pct": number, "current_total_exposure_pct": number, "portfolio_timestamp": string, "portfolio_source": "system" }
     }
   ],
   "exit_candidates": [
     {
-      "proposal_version": "1.0",
-      "source_agent": "harvest",
-      "created_at": "${createdAt}",
-      "expires_at": "${expiresAt}",
-      "token": {
-        "symbol": "...",
-        "name": "...",
-        "chain": "ethereum",
-        "contract_address": "...",
-        "category": "..."
-      },
-      "position": {
-        "quantity": 0,
-        "avg_entry_price": 0,
-        "current_price": 0,
-        "market_value_usd": 0,
-        "cost_basis_usd": 0,
-        "unrealized_pnl_usd": 0
-      },
-      "setup_type": "profit_take",
-      "edge_source": "thesis_decay",
-      "action": "trim",
-      "confidence": 0,
-      "conviction_score": 0,
-      "opportunity_score": 0,
-      "exit_priority": 0,
-      "suggested_exit_fraction": 0.5,
-      "target_exit_price": 0,
-      "decision_price": 0,
-      "summary": "...",
-      "why_now": "...",
-      "evidence": ["..."],
-      "risks": ["..."],
-      "what_would_change_my_mind": ["..."],
-      "next_best_alternative": "...",
-      "current_regime": "neutral",
-      "market_data": {
-        "current_price": 0,
-        "change_24h_pct": 0,
-        "price_timestamp": "${createdAt}",
-        "price_source": "e3d",
-        "volume_24h_usd": 0,
-        "market_cap_usd": 0
-      },
-      "liquidity_data": {
-        "liquidity_usd": 0,
-        "liquidity_timestamp": "${createdAt}",
-        "liquidity_source": "e3d"
-      },
-      "narrative_data": {
-        "story_strength": 0,
-        "thesis_health": 0,
-        "flow_direction": "neutral"
-      },
-      "portfolio_data": {
-        "current_token_exposure_pct": 0.0,
-        "current_category_exposure_pct": 0.0,
-        "current_total_exposure_pct": 0.0,
-        "portfolio_timestamp": "${createdAt}",
-        "portfolio_source": "system"
-      }
+      "proposal_version": "1.0", "source_agent": "harvest", "created_at": "${createdAt}", "expires_at": "${expiresAt}",
+      "token": { "symbol": string, "name": string, "chain": "ethereum", "contract_address": string, "category": string },
+      "position": { "quantity": number, "avg_entry_price": number, "current_price": number, "market_value_usd": number, "cost_basis_usd": number, "unrealized_pnl_usd": number },
+      "setup_type": string, "edge_source": string, "action": "trim"|"exit",
+      "confidence": number(0-100), "conviction_score": number(0-100), "opportunity_score": number(0-100), "exit_priority": number(1-5),
+      "suggested_exit_fraction": number(0-1), "target_exit_price": number, "decision_price": number,
+      "summary": string, "why_now": string, "evidence": string[], "risks": string[], "what_would_change_my_mind": string[], "next_best_alternative": string,
+      "current_regime": string,
+      "market_data": { "current_price": number, "change_24h_pct": number, "price_timestamp": string, "price_source": string, "volume_24h_usd": number, "market_cap_usd": number },
+      "liquidity_data": { "liquidity_usd": number, "liquidity_timestamp": string, "liquidity_source": string },
+      "narrative_data": { "story_strength": number(0-100), "thesis_health": number(0-100), "flow_direction": string },
+      "portfolio_data": { "current_token_exposure_pct": number, "current_category_exposure_pct": number, "current_total_exposure_pct": number, "portfolio_timestamp": string, "portfolio_source": "system" }
     }
   ]
 }
 
-FINAL CHECK BEFORE OUTPUT:
-- JSON parses
-- all contract addresses valid and without spaces
-- position_reviews length should cover all held positions
-- exit_candidates length <= 5
-- only one JSON object returned
+RULES: position_reviews covers every held position — exit_candidates only for trim/exit — valid lowercase addresses — one object only.
 `.trim();
 
   return withAgentContext("harvest", taskPrompt);

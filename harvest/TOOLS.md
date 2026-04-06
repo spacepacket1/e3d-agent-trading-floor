@@ -1,25 +1,31 @@
 # TOOLS.md — Harvest
 
-You may use read-only E3D intelligence tools.
+Use WebFetch for all E3D data. Never execute transactions, place orders, or originate buy ideas.
 
-Preferred tool categories:
-- token detail lookup
-- price history
-- liquidity and swap analytics
-- wallet flow analysis
-- holder concentration analysis
-- narrative / story / thesis layers
-- market context and top gainers / losers views
-- portfolio position inspection
+## Base URL: https://e3d.ai/api
 
-You must not execute transactions.
-You must not mutate portfolio state.
-You must not place orders.
-You must not originate buy ideas.
+### Per-Held-Position Research ({address} = lowercase 0x contract address)
+- Token detail:        `https://e3d.ai/api/token-info/{address}`
+- Evidence bundle:     `https://e3d.ai/api/evidence/token/{address}`
+- Opportunity stories: `https://e3d.ai/api/opportunity-stories?token_address={address}&chain=ethereum&limit=4`
+- Risk stories:        `https://e3d.ai/api/risk-stories?token_address={address}&chain=ethereum&limit=4`
+- Theses:              `https://e3d.ai/api/theses?token_address={address}&limit=3`
+- Flow summary:        `https://e3d.ai/api/flow/summary?token_address={address}`
+- Wallet cohort:       `https://e3d.ai/api/wallet-cohorts/{address}`
+- Counterparties:      `https://e3d.ai/api/tokenCounterparties?token={address}&limit=5`
+- Transactions:        `https://e3d.ai/api/fetchTransactionsDB?dataSource=1&search={address}&limit=25`
 
-When producing an actionable exit idea:
-1. verify token identity
-2. verify liquidity reality
-3. verify thesis decay or profit stretch
-4. verify the proposed exit fraction is practical
-5. emit proposal JSON exactly
+### Market Context (opportunity-cost comparison)
+- 30m gainers: `https://e3d.ai/api/fetchTokenPricesWithHistoryAllRanges?dataSource=1&sortBy=change_30m_pct&sortDir=desc&limit=50`
+- 30m losers:  `https://e3d.ai/api/fetchTokenPricesWithHistoryAllRanges?dataSource=1&sortBy=change_30m_pct&sortDir=asc&limit=50`
+
+### Token Lookup
+- Identity:  `https://e3d.ai/api/addressMeta?address={address}`
+- By symbol: `https://e3d.ai/api/fetchTokensDB?dataSource=1&search={symbol}&limit=10&offset=0`
+
+## Research Protocol
+1. For each held position: fetch risk-stories + flow/summary + wallet-cohort
+2. Compare live signals against the pre-computed thesis scores in context
+3. Fetch opportunity-stories only if flow or risk signals are ambiguous
+4. Fetch market context to evaluate opportunity-cost for any trim/exit candidates
+5. Verify exit fraction is practical given current liquidity before recommending trim/exit
