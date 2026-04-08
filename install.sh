@@ -45,15 +45,9 @@ log "Starting local databases"
 log "Validating pipeline syntax"
 npm run check
 
-if command -v openclaw >/dev/null 2>&1; then
-  log "OpenClaw CLI detected"
-else
-  warn "OpenClaw CLI was not found on PATH. The pipeline will need it to run the agents."
-fi
-
 log "Installation complete"
 printf '\nNext steps:\n'
+printf '  - Ensure your LLM server is running on port 5050 (or set LLM_BASE_URL)\n'
 printf '  - Start the dashboard: npm run dashboard\n'
 printf '  - Start the pipeline loop: npm run loop\n'
 printf '  - View local DB status: npm run db:ps\n'
-printf '\nThis installer leaves your external OpenClaw configuration alone.\n'
