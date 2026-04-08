@@ -27,6 +27,14 @@ const E3D_DOSSIER_CACHE_TTL_MS = 10 * 60 * 1000;
 const E3D_DOSSIER_MAX_POSITIONS = 5;
 const E3D_DOSSIER_MAX_STORIES = 4;
 const E3D_DOSSIER_MAX_COUNTERPARTIES = 5;
+
+// Rate-limit budget management.
+// Tiers: free=50/day @5000ms, premium=500/day @1000ms, enterprise=1000/day @10ms
+// Default to premium-safe: 1100ms between requests, max 450 per run (leaves 50 buffer).
+const E3D_REQUEST_MIN_INTERVAL_MS = Number(process.env.E3D_REQUEST_MIN_INTERVAL_MS || 1100);
+const E3D_REQUEST_DAILY_BUDGET = Number(process.env.E3D_REQUEST_DAILY_BUDGET || 450);
+let _e3dRequestCount = 0;
+let _e3dLastRequestAt = 0;
 const E3D_DOSSIER_CACHE = new Map();
 const E3D_API_DEBUG = process.env.E3D_API_DEBUG === "1" || process.env.E3D_DEBUG === "1";
 let ACTIVE_TRAINING_CONTEXT = null;
@@ -999,10 +1007,25 @@ function buildUrl(baseUrl, pathname, query = {}) {
 }
 
 function fetchJson(pathname, query = {}, fallback = null) {
+  // Enforce daily budget
+  if (_e3dRequestCount >= E3D_REQUEST_DAILY_BUDGET) {
+    log("e3d_api_budget_exceeded", { count: _e3dRequestCount, budget: E3D_REQUEST_DAILY_BUDGET });
+    return fallback;
+  }
+
+  // Enforce minimum interval between requests
+  const now = Date.now();
+  const elapsed = now - _e3dLastRequestAt;
+  if (_e3dLastRequestAt > 0 && elapsed < E3D_REQUEST_MIN_INTERVAL_MS) {
+    sleepSync(E3D_REQUEST_MIN_INTERVAL_MS - elapsed);
+  }
+  _e3dLastRequestAt = Date.now();
+  _e3dRequestCount++;
+
   const url = buildUrl(E3D_API_BASE_URL, pathname, query);
   try {
     const startedAt = Date.now();
-    log("e3d_api_request", { url, pathname, query });
+    log("e3d_api_request", { url, pathname, query, req_num: _e3dRequestCount });
     const marker = "__E3D_HTTP_STATUS__";
     const stdout = runShell("curl", ["-s", "--max-time", "12", "-L", "-o", "-", "-w", `${marker}%{http_code}`, ...buildCurlAuthArgs(url), url]);
     const output = String(stdout || "");
@@ -1448,6 +1471,23 @@ function setCachedDossier(cacheKey, value) {
   });
 }
 
+// Shared market context fetched once per cycle and passed into per-position dossiers.
+// Avoids re-fetching gainers/losers/token-universe for every held position.
+let _cycleMarketContext = null;
+
+function getOrFetchCycleMarketContext() {
+  if (_cycleMarketContext) return _cycleMarketContext;
+  const tokenUniverse = endpointArray(fetchJson("/fetchTokensDB", { dataSource: E3D_TOKENS_DATA_SOURCE, limit: 50, offset: 0 }));
+  const trendingGainers = summarizeTrendingTokens(fetchJson("/fetchTokenPricesWithHistoryAllRanges", {
+    dataSource: E3D_TOKENS_DATA_SOURCE, sortBy: "change_30m_pct", sortDir: "desc", limit: 50
+  }), "gainers", 10);
+  const trendingLosers = summarizeTrendingTokens(fetchJson("/fetchTokenPricesWithHistoryAllRanges", {
+    dataSource: E3D_TOKENS_DATA_SOURCE, sortBy: "change_30m_pct", sortDir: "asc", limit: 50
+  }), "losers", 8);
+  _cycleMarketContext = { tokenUniverse, trendingGainers, trendingLosers };
+  return _cycleMarketContext;
+}
+
 function buildTokenIntelligenceDossier(position, portfolio, options = {}) {
   const address = cleanAddress(position?.contract_address || position?.address || "");
   const symbol = String(position?.symbol || position?.token?.symbol || options?.symbol || "").trim();
@@ -1456,49 +1496,31 @@ function buildTokenIntelligenceDossier(position, portfolio, options = {}) {
   const cached = getCachedDossier(cacheKey);
   if (cached) return cached;
 
-  const tokenUniverse = endpointArray(fetchJson("/fetchTokensDB", { dataSource: E3D_TOKENS_DATA_SOURCE, limit: 50, offset: 0 }));
+  // Use shared cycle-level market data — 3 calls instead of 3 × N positions
+  const { tokenUniverse, trendingGainers, trendingLosers } = getOrFetchCycleMarketContext();
+  const marketFeed = mergeUniqueTokens(trendingGainers, trendingLosers, tokenUniverse);
+
   const identity = address ? fetchJson("/addressMeta", { address }) : null;
   const tokenInfo = address ? fetchJson(`/token-info/${encodeURIComponent(address)}`) : null;
-  const trendingGainers = summarizeTrendingTokens(fetchJson("/fetchTokenPricesWithHistoryAllRanges", {
-    dataSource: E3D_TOKENS_DATA_SOURCE,
-    sortBy: "change_30m_pct",
-    sortDir: "desc",
-    limit: 50
-  }), "gainers", 10);
-  const trendingLosers = summarizeTrendingTokens(fetchJson("/fetchTokenPricesWithHistoryAllRanges", {
-    dataSource: E3D_TOKENS_DATA_SOURCE,
-    sortBy: "change_30m_pct",
-    sortDir: "asc",
-    limit: 50
-  }), "losers", 8);
-  const tokenSearchFeed = symbol ? endpointArray(fetchJson("/fetchTokensDB", { dataSource: E3D_TOKENS_DATA_SOURCE, search: symbol, limit: 10, offset: 0 })) : [];
-  const marketFeed = mergeUniqueTokens(
-    trendingGainers,
-    trendingLosers,
-    tokenSearchFeed,
-    tokenUniverse
-  );
   const recentTransactions = endpointArray(fetchJson("/fetchTransactionsDB", {
     dataSource: E3D_TRANSACTIONS_DATA_SOURCE,
     search: address || symbol || undefined,
     limit: 25
   }));
   const capabilityEvidence = address ? fetchJson(`/evidence/token/${encodeURIComponent(address)}`) : null;
+  // Fetch primary stories only — merging scope=any and symbol-based calls added 2 extra calls
+  // per position for data that largely overlaps with scope=primary.
   const tokenStories = address ? endpointArray(fetchJson("/stories", { q: address, scope: "primary", limit: E3D_DOSSIER_MAX_STORIES })) : [];
   const thesisRows = address ? endpointArray(fetchJson("/stories", { q: address, scope: "primary", type: "THESIS", limit: 3 })) : [];
   const walletCohort = address ? fetchJson(`/wallet-cohorts/${encodeURIComponent(address)}`) : null;
   const flowSummary = address ? fetchJson("/flow/summary", { token_address: address }) : null;
   const counterparties = address ? summarizeCounterparties(fetchJson("/addressCounterparties", { address, limit: E3D_DOSSIER_MAX_COUNTERPARTIES })) : [];
   const tokenCounterparties = address ? summarizeCounterparties(fetchJson("/tokenCounterparties", { token: address, limit: E3D_DOSSIER_MAX_COUNTERPARTIES })) : [];
-  const legacyStoriesByAddress = address ? endpointArray(fetchJson("/stories", { q: address, scope: "any", limit: E3D_DOSSIER_MAX_STORIES })) : [];
-  const legacyStoriesBySymbol = symbol ? endpointArray(fetchJson("/stories", { q: symbol, scope: "any", limit: E3D_DOSSIER_MAX_STORIES })) : [];
   const capabilityStories = mergeUniqueStories(
     endpointArray(capabilityEvidence?.stories),
     endpointArray(capabilityEvidence?.storys),
     tokenStories,
-    thesisRows,
-    legacyStoriesByAddress,
-    legacyStoriesBySymbol
+    thesisRows
   );
   const stories = summarizeStories(capabilityStories, "dossier", E3D_DOSSIER_MAX_STORIES);
   const marketData = extractMarketSnapshot(position, identity, tokenInfo, marketFeed);
@@ -3090,6 +3112,9 @@ function buildDebugHandoffSnapshot(portfolio, portfolioIntelligence, runContext 
 
 async function runCycle(runContext = {}) {
   console.log(`\n🚀 Starting pipeline at ${nowIso()}\n`);
+
+  // Reset per-cycle state
+  _cycleMarketContext = null;
 
   const portfolio = loadPortfolio();
   pruneCooldowns(portfolio);
