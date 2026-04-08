@@ -5,6 +5,13 @@ import os from "os";
 import crypto from "crypto";
 import { fileURLToPath } from "url";
 import { execFileSync, spawn } from "child_process";
+import {
+  clearStoredAuth,
+  connectWithApiKey,
+  connectWithLogin,
+  e3dRequest,
+  getAuthStatus
+} from "./e3dAuthClient.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -28,13 +35,6 @@ const PIPELINE_ENTRYPOINT = path.join(ROOT, "pipeline.js");
 const PIPELINE_PID_FILE = path.join(LOG_DIR, "pipeline.pid");
 const PIPELINE_STDOUT_LOG = path.join(LOG_DIR, "pipeline-stdout.log");
 const PIPELINE_STDERR_LOG = path.join(LOG_DIR, "pipeline-stderr.log");
-const OPENCLAW_CONFIG_FILE = path.join(os.homedir(), ".openclaw", "openclaw.json");
-const OPENCLAW_AGENT_WORKSPACES = {
-  scout: path.join(ROOT, "scout"),
-  harvest: path.join(ROOT, "harvest"),
-  risk: path.join(ROOT, "risk"),
-  executor: path.join(ROOT, "executor")
-};
 const DEFAULT_INITIAL_CASH_USD = 100000;
 const DEFAULT_PORTFOLIO_STATE = {
   cash_usd: DEFAULT_INITIAL_CASH_USD,
@@ -157,72 +157,6 @@ function removeFileIfExists(filePath) {
 
 function ensureDir(filePath) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
-}
-
-function readOpenClawConfig() {
-  return readJsonFile(OPENCLAW_CONFIG_FILE, null) || {};
-}
-
-function writeOpenClawConfig(config) {
-  ensureDir(OPENCLAW_CONFIG_FILE);
-  fs.writeFileSync(OPENCLAW_CONFIG_FILE, `${JSON.stringify(config, null, 2)}\n`, "utf8");
-}
-
-function autoConfigureOpenClaw(openaiApiKey) {
-  const config = readOpenClawConfig();
-  const nextAgents = Array.isArray(config?.agents?.list) ? [...config.agents.list] : [];
-  const nextBindings = Array.isArray(config?.bindings) ? [...config.bindings] : [];
-  const agentMap = new Map(nextAgents.map((agent) => [agent.id, agent]));
-
-  for (const [agentId, workspace] of Object.entries(OPENCLAW_AGENT_WORKSPACES)) {
-    const existing = agentMap.get(agentId) || { id: agentId, name: `E3D ${agentId[0].toUpperCase()}${agentId.slice(1)}` };
-    agentMap.set(agentId, {
-      ...existing,
-      workspace,
-      model: {
-        ...(existing.model || {}),
-        primary: existing.model?.primary || "openai/gpt-5-mini"
-      }
-    });
-  }
-
-  config.auth = config.auth || {};
-  config.auth.profiles = config.auth.profiles || {};
-  config.auth.profiles["openai:manual"] = {
-    provider: "openai",
-    mode: "token",
-    apiKey: openaiApiKey
-  };
-
-  config.agents = config.agents || {};
-  config.agents.list = Array.from(agentMap.values());
-
-  const desiredBindings = [
-    { agentId: "scout", room: "E3D_RESEARCH_ROOM" },
-    { agentId: "risk", room: "E3D_RISK_ROOM" },
-    { agentId: "harvest", room: "E3D_HARVEST_ROOM" },
-    { agentId: "executor", room: "E3D_TRADING_ROOM" }
-  ];
-
-  for (const binding of desiredBindings) {
-    const existingIndex = nextBindings.findIndex((item) => item.agentId === binding.agentId);
-    const nextBinding = {
-      agentId: binding.agentId,
-      match: {
-        channel: "discord",
-        peer: {
-          kind: "group",
-          id: binding.room
-        }
-      }
-    };
-    if (existingIndex >= 0) nextBindings[existingIndex] = nextBinding;
-    else nextBindings.push(nextBinding);
-  }
-
-  config.bindings = nextBindings;
-  writeOpenClawConfig(config);
-  return config;
 }
 
 function readJsonLines(filePath, limit = 250) {
@@ -490,7 +424,12 @@ async function fetchTokenMetadata(address) {
     try {
       const startedAt = Date.now();
       logExternalApi("e3d_api_request", { url, pathname: new URL(url).pathname, query: Object.fromEntries(new URL(url).searchParams.entries()) });
-      const response = await fetch(url, { method: "GET" });
+      const response = await e3dRequest(url, {
+        method: "GET",
+        headers: {
+          Accept: "application/json"
+        }
+      });
       const durationMs = Date.now() - startedAt;
       if (!response.ok) {
         logExternalApi("e3d_api_error", { url, pathname: new URL(url).pathname, status: response.status, duration_ms: durationMs });
@@ -854,6 +793,7 @@ async function handleRequest(req, res) {
       activity_events: activity.events.length,
       mongo_container: MONGO_CONTAINER_NAME,
       clickhouse_url: CLICKHOUSE_HTTP_URL,
+      e3d_auth: getAuthStatus(),
       pipeline: getPipelineStatus()
     });
     return;
@@ -864,20 +804,46 @@ async function handleRequest(req, res) {
     return;
   }
 
-  if (url.pathname === "/api/openclaw/configure" && req.method === "POST") {
-    const body = await readRequestJson();
-    const openaiApiKey = String(body.openai_api_key || body.openaiApiKey || "").trim();
-    if (!openaiApiKey) {
-      sendJson(res, 400, { ok: false, error: "OPENAI_API_KEY_REQUIRED" });
-      return;
-    }
+  if (url.pathname === "/api/e3d/auth/status") {
+    sendJson(res, 200, getAuthStatus());
+    return;
+  }
 
-    const config = autoConfigureOpenClaw(openaiApiKey);
+  if (url.pathname === "/api/e3d/auth/connect" && req.method === "POST") {
+    const body = await readRequestJson();
+    const mode = String(body.mode || body.auth_mode || "").trim().toLowerCase();
+
+    try {
+      if (mode === "api_key") {
+        const apiKey = String(body.apiKey || body.api_key || body.key || "").trim();
+        const result = await connectWithApiKey(apiKey);
+        sendJson(res, 200, result);
+        return;
+      }
+
+      if (mode === "login") {
+        const username = String(body.username || body.email || "").trim();
+        const password = String(body.password || "").trim();
+        const result = await connectWithLogin({ username, password });
+        sendJson(res, 200, result);
+        return;
+      }
+
+      sendJson(res, 400, { ok: false, error: "INVALID_AUTH_MODE" });
+    } catch (err) {
+      sendJson(res, 400, {
+        ok: false,
+        error: err?.message || "AUTH_CONNECT_FAILED"
+      });
+    }
+    return;
+  }
+
+  if (url.pathname === "/api/e3d/auth/clear" && req.method === "POST") {
+    clearStoredAuth();
     sendJson(res, 200, {
       ok: true,
-      config_path: OPENCLAW_CONFIG_FILE,
-      agent_ids: Object.keys(OPENCLAW_AGENT_WORKSPACES),
-      bindings: Array.isArray(config.bindings) ? config.bindings.length : 0
+      auth: getAuthStatus()
     });
     return;
   }

@@ -1033,47 +1033,172 @@ function MilestoneBadge({ item }) {
   );
 }
 
-function SettingsDialog({ open, openaiKey, onOpenaiKeyChange, onClose, onSave, saving, message, error }) {
-  if (!open) return null;
+function E3DAuthPanel({
+  mode,
+  onModeChange,
+  loginEmail,
+  onLoginEmailChange,
+  loginPassword,
+  onLoginPasswordChange,
+  apiKey,
+  onApiKeyChange,
+  authStatus,
+  statusLoading,
+  statusMessage,
+  statusError,
+  connectLoading,
+  clearLoading,
+  onConnect,
+  onClear,
+  onRefresh
+}) {
+  const connected = Boolean(authStatus?.connected);
+  const badgeClass = authStatus?.lastError ? "badge badge-red" : connected ? "badge badge-green" : "badge badge-amber";
+  const modeLabel = mode === "login" ? "Username/password" : "API key";
+  const connectedLabel = connected
+    ? authStatus?.mode === "login"
+      ? "Connected with login session"
+      : "Connected with API key"
+    : "Not connected";
 
   return React.createElement(
-    "div",
-    { className: "settings-backdrop", onClick: onClose },
+    "section",
+    { className: "card auth-panel" },
     React.createElement(
       "div",
-      { className: "card settings-dialog", onClick: (event) => event.stopPropagation() },
+      { className: "auth-panel-head" },
       React.createElement(
         "div",
-        { className: "settings-head" },
-        React.createElement("div", null,
-          React.createElement("div", { className: "settings-title" }, "OpenClaw setup"),
-          React.createElement("div", { className: "settings-subtitle" }, "Enter your OpenAI key and write the OpenClaw config for `pipeline.js`.")
+        { className: "auth-panel-copy" },
+        React.createElement("div", { className: "auth-panel-title" }, "e3d.ai access"),
+        React.createElement(
+          "div",
+          { className: "auth-panel-note" },
+          "Authenticate the trading floor to e3d.ai with either a session login or API key. Secrets stay on the server so the dashboard can use the full story, thesis, and flow surface without the anonymous limit."
+        )
+      ),
+      React.createElement(
+        "div",
+        { className: "auth-panel-status" },
+        React.createElement("span", { className: badgeClass }, connectedLabel),
+        React.createElement(
+          "button",
+          { className: "button button-secondary", onClick: onRefresh, disabled: statusLoading },
+          statusLoading ? "Refreshing…" : "Refresh status"
+        )
+      )
+    ),
+    React.createElement(
+      "div",
+      { className: "auth-panel-grid" },
+      React.createElement(
+        "div",
+        { className: "auth-form" },
+        React.createElement(
+          "div",
+          { className: "auth-form-row" },
+          React.createElement(
+            "div",
+            { className: "auth-form-field" },
+            React.createElement("label", { className: "auth-label" }, "Auth mode"),
+            React.createElement(
+              "select",
+              {
+                className: "auth-input",
+                value: mode,
+                onChange: (event) => onModeChange(event.target.value)
+              },
+              React.createElement("option", { value: "api_key" }, "API key"),
+              React.createElement("option", { value: "login" }, "Username/password")
+            )
+          ),
+          React.createElement(
+            "div",
+            { className: "auth-form-field" },
+            React.createElement("label", { className: "auth-label" }, mode === "login" ? "Email / username" : "API key"),
+            mode === "login"
+              ? React.createElement("input", {
+                  className: "auth-input",
+                  type: "email",
+                  autoComplete: "username",
+                  spellCheck: "false",
+                  placeholder: "you@example.com",
+                  value: loginEmail,
+                  onChange: (event) => onLoginEmailChange(event.target.value)
+                })
+              : React.createElement("input", {
+                  className: "auth-input",
+                  type: "password",
+                  autoComplete: "off",
+                  spellCheck: "false",
+                  placeholder: "e3d_...",
+                  value: apiKey,
+                  onChange: (event) => onApiKeyChange(event.target.value)
+                })
+          )
         ),
-        React.createElement("button", { className: "button button-secondary settings-close", onClick: onClose }, "✕")
-      ),
-      React.createElement(
-        "label",
-        { className: "settings-field" },
-        React.createElement("span", { className: "settings-label" }, "OpenAI key"),
-        React.createElement("input", {
-          className: "settings-input",
-          type: "password",
-          autoComplete: "off",
-          spellCheck: "false",
-          placeholder: "sk-...",
-          value: openaiKey,
-          onChange: (event) => onOpenaiKeyChange(event.target.value)
-        })
+        mode === "login"
+          ? React.createElement(
+              "div",
+              { className: "auth-form-field" },
+              React.createElement("label", { className: "auth-label" }, "Password"),
+              React.createElement("input", {
+                className: "auth-input",
+                type: "password",
+                autoComplete: "current-password",
+                spellCheck: "false",
+                placeholder: "Password",
+                value: loginPassword,
+                onChange: (event) => onLoginPasswordChange(event.target.value)
+              })
+            )
+          : null,
+        React.createElement(
+          "div",
+          { className: "auth-actions" },
+          React.createElement(
+            "button",
+            { className: "button button-primary", onClick: onConnect, disabled: connectLoading },
+            connectLoading ? "Connecting…" : "Connect"
+          ),
+          React.createElement(
+            "button",
+            { className: "button button-danger", onClick: onClear, disabled: clearLoading },
+            clearLoading ? "Clearing…" : "Clear credentials"
+          )
+        ),
+        statusMessage ? React.createElement("div", { className: "auth-message" }, statusMessage) : null,
+        statusError ? React.createElement("div", { className: "auth-error" }, statusError) : null,
+        React.createElement(
+          "div",
+          { className: "auth-helper" },
+          `Current mode: ${modeLabel}. Credentials are stored on the server using OS keychain when available, with encrypted local file fallback.`
+        )
       ),
       React.createElement(
         "div",
-        { className: "settings-actions" },
-        React.createElement("button", { className: "button button-primary", onClick: onSave, disabled: saving || !openaiKey.trim() }, saving ? "Saving…" : "Auto-configure OpenClaw"),
-        React.createElement("button", { className: "button button-secondary", onClick: onClose }, "Close")
-      ),
-      message ? React.createElement("div", { className: "settings-message" }, message) : null,
-      error ? React.createElement("div", { className: "settings-error" }, error) : null,
-      React.createElement("div", { className: "settings-note" }, "The key is sent to the local dashboard server so it can write ~/.openclaw/openclaw.json with the E3D agent workspace bindings.")
+        { className: "auth-form" },
+        React.createElement("div", { className: "auth-label" }, "Current status"),
+        React.createElement(
+          "div",
+          { className: "auth-helper" },
+          authStatus?.mode === "login"
+            ? `Login session active for ${authStatus.email || authStatus.username || "e3d.ai account"}.`
+            : authStatus?.mode === "api_key"
+              ? `API key active${authStatus.updatedAt ? ` · updated ${new Date(authStatus.updatedAt).toLocaleString()}` : ""}.`
+              : "No e3d.ai credentials are stored yet."
+        ),
+        React.createElement(
+          "div",
+          { className: "auth-helper" },
+          authStatus?.lastError ? `Last error: ${authStatus.lastError}` : "The dashboard will use this auth context for all e3d.ai requests made by the trading floor."
+        ),
+        React.createElement(
+          "div",
+          { className: "auth-helper" },
+          "Username/password means your e3d.ai account login; the trading floor does not create a second identity."
+        )
+      )
     )
   );
 }
@@ -1088,12 +1213,82 @@ function App() {
   const [intervalSeconds, setIntervalSeconds] = useState(300);
   const [pipelineMessage, setPipelineMessage] = useState(null);
   const [pipelineError, setPipelineError] = useState(null);
-  const [settingsOpen, setSettingsOpen] = useState(false);
-  const [openaiKey, setOpenaiKey] = useState("");
-  const [settingsSaving, setSettingsSaving] = useState(false);
-  const [settingsMessage, setSettingsMessage] = useState(null);
-  const [settingsError, setSettingsError] = useState(null);
+  const [authMode, setAuthMode] = useState("api_key");
+  const [authEmail, setAuthEmail] = useState("");
+  const [authPassword, setAuthPassword] = useState("");
+  const [authApiKey, setAuthApiKey] = useState("");
+  const [authStatus, setAuthStatus] = useState(null);
+  const [authLoading, setAuthLoading] = useState(false);
+  const [authConnectLoading, setAuthConnectLoading] = useState(false);
+  const [authClearLoading, setAuthClearLoading] = useState(false);
+  const [authMessage, setAuthMessage] = useState(null);
+  const [authError, setAuthError] = useState(null);
 
+  async function loadAuthStatus() {
+    try {
+      setAuthLoading(true);
+      const res = await fetch("/api/e3d/auth/status");
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data?.error || data?.message || `HTTP ${res.status}`);
+      setAuthStatus(data);
+      if (data?.mode === "login" || data?.mode === "api_key") {
+        setAuthMode(data.mode);
+      }
+      if (data?.connected) {
+        setAuthMessage(data.mode === "login" ? "e3d.ai login session loaded." : "e3d.ai API key loaded.");
+        setAuthError(null);
+      }
+    } catch (err) {
+      setAuthError(err.message);
+    } finally {
+      setAuthLoading(false);
+    }
+  }
+
+  async function connectE3dAuth() {
+    try {
+      setAuthConnectLoading(true);
+      setAuthError(null);
+      setAuthMessage(null);
+      const payload = authMode === "login"
+        ? { mode: "login", username: authEmail, password: authPassword }
+        : { mode: "api_key", apiKey: authApiKey };
+      const res = await fetch("/api/e3d/auth/connect", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data?.error || data?.message || `HTTP ${res.status}`);
+      setAuthStatus(data.auth || null);
+      setAuthMessage(authMode === "login" ? "Connected to e3d.ai with login session." : "Connected to e3d.ai with API key.");
+      setAuthPassword("");
+      await loadAuthStatus();
+    } catch (err) {
+      setAuthError(err.message);
+    } finally {
+      setAuthConnectLoading(false);
+    }
+  }
+
+  async function clearE3dAuth() {
+    try {
+      setAuthClearLoading(true);
+      setAuthError(null);
+      setAuthMessage(null);
+      const res = await fetch("/api/e3d/auth/clear", { method: "POST" });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data?.error || data?.message || `HTTP ${res.status}`);
+      setAuthStatus(data.auth || null);
+      setAuthApiKey("");
+      setAuthPassword("");
+      setAuthMessage("e3d.ai credentials cleared.");
+    } catch (err) {
+      setAuthError(err.message);
+    } finally {
+      setAuthClearLoading(false);
+    }
+  }
   async function load() {
     try {
       setError(null);
@@ -1139,28 +1334,6 @@ function App() {
     }
   }
 
-  async function saveOpenClawSettings() {
-    try {
-      setSettingsError(null);
-      setSettingsMessage(null);
-      setSettingsSaving(true);
-      const res = await fetch("/api/openclaw/configure", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ openai_api_key: openaiKey })
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
-      setSettingsMessage(`Wrote ${data.config_path}`);
-      setOpenaiKey("");
-      setSettingsOpen(false);
-    } catch (err) {
-      setSettingsError(err.message);
-    } finally {
-      setSettingsSaving(false);
-    }
-  }
-
   async function startPipeline() {
     try {
       setPipelineError(null);
@@ -1203,6 +1376,12 @@ function App() {
   useEffect(() => {
     loadPipelineStatus();
     const id = setInterval(loadPipelineStatus, 4000);
+    return () => clearInterval(id);
+  }, []);
+
+  useEffect(() => {
+    loadAuthStatus();
+    const id = setInterval(loadAuthStatus, 30000);
     return () => clearInterval(id);
   }, []);
 
@@ -1441,7 +1620,6 @@ function App() {
             React.createElement("button", { className: cls("button", page === "orbit" && "button-active"), onClick: () => goToPage("orbit") }, "Orbit + trail"),
             React.createElement("button", { className: cls("button", page === "activity" && "button-active"), onClick: () => goToPage("activity") }, "Activity"),
             React.createElement("button", { className: "button button-primary", onClick: load }, "Refresh now"),
-            React.createElement("button", { className: "button button-secondary gear-button", onClick: () => setSettingsOpen(true), title: "OpenClaw settings" }, "⚙ Settings"),
             React.createElement("a", { className: "button button-secondary", href: "/api/activity", target: "_blank", rel: "noreferrer" }, "Raw activity API")
           )
         ),
@@ -1530,17 +1708,26 @@ function App() {
           pipelineStatus?.pid ? React.createElement("div", { className: "pipeline-controls-meta" }, `PID ${pipelineStatus.pid}`) : null
         )
       ),
-      page === "orbit" ? orbitPage : page === "activity" ? React.createElement(AgentActivityPage, null) : portfolioPage,
-      React.createElement(SettingsDialog, {
-        open: settingsOpen,
-        openaiKey,
-        onOpenaiKeyChange: setOpenaiKey,
-        onClose: () => setSettingsOpen(false),
-        onSave: saveOpenClawSettings,
-        saving: settingsSaving,
-        message: settingsMessage,
-        error: settingsError
-      })
+      React.createElement(E3DAuthPanel, {
+        mode: authMode,
+        onModeChange: setAuthMode,
+        loginEmail: authEmail,
+        onLoginEmailChange: setAuthEmail,
+        loginPassword: authPassword,
+        onLoginPasswordChange: setAuthPassword,
+        apiKey: authApiKey,
+        onApiKeyChange: setAuthApiKey,
+        authStatus,
+        statusLoading: authLoading,
+        statusMessage: authMessage,
+        statusError: authError,
+        connectLoading: authConnectLoading,
+        clearLoading: authClearLoading,
+        onConnect: connectE3dAuth,
+        onClear: clearE3dAuth,
+        onRefresh: loadAuthStatus
+      }),
+      page === "orbit" ? orbitPage : page === "activity" ? React.createElement(AgentActivityPage, null) : portfolioPage
     )
   );
 }

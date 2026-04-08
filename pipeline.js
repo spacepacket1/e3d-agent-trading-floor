@@ -3,6 +3,7 @@ import path from "path";
 import crypto from "crypto";
 import { execFileSync } from "child_process";
 import { fileURLToPath } from "url";
+import { buildCurlAuthArgs } from "./e3dAuthClient.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -26,21 +27,6 @@ const E3D_DOSSIER_CACHE_TTL_MS = 10 * 60 * 1000;
 const E3D_DOSSIER_MAX_POSITIONS = 5;
 const E3D_DOSSIER_MAX_STORIES = 4;
 const E3D_DOSSIER_MAX_COUNTERPARTIES = 5;
-const AGENT_WORKSPACES = {
-  scout: path.join(__dirname, "scout"),
-  harvest: path.join(__dirname, "harvest"),
-  risk: path.join(__dirname, "risk"),
-  executor: path.join(__dirname, "executor")
-};
-const AGENT_CONTEXT_FILES = [
-  "AGENTS.md",
-  "IDENTITY.md",
-  "MEMORY.md",
-  "SOUL.md",
-  "TOOLS.md",
-  "USER.md"
-];
-const AGENT_CONTEXT_CACHE = new Map();
 const E3D_DOSSIER_CACHE = new Map();
 const E3D_API_DEBUG = process.env.E3D_API_DEBUG === "1" || process.env.E3D_DEBUG === "1";
 let ACTIVE_TRAINING_CONTEXT = null;
@@ -991,40 +977,6 @@ function printPortfolioSummary(portfolio) {
   log("portfolio_summary", summary);
 }
 
-function loadAgentContext(agentId) {
-  if (AGENT_CONTEXT_CACHE.has(agentId)) {
-    return AGENT_CONTEXT_CACHE.get(agentId);
-  }
-
-  const workspace = AGENT_WORKSPACES[agentId];
-  if (!workspace || !fs.existsSync(workspace)) {
-    AGENT_CONTEXT_CACHE.set(agentId, "");
-    return "";
-  }
-
-  const blocks = [];
-  for (const fileName of AGENT_CONTEXT_FILES) {
-    const filePath = path.join(workspace, fileName);
-    if (!fs.existsSync(filePath)) continue;
-
-    const content = fs.readFileSync(filePath, "utf8").trim();
-    if (!content) continue;
-
-    blocks.push(`### ${agentId.toUpperCase()} / ${fileName}\n\n${content}`);
-  }
-
-  const context = blocks.join("\n\n");
-  AGENT_CONTEXT_CACHE.set(agentId, context);
-  return context;
-}
-
-function withAgentContext(agentId, taskPrompt) {
-  // OpenClaw loads workspace files (TOOLS.md, SOUL.md, etc.) automatically
-  // from the agent's configured workspace directory. Do not re-inject them
-  // here — that would double the context and overflow the model.
-  return taskPrompt.trim();
-}
-
 function buildUrl(baseUrl, pathname, query = {}) {
   const base = new URL(baseUrl);
   const basePath = base.pathname.replace(/^\/+|\/+$/g, "");
@@ -1052,7 +1004,7 @@ function fetchJson(pathname, query = {}, fallback = null) {
     const startedAt = Date.now();
     log("e3d_api_request", { url, pathname, query });
     const marker = "__E3D_HTTP_STATUS__";
-    const stdout = runShell("curl", ["-s", "--max-time", "12", "-L", "-o", "-", "-w", `${marker}%{http_code}`, url]);
+    const stdout = runShell("curl", ["-s", "--max-time", "12", "-L", "-o", "-", "-w", `${marker}%{http_code}`, ...buildCurlAuthArgs(url), url]);
     const output = String(stdout || "");
     const markerIndex = output.lastIndexOf(marker);
     const text = markerIndex >= 0 ? output.slice(0, markerIndex).trim() : output.trim();
@@ -1070,6 +1022,19 @@ function fetchJson(pathname, query = {}, fallback = null) {
     return JSON.parse(text);
   } catch (err) {
     log("e3d_api_error", { url, pathname, query, message: err.message });
+    return fallback;
+  }
+}
+
+function e3dFetch(url, fallback = null) {
+  try {
+    const parsed = new URL(String(url || ""));
+    const pathname = parsed.pathname.replace(/^\/+/, "");
+    const query = Object.fromEntries(parsed.searchParams.entries());
+    const cleanPath = pathname.startsWith("api/") ? pathname.slice(3) : pathname;
+    return fetchJson(cleanPath.startsWith("/") ? cleanPath : `/${cleanPath}`, query, fallback);
+  } catch (err) {
+    log("e3d_api_error", { url: String(url || ""), message: err.message });
     return fallback;
   }
 }
@@ -1761,91 +1726,8 @@ function savePortfolio(portfolio) {
   syncPortfolioToMongo(portfolio);
 }
 
-function parseAgentWrapper(stdout, agentId) {
-  let wrapper;
-  try {
-    wrapper = JSON.parse(stdout);
-  } catch {
-    throw new Error(`${agentId.toUpperCase()}_WRAPPER_NOT_JSON\n${stdout}`);
-  }
-
-  const reply =
-    wrapper?.reply ??
-    wrapper?.message ??
-    wrapper?.text ??
-    wrapper?.output ??
-    wrapper?.content ??
-    wrapper?.result?.payloads?.[0]?.text;
-
-  if (typeof reply !== "string") {
-    throw new Error(`${agentId.toUpperCase()}_MISSING_REPLY_TEXT\n${stdout}`);
-  }
-
-  try {
-    return JSON.parse(reply);
-  } catch {
-    throw new Error(`${agentId.toUpperCase()}_REPLY_NOT_JSON\n${reply}`);
-  }
-}
-
 function sleepSync(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-}
-
-function isRateLimitError(err) {
-  const msg = String(err?.message || err || "").toLowerCase();
-  return msg.includes("rate limit") || msg.includes("rate_limit") || msg.includes("too many requests");
-}
-
-function extractAgentToolCalls(stdout, agentId) {
-  // Extract observable signals from raw openclaw JSON output.
-  // Looks for WebFetch URLs, tool_use blocks, and any structured tool call data
-  // the wrapper may contain (varies by openclaw version).
-  const result = {
-    agent: agentId,
-    ts: nowIso(),
-    webfetch_urls: [],
-    tool_names: [],
-    story_types_fetched: [],
-    raw_bytes: Buffer.byteLength(stdout, "utf8"),
-  };
-
-  try {
-    // Extract all URLs that look like E3D story API calls
-    const urlMatches = stdout.matchAll(/https?:\/\/[^\s"'\\}]+/g);
-    for (const m of urlMatches) {
-      const url = m[0].replace(/[",\])}]+$/, "");
-      if (url.includes("e3d.ai") && !result.webfetch_urls.includes(url)) {
-        result.webfetch_urls.push(url);
-        // Extract story type if present (?type=X or /type/X)
-        const typeMatch = url.match(/[?&]type=([A-Z_]+)/);
-        if (typeMatch && !result.story_types_fetched.includes(typeMatch[1])) {
-          result.story_types_fetched.push(typeMatch[1]);
-        }
-      }
-    }
-
-    // Try to parse the wrapper for tool_use / tool_calls arrays
-    const wrapper = JSON.parse(stdout);
-    const toolUseBlocks = wrapper?.tool_use ?? wrapper?.tool_calls ?? wrapper?.result?.tool_use ?? [];
-    if (Array.isArray(toolUseBlocks)) {
-      for (const block of toolUseBlocks) {
-        const name = block?.name ?? block?.function?.name;
-        if (name && !result.tool_names.includes(name)) result.tool_names.push(name);
-      }
-    }
-    // Some openclaw versions embed payloads with tool steps
-    const payloads = wrapper?.result?.payloads ?? [];
-    for (const p of payloads) {
-      if (p?.type === "tool_use" && p?.name && !result.tool_names.includes(p.name)) {
-        result.tool_names.push(p.name);
-      }
-    }
-  } catch {
-    // best-effort only — never block the pipeline
-  }
-
-  return result;
 }
 
 const EXPECTED_STORY_TYPES = {
@@ -1905,22 +1787,6 @@ function buildAgentCoverageLog(agentId, payload) {
   };
 }
 
-function logAgentRaw(agentId, stdout, runId, cycleId) {
-  try {
-    const entry = {
-      ts: nowIso(),
-      pipeline_run_id: runId ?? null,
-      cycle_id: cycleId ?? null,
-      agent: agentId,
-      bytes: Buffer.byteLength(stdout, "utf8"),
-      tool_signals: extractAgentToolCalls(stdout, agentId),
-    };
-    fs.appendFileSync(AGENT_RAW_LOG, JSON.stringify(entry) + "\n");
-  } catch {
-    // never block the pipeline on logging
-  }
-}
-
 const LLM_BASE_URL = process.env.LLM_BASE_URL || "http://127.0.0.1:5050";
 const LLM_MODEL = process.env.LLM_MODEL || "mlx-community/Qwen2.5-14B-Instruct-4bit";
 
@@ -1975,35 +1841,6 @@ function callLLMDirect(systemPrompt, userMessage, { maxRetries = 2 } = {}) {
     } catch (err) {
       lastErr = err;
       if (attempt < maxRetries) sleepSync(5000);
-    }
-  }
-  throw lastErr;
-}
-
-function callAgent(agentId, message, { maxRetries = 3, retryDelayMs = 60000, runId, cycleId } = {}) {
-  let lastErr;
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    try {
-      const sessionId = crypto.randomUUID();
-      const stdout = execFileSync(
-        "openclaw",
-        ["agent", "--agent", agentId, "--session-id", sessionId, "--message", message, "--json"],
-        {
-          encoding: "utf8",
-          maxBuffer: 10 * 1024 * 1024
-        }
-      );
-      logAgentRaw(agentId, stdout, runId, cycleId);
-      return parseAgentWrapper(stdout, agentId);
-    } catch (err) {
-      lastErr = err;
-      if (isRateLimitError(err) && attempt < maxRetries) {
-        const waitSec = Math.round((retryDelayMs * attempt) / 1000);
-        console.log(`⏳ ${agentId} rate limited (attempt ${attempt}/${maxRetries}). Waiting ${waitSec}s before retry...`);
-        sleepSync(retryDelayMs * attempt);
-      } else if (!isRateLimitError(err)) {
-        throw err;
-      }
     }
   }
   throw lastErr;
@@ -2389,7 +2226,7 @@ function buildScoutPrompt(portfolio, portfolioIntelligence = null) {
     `Portfolio context: ${compactPortfolioBaseline}`
   ].join("\n").trim();
 
-  return withAgentContext("scout", taskPrompt);
+  return taskPrompt.trim();
 }
 
 function buildHarvestPrompt(portfolio, portfolioIntelligence = null) {
@@ -2514,7 +2351,7 @@ Include a top-level "stories_checked" array listing every story type you fetched
 Example: [{"type":"LIQUIDITY_DRAIN","found":2,"flagged_addresses":["0x..."]},{"type":"ACCUMULATION","found":0,"flagged_addresses":[]}]
 `.trim();
 
-  return withAgentContext("harvest", taskPrompt);
+  return taskPrompt.trim();
 }
 
 function buildRiskPrompt(proposal) {
@@ -2534,7 +2371,7 @@ Proposal:
 ${JSON.stringify(proposal)}
 `.trim();
 
-  return withAgentContext("risk", taskPrompt);
+  return taskPrompt.trim();
 }
 
 function buildExecutorPrompt(proposal, portfolio) {
@@ -2584,7 +2421,7 @@ Required response shape:
 }
 `.trim();
 
-  return withAgentContext("executor", taskPrompt);
+  return taskPrompt.trim();
 }
 
 function setCooldown(portfolio, symbol) {
@@ -3204,7 +3041,7 @@ async function runCycle(runContext = {}) {
   const portfolioIntelligence = buildPortfolioIntelligenceDossier(portfolio);
   if (runContext.debugMode) {
     const debugSnapshot = buildDebugHandoffSnapshot(portfolio, portfolioIntelligence, runContext);
-    console.log("🧪 Pipeline debug mode: OpenClaw execution skipped.\n");
+    console.log("🧪 Pipeline debug mode: LLM execution skipped.\n");
     console.log(JSON.stringify(debugSnapshot, null, 2));
     log("debug_handoff", {
       pipeline_run_id: debugSnapshot.pipeline_run_id,
@@ -3255,7 +3092,7 @@ async function runCycle(runContext = {}) {
     }
     if (sellTrades.length) log("sell_trades", sellTrades);
 
-    // 4. HARVEST EXIT SCAN (direct LLM — bypasses OpenClaw)
+    // 4. HARVEST EXIT SCAN
     const harvestPayload = runHarvestDirect(portfolio, portfolioIntelligence);
     validateHarvestPayload(harvestPayload);
     log("harvest", harvestPayload);
