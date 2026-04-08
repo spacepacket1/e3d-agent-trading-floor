@@ -1995,47 +1995,71 @@ function runScoutDirect(portfolio, portfolioIntelligence = null) {
   const buySignalStories = Object.entries(data.stories).filter(([t]) => data.buySignalTypes.has(t));
   const secondaryStories = Object.entries(data.stories).filter(([t]) => data.secondaryTypes.has(t) || (!data.disqualifierTypes.has(t) && !data.buySignalTypes.has(t)));
 
+  // Build a fast address → token lookup from the universe so we can match story
+  // subjects to tokens that actually have market data.
+  const tokenByAddr = new Map(
+    data.tokenUniverse
+      .filter((t) => t.address && t.price_usd > 0)
+      .map((t) => [t.address, t])
+  );
+
   const formatStory = (s) => {
-    const addr = cleanAddress(s?.meta?.token_address || s?.meta?.token?.address || s?.primary_token || s?.token_address || s?.address || "");
-    const sym = s?.meta?.token_symbol || s?.meta?.token?.symbol || s?.meta?.entities?.symbol || s?.symbol || s?.title || "";
-    const hint = s?.ai_narrative?.slice(0, 150) || s?.meta?.narrative_hint || s?.meta?.ai_narrative?.slice(0, 120) || s?.subtitle || "";
+    const storyAddr = cleanAddress(s?.meta?.primary?.address || s?.meta?.token_address || s?.meta?.token?.address || s?.primary_token || "");
+    const storyTitle = s?.title || s?.subtitle || "";
+    const hint = (s?.ai_narrative || s?.meta?.ai_narrative || s?.meta?.narrative_hint || s?.subtitle || "").slice(0, 180);
     const score = s?.score ?? null;
-    return JSON.stringify({ address: addr, symbol: sym, score, hint });
+    // Check if this story subject is a tradeable token in our universe
+    const tokenMatch = storyAddr ? tokenByAddr.get(storyAddr) : null;
+    return JSON.stringify({
+      story_subject_address: storyAddr,
+      story_title: storyTitle.slice(0, 80),
+      score,
+      hint,
+      in_token_universe: !!tokenMatch,
+      token_symbol: tokenMatch?.symbol || null,
+      price_usd: tokenMatch?.price_usd ?? null,
+      change_30m: tokenMatch?.change_30m ?? null,
+      liquidity_usd: tokenMatch?.liquidity_usd ?? null,
+    });
   };
 
   const systemPrompt = [
     "You are Scout, a crypto trading research agent.",
-    "You have been given pre-fetched E3D market intelligence data. Analyze it and return STRICT JSON only — one object, no markdown, no commentary.",
-    "Disqualify any token whose address appears in the DISQUALIFIERS section.",
-    "Score candidates from the BUY SIGNALS section using real evidence values from the data.",
-    "Return up to 3 buy candidates. Only return candidates:[] if zero tokens survived disqualification with any positive signal.",
-    `Exclude: symbols=${JSON.stringify([...heldSymbols])} addresses=${JSON.stringify([...heldAddresses])}`,
+    "You have been given pre-fetched E3D market intelligence data. Return STRICT JSON only — one object, no markdown, no commentary.",
+    "",
+    "CRITICAL RULES:",
+    "1. Only propose tokens that appear in the TOKEN UNIVERSE with price_usd > 0 and liquidity_usd > 5000.",
+    "2. Stories show ON-CHAIN SIGNALS. A story's subject address may be a wallet, LP, or contract — NOT necessarily a tradeable token. Only use stories where in_token_universe=true or where the story confirms activity around a token from the TOKEN UNIVERSE.",
+    "3. Do NOT use the story type name (MOVER, SURGE, THESIS, etc.) as a token symbol. Use the token symbol from the TOKEN UNIVERSE.",
+    "4. If no story subject matches a token with real price and liquidity data, propose the best candidates from the TOKEN UNIVERSE based on momentum (change_30m, change_24h) alone.",
+    "5. Exclude addresses in DISQUALIFIERS and already-held: " + `symbols=${JSON.stringify([...heldSymbols])} addresses=${JSON.stringify([...heldAddresses])}`,
+    "",
     `Output shape: {scan_timestamp, candidates[], holdings_updates[], stories_checked[]}`,
     `Each candidate: {source_agent:"scout", created_at:"${createdAt}", expires_at:"${expiresAt}", token:{symbol,name,chain:"ethereum",contract_address,category}, setup_type, action:"buy", confidence, conviction_score, opportunity_score, why_now, evidence[], risks[], entry_zone:{low,high}, invalidation_price, targets:{target_1,target_2,target_3}, market_data:{current_price,change_24h_pct,change_30m_pct,price_source:"e3d",market_cap_usd}, liquidity_data:{liquidity_usd,liquidity_source:"e3d"}, execution_data:{estimated_slippage_bps,quote_source:"e3d"}, portfolio_data:{current_token_exposure_pct:0,current_category_exposure_pct:0,current_total_exposure_pct:0}}`,
-    `stories_checked[]: one entry per story type — {type, found, tokens[]}`
+    `stories_checked[]: one entry per story type seen — {type, found, tokens[]} — tokens[] = token_symbol values only`
   ].join("\n");
 
   const userMessage = [
     `Scout task — ${createdAt} [token universe sorted by: ${data.sortLabel}]`,
     `Portfolio: cash=$${portfolio?.cash_usd ?? 100000} positions=${Object.keys(portfolio?.positions || {}).length}`,
-    `\n--- DISQUALIFIERS (addresses to exclude) ---`,
+    `Tokens with price data in universe: ${tokenByAddr.size} of ${data.tokenUniverse.length}`,
+    `\n--- DISQUALIFIERS (exclude these addresses) ---`,
     ...disqualifierStories.map(([type, items]) => {
-      const addrs = items.map((s) => cleanAddress(s?.meta?.token_address || s?.primary_token || s?.token_address || "")).filter(Boolean);
-      return `${type} (${items.length} stories): ${addrs.slice(0, 5).join(", ") || "none"}`;
+      const addrs = items.map((s) => cleanAddress(s?.meta?.primary?.address || s?.primary_token || "")).filter(Boolean);
+      return `${type}: ${addrs.slice(0, 5).join(", ") || "none"}`;
     }),
     disqualifierStories.length === 0 ? "none" : "",
-    `\n--- BUY SIGNALS ---`,
+    `\n--- ON-CHAIN SIGNALS (stories — check in_token_universe before using as candidate) ---`,
     ...buySignalStories.map(([type, items]) => {
-      return `${type} (${items.length} found):\n${items.slice(0, 5).map(formatStory).join("\n")}`;
+      return `${type} (${items.length}):\n${items.slice(0, 5).map(formatStory).join("\n")}`;
     }),
-    buySignalStories.length === 0 ? "none currently" : "",
-    `\n--- SECONDARY SIGNALS ---`,
     ...secondaryStories.map(([type, items]) => {
-      const addrs = items.slice(0, 3).map((s) => cleanAddress(s?.meta?.token_address || s?.primary_token || s?.token_address || "")).filter(Boolean);
-      return `${type} (${items.length}): ${addrs.join(", ") || "none"}`;
+      return `${type} (${items.length}):\n${items.slice(0, 3).map(formatStory).join("\n")}`;
     }),
-    `\n--- TOKEN UNIVERSE (${data.tokenUniverse.length} tokens, sorted by ${data.sortLabel}) ---`,
-    JSON.stringify(data.tokenUniverse.slice(0, 20))
+    buySignalStories.length + secondaryStories.length === 0 ? "none currently" : "",
+    `\n--- TOKEN UNIVERSE (${data.tokenUniverse.length} tokens with market data, sorted by ${data.sortLabel}) ---`,
+    `Use these for candidates. Pick tokens with strong momentum and sufficient liquidity (>5000 USD).`,
+    JSON.stringify(data.tokenUniverse.slice(0, 25))
   ].join("\n");
 
   const rawText = callLLMDirect(systemPrompt, userMessage);
