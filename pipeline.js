@@ -1846,33 +1846,77 @@ function callLLMDirect(systemPrompt, userMessage, { maxRetries = 2 } = {}) {
   throw lastErr;
 }
 
-function fetchScoutData() {
-  const disqualifierTypes = ["WASH_TRADE", "LOOP", "LIQUIDITY_DRAIN", "SPREAD_WIDENING", "MOMENTUM_DIVERGENCE", "EXCHANGE_FLOW"];
-  const buySignalTypes = ["ACCUMULATION", "SMART_MONEY", "STEALTH_ACCUMULATION", "BREAKOUT_CONFIRMED", "MOVER", "SURGE"];
-  const secondaryTypes = ["CONCENTRATION_SHIFT", "INSIDER_TIMING", "TOKEN_QUALITY_SCORE", "SANDWICH"];
+// Rotate token universe fetch criteria across cycles to avoid always seeing the same tokens.
+const SCOUT_SORT_ROTATION = [
+  { sortBy: "change_30m_pct", sortDir: "desc" },
+  { sortBy: "change_1h_pct",  sortDir: "desc" },
+  { sortBy: "change_24h_pct", sortDir: "desc" },
+  { sortBy: "volume_24h_usd", sortDir: "desc" },
+  { sortBy: "change_30m_pct", sortDir: "asc"  },  // losers/reversal candidates
+  { sortBy: "change_1h_pct",  sortDir: "asc"  },
+];
+let _scoutCycleIndex = 0;
 
+function fetchScoutData() {
+  // Story type categorisation — used to label whatever the API returns
+  const disqualifierTypes = new Set(["WASH_TRADE", "LOOP", "LIQUIDITY_DRAIN", "SPREAD_WIDENING",
+    "MOMENTUM_DIVERGENCE", "EXCHANGE_FLOW", "SECURITY_RISK", "RUG_LIQUIDITY_PULL", "AIRDROP"]);
+  const buySignalTypes = new Set(["ACCUMULATION", "SMART_MONEY", "STEALTH_ACCUMULATION",
+    "BREAKOUT_CONFIRMED", "MOVER", "SURGE", "DISCOVERY", "FLOW", "CLUSTER", "THESIS",
+    "DELEGATE_SURGE", "NEW_WALLETS", "HOTLINKS", "STAGING", "DEEP_DIVE"]);
+  const secondaryTypes = new Set(["CONCENTRATION_SHIFT", "INSIDER_TIMING", "TOKEN_QUALITY_SCORE",
+    "SANDWICH", "MIRROR", "VOLUME_PROFILE_ANOMALY", "FUNNEL", "WHALE"]);
+
+  // Fetch all available stories in one call (no type/chain filter — combining them kills results).
+  // The API returns one story per active story_type; bucket them locally.
+  const allStories = endpointArray(fetchJson("/stories", { limit: 100, chain: "ETH" }));
   const stories = {};
-  for (const type of [...disqualifierTypes, ...buySignalTypes, ...secondaryTypes]) {
-    const limit = ["BREAKOUT_CONFIRMED", "ECOSYSTEM_SHIFT"].includes(type) ? 5 : 10;
-    stories[type] = endpointArray(fetchJson("/stories", { type, chain: "ETH", limit }));
+  for (const s of allStories) {
+    const t = String(s?.story_type || s?.type || "").toUpperCase();
+    if (!t) continue;
+    if (!stories[t]) stories[t] = [];
+    stories[t].push(s);
   }
 
-  const gainers = endpointArray(fetchJson("/fetchTokenPricesWithHistoryAllRanges", {
-    dataSource: 1, sortBy: "change_30m_pct", sortDir: "desc", limit: 30
-  })).map((t) => ({
+  // Rotate sort criteria so each cycle surfaces different tokens
+  const sortParams = SCOUT_SORT_ROTATION[_scoutCycleIndex % SCOUT_SORT_ROTATION.length];
+  _scoutCycleIndex++;
+
+  const mapToken = (t) => ({
     symbol: t.symbol,
     name: t.name || "",
     address: cleanAddress(t.address || t.contract_address || ""),
     price_usd: t.priceUSD ?? t.price_usd ?? t.priceUsd ?? null,
     change_30m: t.changes?.["30M"]?.percent ?? t.change_30m_pct ?? null,
+    change_1h: t.changes?.["1H"]?.percent ?? t.change_1h_pct ?? null,
     change_24h: t.changes?.["24H"]?.percent ?? t.change_24h_pct ?? null,
     market_cap_usd: t.marketCapUSD ?? t.market_cap_usd ?? null,
     liquidity_usd: t.liquidityUSD ?? t.effectiveLiquidityUSD ?? t.liquidity_usd ?? null,
     volume_24h_usd: t.volume24hUSD ?? t.volume_24h_usd ?? null,
     fragility_score: t.fragilityScore ?? null
-  }));
+  });
 
-  return { stories, gainers, disqualifierTypes, buySignalTypes, secondaryTypes };
+  // Primary sort: rotated criteria
+  const gainers = endpointArray(fetchJson("/fetchTokenPricesWithHistoryAllRanges", {
+    dataSource: 1, ...sortParams, limit: 50
+  })).map(mapToken);
+
+  // Always also pull top 30m gainers as a second lens (deduplicated below)
+  const topGainers = endpointArray(fetchJson("/fetchTokenPricesWithHistoryAllRanges", {
+    dataSource: 1, sortBy: "change_30m_pct", sortDir: "desc", limit: 30
+  })).map(mapToken);
+
+  // Merge and deduplicate by address; primary sort list takes precedence
+  const seen = new Set();
+  const tokenUniverse = [];
+  for (const t of [...gainers, ...topGainers]) {
+    const addr = t.address;
+    if (!addr || seen.has(addr)) continue;
+    seen.add(addr);
+    tokenUniverse.push(t);
+  }
+
+  return { stories, tokenUniverse, disqualifierTypes, buySignalTypes, secondaryTypes, sortLabel: `${sortParams.sortBy} ${sortParams.sortDir}` };
 }
 
 function runScoutDirect(portfolio, portfolioIntelligence = null) {
@@ -1913,15 +1957,29 @@ function runScoutDirect(portfolio, portfolioIntelligence = null) {
     }
   }
 
-  // Build disqualified address set
+  // Build disqualified address set from stories tagged as disqualifiers
   const disqualifiedAddresses = new Set([...heldAddresses]);
-  for (const type of data.disqualifierTypes) {
-    for (const s of (data.stories[type] || [])) {
-      const addr = cleanAddress(s?.meta?.token_address || s?.token_address || s?.address || "");
+  for (const [type, items] of Object.entries(data.stories)) {
+    if (!data.disqualifierTypes.has(type)) continue;
+    for (const s of (items || [])) {
+      const addr = cleanAddress(s?.meta?.token_address || s?.primary_token || s?.token_address || s?.address || "");
       if (addr) disqualifiedAddresses.add(addr);
       if (type === "EXCHANGE_FLOW" && s?.meta?.direction !== "deposits") disqualifiedAddresses.delete(addr);
     }
   }
+
+  // Bucket stories into signal categories
+  const disqualifierStories = Object.entries(data.stories).filter(([t]) => data.disqualifierTypes.has(t));
+  const buySignalStories = Object.entries(data.stories).filter(([t]) => data.buySignalTypes.has(t));
+  const secondaryStories = Object.entries(data.stories).filter(([t]) => data.secondaryTypes.has(t) || (!data.disqualifierTypes.has(t) && !data.buySignalTypes.has(t)));
+
+  const formatStory = (s) => {
+    const addr = cleanAddress(s?.meta?.token_address || s?.meta?.token?.address || s?.primary_token || s?.token_address || s?.address || "");
+    const sym = s?.meta?.token_symbol || s?.meta?.token?.symbol || s?.meta?.entities?.symbol || s?.symbol || s?.title || "";
+    const hint = s?.ai_narrative?.slice(0, 150) || s?.meta?.narrative_hint || s?.meta?.ai_narrative?.slice(0, 120) || s?.subtitle || "";
+    const score = s?.score ?? null;
+    return JSON.stringify({ address: addr, symbol: sym, score, hint });
+  };
 
   const systemPrompt = [
     "You are Scout, a crypto trading research agent.",
@@ -1936,32 +1994,26 @@ function runScoutDirect(portfolio, portfolioIntelligence = null) {
   ].join("\n");
 
   const userMessage = [
-    `Scout task — ${createdAt}`,
+    `Scout task — ${createdAt} [token universe sorted by: ${data.sortLabel}]`,
     `Portfolio: cash=$${portfolio?.cash_usd ?? 100000} positions=${Object.keys(portfolio?.positions || {}).length}`,
     `\n--- DISQUALIFIERS (addresses to exclude) ---`,
-    ...data.disqualifierTypes.map((type) => {
-      const items = data.stories[type] || [];
-      const addrs = items.map((s) => cleanAddress(s?.meta?.token_address || s?.token_address || "")).filter(Boolean);
+    ...disqualifierStories.map(([type, items]) => {
+      const addrs = items.map((s) => cleanAddress(s?.meta?.token_address || s?.primary_token || s?.token_address || "")).filter(Boolean);
       return `${type} (${items.length} stories): ${addrs.slice(0, 5).join(", ") || "none"}`;
     }),
+    disqualifierStories.length === 0 ? "none" : "",
     `\n--- BUY SIGNALS ---`,
-    ...data.buySignalTypes.map((type) => {
-      const items = (data.stories[type] || []).slice(0, 5);
-      return `${type} (${items.length} found):\n${items.map((s) => {
-        const addr = cleanAddress(s?.meta?.token_address || s?.meta?.token?.address || s?.token_address || s?.address || "");
-        const sym = s?.meta?.token_symbol || s?.meta?.token?.symbol || s?.symbol || s?.title || "";
-        const hint = s?.meta?.narrative_hint || s?.meta?.ai_narrative?.slice(0, 120) || "";
-        const qual = s?.meta?.confirmation_quality || s?.meta?.participation_type || "";
-        return JSON.stringify({ address: addr, symbol: sym, score: s?.score, hint, quality: qual });
-      }).join("\n")}`;
+    ...buySignalStories.map(([type, items]) => {
+      return `${type} (${items.length} found):\n${items.slice(0, 5).map(formatStory).join("\n")}`;
     }),
+    buySignalStories.length === 0 ? "none currently" : "",
     `\n--- SECONDARY SIGNALS ---`,
-    ...data.secondaryTypes.map((type) => {
-      const items = (data.stories[type] || []).slice(0, 3);
-      return `${type} (${items.length}): ${items.map((s) => cleanAddress(s?.meta?.token_address || s?.token_address || "")).filter(Boolean).join(", ") || "none"}`;
+    ...secondaryStories.map(([type, items]) => {
+      const addrs = items.slice(0, 3).map((s) => cleanAddress(s?.meta?.token_address || s?.primary_token || s?.token_address || "")).filter(Boolean);
+      return `${type} (${items.length}): ${addrs.join(", ") || "none"}`;
     }),
-    `\n--- TOP 30m GAINERS ---`,
-    JSON.stringify(data.gainers.slice(0, 15))
+    `\n--- TOKEN UNIVERSE (${data.tokenUniverse.length} tokens, sorted by ${data.sortLabel}) ---`,
+    JSON.stringify(data.tokenUniverse.slice(0, 20))
   ].join("\n");
 
   const rawText = callLLMDirect(systemPrompt, userMessage);
@@ -2080,17 +2132,20 @@ function runHarvestDirect(portfolio, portfolioIntelligence = null) {
     };
   }
 
-  // Pre-fetch exit-risk stories for held addresses
+  // Pre-fetch exit-risk stories for held addresses — fetch all at once, bucket locally
+  // (type+chain filter combination returns 0 results from the API)
   const heldAddresses = positions.map((p) => cleanAddress(p?.contract_address || "")).filter(Boolean);
-  const exitRiskTypes = ["LIQUIDITY_DRAIN", "WASH_TRADE", "SPREAD_WIDENING", "MOMENTUM_DIVERGENCE", "EXCHANGE_FLOW", "LOOP"];
-  const holdConfirmTypes = ["ACCUMULATION", "SMART_MONEY"];
+  const exitRiskTypes = ["LIQUIDITY_DRAIN", "WASH_TRADE", "SPREAD_WIDENING", "MOMENTUM_DIVERGENCE", "EXCHANGE_FLOW", "LOOP",
+    "SECURITY_RISK", "RUG_LIQUIDITY_PULL"];
+  const holdConfirmTypes = ["ACCUMULATION", "SMART_MONEY", "MOVER", "SURGE", "FLOW", "CLUSTER"];
+
+  const allHarvestStories = endpointArray(e3dFetch(`${E3D_API_BASE_URL}/stories?limit=100&chain=ETH`));
   const exitStories = {};
-  for (const type of [...exitRiskTypes, ...holdConfirmTypes]) {
-    try {
-      const url = `${E3D_API_BASE_URL}/stories?type=${type}&chain=ETH&scope=primary&limit=20`;
-      const raw = e3dFetch(url);
-      exitStories[type] = raw?.items || raw?.data || raw || [];
-    } catch (_) { exitStories[type] = []; }
+  for (const s of allHarvestStories) {
+    const t = String(s?.story_type || s?.type || "").toUpperCase();
+    if (!t) continue;
+    if (!exitStories[t]) exitStories[t] = [];
+    exitStories[t].push(s);
   }
 
   // Build per-position story matches
@@ -2098,7 +2153,7 @@ function runHarvestDirect(portfolio, portfolioIntelligence = null) {
   const storyMatches = {};
   for (const [type, items] of Object.entries(exitStories)) {
     storyMatches[type] = items.filter((s) => {
-      const addr = cleanAddress(s?.meta?.token_address || s?.token_address || s?.address || "");
+      const addr = cleanAddress(s?.meta?.token_address || s?.primary_token || s?.token_address || s?.address || "");
       return addrSet.has(addr);
     }).map((s) => ({
       address: cleanAddress(s?.meta?.token_address || s?.token_address || s?.address || ""),
