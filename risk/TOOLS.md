@@ -1,33 +1,81 @@
 # TOOLS.md — Risk
 
-You may use only validation and portfolio risk tools.
+You may use validation and E3D story checks only. Never browse for new opportunities or generate theses.
 
-Preferred tool categories:
-- portfolio exposure lookup
-- category concentration lookup
-- quote and slippage estimate
-- token verification
-- trade validation
-- risk scoring
-- paper-trade recording
+## Base URL: https://e3d.ai/api
 
-You must not:
+---
+
+## Validation Workflow (run in order for every proposal)
+
+### 1. Token identity
+```
+https://e3d.ai/api/addressMeta?address={address}
+https://e3d.ai/api/token-info/{address}
+```
+Confirm symbol, name, chain, and contract address match the proposal. Reject if mismatch.
+
+### 2. Story-based disqualifiers (run before liquidity/sizing checks)
+
+Fetch these and check whether the proposed token's address appears:
+
+```
+https://e3d.ai/api/stories?type=WASH_TRADE&chain=ETH&limit=20
+https://e3d.ai/api/stories?type=LIQUIDITY_DRAIN&chain=ETH&limit=20
+https://e3d.ai/api/stories?type=SPREAD_WIDENING&chain=ETH&limit=15
+https://e3d.ai/api/stories?type=LOOP&chain=ETH&limit=10
+https://e3d.ai/api/stories?type=MOMENTUM_DIVERGENCE&chain=ETH&limit=15
+```
+
+**Reject if:**
+- Token appears in `WASH_TRADE` → volume is manufactured; disqualify
+- Token appears in `LIQUIDITY_DRAIN` → pool TVL collapsing; reject or require size reduction to ≤ 25% of normal allocation
+- Token appears in `LOOP` → recycled flows / manipulation fingerprint; reject
+
+**Reduce size if:**
+- Token appears in `SPREAD_WIDENING` → slippage worsening; cap allocation at 50% of proposed size
+- Token appears in `MOMENTUM_DIVERGENCE` → fundamentals weakening vs price; require conviction_score ≥ 0.7 to proceed
+
+### 3. Liquidity and slippage check
+```
+https://e3d.ai/api/evidence/token/{address}
+https://e3d.ai/api/flow/summary?token_address={address}
+```
+Verify liquidity_usd and estimated_slippage_bps in the proposal are consistent with on-chain data.
+
+### 4. Execution risk check
+```
+https://e3d.ai/api/stories?type=SANDWICH&chain=ETH&limit=20
+```
+If the proposed token appears in a recent SANDWICH story, flag it in your response with the bot address and estimated profit. Do not reject on this alone — executor will handle routing — but note it as an execution risk requiring private mempool.
+
+### 5. Buy signal quality check
+
+Verify the proposal's claimed evidence is substantiated. Cross-reference at least one signal:
+```
+https://e3d.ai/api/stories?type=ACCUMULATION&chain=ETH&limit=10
+https://e3d.ai/api/stories?type=SMART_MONEY&chain=ETH&limit=10
+https://e3d.ai/api/stories?type=BREAKOUT_CONFIRMED&chain=ETH&limit=5
+```
+If the proposal claims "ACCUMULATION" but no ACCUMULATION story exists for this token, downgrade confidence and require scout to re-verify.
+
+### 6. Portfolio exposure and sizing
+Apply standard concentration limits:
+- Single token: ≤ 20% of portfolio
+- Single category: ≤ 40% of portfolio
+- Reduce size if position would breach drawdown limits
+
+### 7. Return one of:
+- `reject` — with reason
+- `wait` — with condition (e.g. "re-check after LIQUIDITY_DRAIN resolves")
+- `reduce_size` — with suggested allocation and reason
+- `paper_trade` — log but do not execute
+- `approve_for_executor` — include SANDWICH flag if present
+
+---
+
+## You must not:
 - browse for new opportunities
 - generate freeform token theses
-- execute live trades
-- send funds
+- execute live trades or send funds
 - bypass hard limits
-
-Workflow for every proposal:
-1. validate proposal structure
-2. verify token identity
-3. verify current price drift
-4. verify liquidity and slippage
-5. verify position sizing
-6. verify category and portfolio exposure
-7. return one of:
-   - reject
-   - wait
-   - reduce_size
-   - paper_trade
-   - approve_for_executor

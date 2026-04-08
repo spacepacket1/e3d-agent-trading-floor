@@ -10,6 +10,7 @@ const __dirname = path.dirname(__filename);
 const LOG_DIR = path.join(__dirname, "logs");
 const PORTFOLIO_FILE = path.join(__dirname, "portfolio.json");
 const PIPELINE_LOG = path.join(LOG_DIR, "pipeline.jsonl");
+const AGENT_RAW_LOG = path.join(LOG_DIR, "agent-raw.jsonl");
 const TRAINING_EVENT_LOG = path.join(LOG_DIR, "training-events.jsonl");
 const TRAINING_EVENT_SCHEMA_VERSION = "1.0";
 const MONGO_CONTAINER_NAME = process.env.E3D_MONGO_CONTAINER || "e3d-mongo";
@@ -72,7 +73,8 @@ function nowIso() {
   const absMinutes = Math.abs(offsetMinutes);
   const hours = String(Math.floor(absMinutes / 60)).padStart(2, "0");
   const minutes = String(absMinutes % 60).padStart(2, "0");
-  return `${date.toISOString().slice(0, 19)}${sign}${hours}:${minutes}`;
+  const local = new Date(date.getTime() + offsetMinutes * 60000);
+  return `${local.toISOString().slice(0, 19)}${sign}${hours}:${minutes}`;
 }
 
 function nowMs() {
@@ -262,9 +264,8 @@ function buildScoutIntelUrls(portfolioIntelligence) {
       urls.push(`${E3D_API_BASE_URL}/addressMeta?address=${encodeURIComponent(address)}`);
       urls.push(`${E3D_API_BASE_URL}/token-info/${encodeURIComponent(address)}`);
       urls.push(`${E3D_API_BASE_URL}/evidence/token/${encodeURIComponent(address)}`);
-      urls.push(`${E3D_API_BASE_URL}/opportunity-stories?token_address=${encodeURIComponent(address)}&chain=${encodeURIComponent(chain)}&limit=${E3D_DOSSIER_MAX_STORIES}`);
-      urls.push(`${E3D_API_BASE_URL}/risk-stories?token_address=${encodeURIComponent(address)}&chain=${encodeURIComponent(chain)}&limit=${E3D_DOSSIER_MAX_STORIES}`);
-      urls.push(`${E3D_API_BASE_URL}/theses?token_address=${encodeURIComponent(address)}&limit=3`);
+      urls.push(`${E3D_API_BASE_URL}/stories?q=${encodeURIComponent(address)}&scope=primary&limit=${E3D_DOSSIER_MAX_STORIES}`);
+      urls.push(`${E3D_API_BASE_URL}/stories?q=${encodeURIComponent(address)}&scope=primary&type=THESIS&limit=3`);
       urls.push(`${E3D_API_BASE_URL}/wallet-cohorts/${encodeURIComponent(address)}`);
       urls.push(`${E3D_API_BASE_URL}/flow/summary?token_address=${encodeURIComponent(address)}`);
       urls.push(`${E3D_API_BASE_URL}/addressCounterparties?address=${encodeURIComponent(address)}&limit=${E3D_DOSSIER_MAX_COUNTERPARTIES}`);
@@ -325,9 +326,8 @@ function fetchScoutIntelDebug(portfolioIntelligence) {
       identity: fetchJson("/addressMeta", { address }),
       token_info: fetchJson(`/token-info/${encodeURIComponent(address)}`),
       evidence: fetchJson(`/evidence/token/${encodeURIComponent(address)}`),
-      opportunity_stories: fetchJson("/opportunity-stories", { token_address: address, chain, limit: E3D_DOSSIER_MAX_STORIES }),
-      risk_stories: fetchJson("/risk-stories", { token_address: address, chain, limit: E3D_DOSSIER_MAX_STORIES }),
-      theses: fetchJson("/theses", { token_address: address, limit: 3 }),
+      stories_primary: fetchJson("/stories", { q: address, scope: "primary", limit: E3D_DOSSIER_MAX_STORIES }),
+      theses: fetchJson("/stories", { q: address, scope: "primary", type: "THESIS", limit: 3 }),
       wallet_cohort: fetchJson(`/wallet-cohorts/${encodeURIComponent(address)}`),
       flow_summary: fetchJson("/flow/summary", { token_address: address }),
       address_counterparties: fetchJson("/addressCounterparties", { address, limit: E3D_DOSSIER_MAX_COUNTERPARTIES }),
@@ -374,9 +374,10 @@ function normalizeScoutIntelToken(token, source) {
     symbol: compactText(token.symbol || token.ticker || token.name || "", 40) || null,
     name: compactText(token.name || token.token_name || token.display_name || token.title || "", 80) || null,
     contract_address: cleanAddress(token.contract_address || token.address || token.token_address || "") || null,
-    change_24h_pct: toNum(token.change_24h_pct || token.change_24H || token.change_24h || token.price_change_24h_pct, 0),
+    change_30m_pct: toNum(token.change_30m_pct || token.changes?.["30M"]?.percent, 0),
+    change_24h_pct: toNum(token.change_24h_pct || token.change_24H || token.change_24h || token.price_change_24h_pct || token.changes?.["24H"]?.percent, 0),
     current_price: toNum(token.current_price || token.priceUSD || token.price_usd || token.price, 0),
-    market_cap_usd: toNum(token.market_cap_usd || token.marketCap || token.market_cap, 0),
+    market_cap_usd: toNum(token.market_cap_usd || token.marketCapUSD || token.marketCap || token.market_cap, 0),
     liquidity_usd: toNum(token.liquidity_usd || token.liquidity, 0),
     price_timestamp: token.price_timestamp || token.timestamp || token.ts_created || token.updated_at || null
   };
@@ -389,6 +390,7 @@ function summarizeScoutCandidateReason(token, heldIndex) {
   const symbol = String(token?.symbol || "").trim().toLowerCase();
   const heldMatch = (address && heldIndex.get(address)) || (symbol && heldIndex.get(symbol)) || null;
   const change = toNum(token?.change_24h_pct, 0);
+  const change30m = toNum(token?.change_30m_pct, 0);
 
   if (!address) {
     reasons.push("missing_contract_address");
@@ -403,12 +405,13 @@ function summarizeScoutCandidateReason(token, heldIndex) {
 
   if (token?.bucket === "gainers") {
     signals.push("from_top_gainers_feed");
+    if (change30m > 0) signals.push("positive_30m_change");
     if (change > 0) signals.push("positive_24h_change");
   }
 
   if (token?.bucket === "losers") {
     signals.push("from_top_losers_feed");
-    if (change < 0) reasons.push("negative_24h_change");
+    if (change30m < 0) reasons.push("negative_30m_change");
   }
 
   if (token?.bucket === "token_universe") {
@@ -422,13 +425,13 @@ function summarizeScoutCandidateReason(token, heldIndex) {
     address &&
     !heldMatch &&
     token?.bucket === "gainers" &&
-    change > 0
+    (change30m > 0 || change > 0)
   );
 
   if (!isCandidate) {
     if (!token?.bucket || token.bucket === "token_universe") reasons.push("not_in_top_momentum_feed");
     if (token?.bucket === "losers") reasons.push("appears_in_losers_feed");
-    if (change <= 0) reasons.push("no_positive_24h_momentum");
+    if (change30m <= 0 && change <= 0) reasons.push("no_positive_momentum");
     if (!token?.liquidity_usd && !token?.market_cap_usd) reasons.push("limited_market_context");
   } else {
     reasons.push("top_gainer_with_valid_address_not_held");
@@ -453,8 +456,8 @@ function summarizeScoutCandidateReason(token, heldIndex) {
 function buildScoutCandidateDebug(portfolio, scoutIntel) {
   const heldIndex = buildHeldTokenIndex(portfolio);
   const tokens = mergeUniqueTokens(
-    endpointArray(scoutIntel?.market_trends?.gainers).map((row) => normalizeScoutIntelToken(row, "market_trends")),
-    endpointArray(scoutIntel?.market_trends?.losers).map((row) => normalizeScoutIntelToken(row, "market_trends")),
+    endpointArray(scoutIntel?.market_trends?.gainers).map((row) => normalizeScoutIntelToken(row, "gainers")),
+    endpointArray(scoutIntel?.market_trends?.losers).map((row) => normalizeScoutIntelToken(row, "losers")),
     endpointArray(scoutIntel?.token_universe).map((row) => normalizeScoutIntelToken(row, "token_universe"))
   )
     .filter(Boolean)
@@ -1016,8 +1019,10 @@ function loadAgentContext(agentId) {
 }
 
 function withAgentContext(agentId, taskPrompt) {
-  const context = loadAgentContext(agentId);
-  return [context, taskPrompt].filter(Boolean).join("\n\n").trim();
+  // OpenClaw loads workspace files (TOOLS.md, SOUL.md, etc.) automatically
+  // from the agent's configured workspace directory. Do not re-inject them
+  // here — that would double the context and overflow the model.
+  return taskPrompt.trim();
 }
 
 function buildUrl(baseUrl, pathname, query = {}) {
@@ -1514,9 +1519,8 @@ function buildTokenIntelligenceDossier(position, portfolio, options = {}) {
     limit: 25
   }));
   const capabilityEvidence = address ? fetchJson(`/evidence/token/${encodeURIComponent(address)}`) : null;
-  const opportunityStories = address ? endpointArray(fetchJson("/opportunity-stories", { token_address: address, chain: position?.chain || "ETH", limit: E3D_DOSSIER_MAX_STORIES })) : [];
-  const riskStories = address ? endpointArray(fetchJson("/risk-stories", { token_address: address, chain: position?.chain || "ETH", limit: E3D_DOSSIER_MAX_STORIES })) : [];
-  const thesisRows = address ? endpointArray(fetchJson("/theses", { token_address: address, limit: 3 })) : [];
+  const tokenStories = address ? endpointArray(fetchJson("/stories", { q: address, scope: "primary", limit: E3D_DOSSIER_MAX_STORIES })) : [];
+  const thesisRows = address ? endpointArray(fetchJson("/stories", { q: address, scope: "primary", type: "THESIS", limit: 3 })) : [];
   const walletCohort = address ? fetchJson(`/wallet-cohorts/${encodeURIComponent(address)}`) : null;
   const flowSummary = address ? fetchJson("/flow/summary", { token_address: address }) : null;
   const counterparties = address ? summarizeCounterparties(fetchJson("/addressCounterparties", { address, limit: E3D_DOSSIER_MAX_COUNTERPARTIES })) : [];
@@ -1526,10 +1530,7 @@ function buildTokenIntelligenceDossier(position, portfolio, options = {}) {
   const capabilityStories = mergeUniqueStories(
     endpointArray(capabilityEvidence?.stories),
     endpointArray(capabilityEvidence?.storys),
-    endpointArray(capabilityEvidence?.opportunity_stories),
-    endpointArray(capabilityEvidence?.risk_stories),
-    opportunityStories,
-    riskStories,
+    tokenStories,
     thesisRows,
     legacyStoriesByAddress,
     legacyStoriesBySymbol
@@ -1554,8 +1555,8 @@ function buildTokenIntelligenceDossier(position, portfolio, options = {}) {
   const scores = computeDossierScores({
     position,
     stories: capabilityStories,
-    opportunityStories,
-    riskStories,
+    opportunityStories: tokenStories,
+    riskStories: thesisRows,
     counterparties,
     tokenCounterparties,
     marketData,
@@ -1796,18 +1797,203 @@ function isRateLimitError(err) {
   return msg.includes("rate limit") || msg.includes("rate_limit") || msg.includes("too many requests");
 }
 
-function callAgent(agentId, message, { maxRetries = 3, retryDelayMs = 60000 } = {}) {
+function extractAgentToolCalls(stdout, agentId) {
+  // Extract observable signals from raw openclaw JSON output.
+  // Looks for WebFetch URLs, tool_use blocks, and any structured tool call data
+  // the wrapper may contain (varies by openclaw version).
+  const result = {
+    agent: agentId,
+    ts: nowIso(),
+    webfetch_urls: [],
+    tool_names: [],
+    story_types_fetched: [],
+    raw_bytes: Buffer.byteLength(stdout, "utf8"),
+  };
+
+  try {
+    // Extract all URLs that look like E3D story API calls
+    const urlMatches = stdout.matchAll(/https?:\/\/[^\s"'\\}]+/g);
+    for (const m of urlMatches) {
+      const url = m[0].replace(/[",\])}]+$/, "");
+      if (url.includes("e3d.ai") && !result.webfetch_urls.includes(url)) {
+        result.webfetch_urls.push(url);
+        // Extract story type if present (?type=X or /type/X)
+        const typeMatch = url.match(/[?&]type=([A-Z_]+)/);
+        if (typeMatch && !result.story_types_fetched.includes(typeMatch[1])) {
+          result.story_types_fetched.push(typeMatch[1]);
+        }
+      }
+    }
+
+    // Try to parse the wrapper for tool_use / tool_calls arrays
+    const wrapper = JSON.parse(stdout);
+    const toolUseBlocks = wrapper?.tool_use ?? wrapper?.tool_calls ?? wrapper?.result?.tool_use ?? [];
+    if (Array.isArray(toolUseBlocks)) {
+      for (const block of toolUseBlocks) {
+        const name = block?.name ?? block?.function?.name;
+        if (name && !result.tool_names.includes(name)) result.tool_names.push(name);
+      }
+    }
+    // Some openclaw versions embed payloads with tool steps
+    const payloads = wrapper?.result?.payloads ?? [];
+    for (const p of payloads) {
+      if (p?.type === "tool_use" && p?.name && !result.tool_names.includes(p.name)) {
+        result.tool_names.push(p.name);
+      }
+    }
+  } catch {
+    // best-effort only — never block the pipeline
+  }
+
+  return result;
+}
+
+const EXPECTED_STORY_TYPES = {
+  scout: [
+    "WASH_TRADE", "LOOP", "LIQUIDITY_DRAIN", "SPREAD_WIDENING", "MOMENTUM_DIVERGENCE", "EXCHANGE_FLOW",
+    "ACCUMULATION", "SMART_MONEY", "STEALTH_ACCUMULATION", "BREAKOUT_CONFIRMED", "MOVER", "SURGE",
+    "CONCENTRATION_SHIFT", "INSIDER_TIMING", "TOKEN_QUALITY_SCORE", "SANDWICH",
+  ],
+  harvest: [
+    "LIQUIDITY_DRAIN", "RUG_LIQUIDITY_PULL", "SPREAD_WIDENING", "EXCHANGE_FLOW",
+    "MOMENTUM_DIVERGENCE", "WASH_TRADE", "LOOP", "CONCENTRATION_SHIFT", "WHALE",
+    "VOLUME_PROFILE_ANOMALY", "MIRROR", "ACCUMULATION", "SMART_MONEY",
+  ],
+};
+
+function buildAgentCoverageLog(agentId, payload) {
+  const expected = EXPECTED_STORY_TYPES[agentId] || [];
+
+  // Self-reported: agent may include stories_checked[] in its output
+  const selfReported = Array.isArray(payload?.stories_checked)
+    ? payload.stories_checked
+    : [];
+  const selfReportedTypes = selfReported.map((s) => String(s?.type || s || "").toUpperCase()).filter(Boolean);
+
+  // Evidence-cited: extract story type mentions from candidate evidence[] and risks[]
+  const evidenceCited = new Set();
+  const allItems = [
+    ...(payload?.candidates || []),
+    ...(payload?.exit_candidates || []),
+    ...(payload?.holdings_updates || []),
+  ];
+  for (const item of allItems) {
+    for (const e of item?.evidence || []) {
+      const t = String(e?.type || e?.story_type || "").toUpperCase();
+      if (t) evidenceCited.add(t);
+    }
+    for (const r of item?.risks || []) {
+      const t = String(r?.type || r?.story_type || "").toUpperCase();
+      if (t) evidenceCited.add(t);
+    }
+  }
+
+  const covered = new Set([...selfReportedTypes, ...evidenceCited]);
+  const missing = expected.filter((t) => !covered.has(t));
+  const coverage_pct = expected.length > 0
+    ? Math.round((100 * (expected.length - missing.length)) / expected.length)
+    : null;
+
+  return {
+    agent: agentId,
+    self_reported_types: selfReportedTypes,
+    evidence_cited_types: [...evidenceCited],
+    expected_types: expected,
+    missing_types: missing,
+    coverage_pct,
+    stories_checked_field_present: Array.isArray(payload?.stories_checked),
+  };
+}
+
+function logAgentRaw(agentId, stdout, runId, cycleId) {
+  try {
+    const entry = {
+      ts: nowIso(),
+      pipeline_run_id: runId ?? null,
+      cycle_id: cycleId ?? null,
+      agent: agentId,
+      bytes: Buffer.byteLength(stdout, "utf8"),
+      tool_signals: extractAgentToolCalls(stdout, agentId),
+    };
+    fs.appendFileSync(AGENT_RAW_LOG, JSON.stringify(entry) + "\n");
+  } catch {
+    // never block the pipeline on logging
+  }
+}
+
+const LLM_BASE_URL = process.env.LLM_BASE_URL || "http://127.0.0.1:5050";
+const LLM_MODEL = process.env.LLM_MODEL || "mlx-community/Qwen2.5-14B-Instruct-4bit";
+
+function callLLMDirect(systemPrompt, userMessage, { maxRetries = 2 } = {}) {
+  const bodyObj = {
+    model: LLM_MODEL,
+    messages: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userMessage }
+    ],
+    max_tokens: 6000,
+    temperature: 0
+  };
+  const bodyJson = JSON.stringify(bodyObj);
+  const reqId = crypto.randomUUID();
+
+  // Write body to a temp file so curl can read it via -d @file (avoids ARG_MAX
+  // and stdin-piping issues with execFileSync).
+  const tmpFile = `/tmp/llm-req-${reqId}.json`;
+
   let lastErr;
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
+      fs.writeFileSync(tmpFile, bodyJson);
+      let stdout;
+      try {
+        stdout = execFileSync("curl", [
+          "-s", "-X", "POST",
+          `${LLM_BASE_URL}/v1/chat/completions`,
+          "-H", "Content-Type: application/json",
+          "-H", `X-Request-Id: ${reqId}`,
+          "--max-time", "600",
+          "-d", `@${tmpFile}`
+        ], { encoding: "utf8", maxBuffer: 10 * 1024 * 1024, timeout: 620000 });
+      } finally {
+        try { fs.unlinkSync(tmpFile); } catch (_) {}
+      }
+
+      let parsed;
+      try { parsed = JSON.parse(stdout); } catch (_) {
+        throw new Error(`LLM_JSON_PARSE_FAILED\n${stdout.slice(0, 500)}`);
+      }
+      if (parsed?.error) throw new Error(`LLM_SERVER_ERROR: ${JSON.stringify(parsed.error)}`);
+
+      const msg = parsed?.choices?.[0]?.message;
+      let text = msg?.content;
+      if (Array.isArray(text)) text = text.map((c) => c?.text ?? "").join("");
+      if (typeof text !== "string" || !text.trim()) {
+        throw new Error(`LLM_EMPTY_RESPONSE\n${stdout.slice(0, 500)}`);
+      }
+      return text.trim();
+    } catch (err) {
+      lastErr = err;
+      if (attempt < maxRetries) sleepSync(5000);
+    }
+  }
+  throw lastErr;
+}
+
+function callAgent(agentId, message, { maxRetries = 3, retryDelayMs = 60000, runId, cycleId } = {}) {
+  let lastErr;
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      const sessionId = crypto.randomUUID();
       const stdout = execFileSync(
         "openclaw",
-        ["agent", "--agent", agentId, "--message", message, "--json"],
+        ["agent", "--agent", agentId, "--session-id", sessionId, "--message", message, "--json"],
         {
           encoding: "utf8",
           maxBuffer: 10 * 1024 * 1024
         }
       );
+      logAgentRaw(agentId, stdout, runId, cycleId);
       return parseAgentWrapper(stdout, agentId);
     } catch (err) {
       lastErr = err;
@@ -1821,6 +2007,335 @@ function callAgent(agentId, message, { maxRetries = 3, retryDelayMs = 60000 } = 
     }
   }
   throw lastErr;
+}
+
+function fetchScoutData() {
+  const disqualifierTypes = ["WASH_TRADE", "LOOP", "LIQUIDITY_DRAIN", "SPREAD_WIDENING", "MOMENTUM_DIVERGENCE", "EXCHANGE_FLOW"];
+  const buySignalTypes = ["ACCUMULATION", "SMART_MONEY", "STEALTH_ACCUMULATION", "BREAKOUT_CONFIRMED", "MOVER", "SURGE"];
+  const secondaryTypes = ["CONCENTRATION_SHIFT", "INSIDER_TIMING", "TOKEN_QUALITY_SCORE", "SANDWICH"];
+
+  const stories = {};
+  for (const type of [...disqualifierTypes, ...buySignalTypes, ...secondaryTypes]) {
+    const limit = ["BREAKOUT_CONFIRMED", "ECOSYSTEM_SHIFT"].includes(type) ? 5 : 10;
+    stories[type] = endpointArray(fetchJson("/stories", { type, chain: "ETH", limit }));
+  }
+
+  const gainers = endpointArray(fetchJson("/fetchTokenPricesWithHistoryAllRanges", {
+    dataSource: 1, sortBy: "change_30m_pct", sortDir: "desc", limit: 30
+  })).map((t) => ({
+    symbol: t.symbol,
+    name: t.name || "",
+    address: cleanAddress(t.address || t.contract_address || ""),
+    price_usd: t.priceUSD ?? t.price_usd ?? t.priceUsd ?? null,
+    change_30m: t.changes?.["30M"]?.percent ?? t.change_30m_pct ?? null,
+    change_24h: t.changes?.["24H"]?.percent ?? t.change_24h_pct ?? null,
+    market_cap_usd: t.marketCapUSD ?? t.market_cap_usd ?? null,
+    liquidity_usd: t.liquidityUSD ?? t.effectiveLiquidityUSD ?? t.liquidity_usd ?? null,
+    volume_24h_usd: t.volume24hUSD ?? t.volume_24h_usd ?? null,
+    fragility_score: t.fragilityScore ?? null
+  }));
+
+  return { stories, gainers, disqualifierTypes, buySignalTypes, secondaryTypes };
+}
+
+function runScoutDirect(portfolio, portfolioIntelligence = null) {
+  const createdAt = nowIso();
+  const expiresAt = new Date(Date.now() + 2 * 24 * 60 * 60 * 1000).toISOString();
+  const dossier = portfolioIntelligence || buildPortfolioIntelligenceDossier(portfolio);
+
+  const heldAddresses = new Set(
+    Object.values(portfolio?.positions || {})
+      .map((p) => cleanAddress(p?.contract_address || "")).filter(Boolean)
+  );
+  const heldSymbols = new Set(
+    Object.values(portfolio?.positions || {})
+      .map((p) => String(p?.symbol || "").trim().toLowerCase()).filter(Boolean)
+  );
+
+  // Pre-fetch all E3D data
+  const data = fetchScoutData();
+
+  // Build story-based price fallback: address → story meta with price data
+  const storyPriceMap = new Map();
+  for (const items of Object.values(data.stories)) {
+    for (const s of (items || [])) {
+      const addr = cleanAddress(s?.meta?.token_address || s?.primary_token || s?.address || "");
+      if (!addr) continue;
+      const existing = storyPriceMap.get(addr);
+      const price = s?.meta?.entities?.current_price_usd ?? s?.meta?.current_price_usd ?? null;
+      const mcap = s?.meta?.entities?.marketCapUSD ?? s?.meta?.marketCapUSD ?? null;
+      const liq = s?.meta?.entities?.liquidityUSD ?? s?.meta?.liquidityUSD ?? s?.meta?.liquidity_usd ?? null;
+      if (price != null && (!existing || (existing.price == null))) {
+        storyPriceMap.set(addr, {
+          price,
+          mcap: mcap ?? (existing?.mcap ?? null),
+          liq: liq ?? (existing?.liq ?? null),
+          symbol: s?.meta?.token?.symbol || s?.meta?.token_symbol || ""
+        });
+      }
+    }
+  }
+
+  // Build disqualified address set
+  const disqualifiedAddresses = new Set([...heldAddresses]);
+  for (const type of data.disqualifierTypes) {
+    for (const s of (data.stories[type] || [])) {
+      const addr = cleanAddress(s?.meta?.token_address || s?.token_address || s?.address || "");
+      if (addr) disqualifiedAddresses.add(addr);
+      if (type === "EXCHANGE_FLOW" && s?.meta?.direction !== "deposits") disqualifiedAddresses.delete(addr);
+    }
+  }
+
+  const systemPrompt = [
+    "You are Scout, a crypto trading research agent.",
+    "You have been given pre-fetched E3D market intelligence data. Analyze it and return STRICT JSON only — one object, no markdown, no commentary.",
+    "Disqualify any token whose address appears in the DISQUALIFIERS section.",
+    "Score candidates from the BUY SIGNALS section using real evidence values from the data.",
+    "Return up to 3 buy candidates. Only return candidates:[] if zero tokens survived disqualification with any positive signal.",
+    `Exclude: symbols=${JSON.stringify([...heldSymbols])} addresses=${JSON.stringify([...heldAddresses])}`,
+    `Output shape: {scan_timestamp, candidates[], holdings_updates[], stories_checked[]}`,
+    `Each candidate: {source_agent:"scout", created_at:"${createdAt}", expires_at:"${expiresAt}", token:{symbol,name,chain:"ethereum",contract_address,category}, setup_type, action:"buy", confidence, conviction_score, opportunity_score, why_now, evidence[], risks[], entry_zone:{low,high}, invalidation_price, targets:{target_1,target_2,target_3}, market_data:{current_price,change_24h_pct,change_30m_pct,price_source:"e3d",market_cap_usd}, liquidity_data:{liquidity_usd,liquidity_source:"e3d"}, execution_data:{estimated_slippage_bps,quote_source:"e3d"}, portfolio_data:{current_token_exposure_pct:0,current_category_exposure_pct:0,current_total_exposure_pct:0}}`,
+    `stories_checked[]: one entry per story type — {type, found, tokens[]}`
+  ].join("\n");
+
+  const userMessage = [
+    `Scout task — ${createdAt}`,
+    `Portfolio: cash=$${portfolio?.cash_usd ?? 100000} positions=${Object.keys(portfolio?.positions || {}).length}`,
+    `\n--- DISQUALIFIERS (addresses to exclude) ---`,
+    ...data.disqualifierTypes.map((type) => {
+      const items = data.stories[type] || [];
+      const addrs = items.map((s) => cleanAddress(s?.meta?.token_address || s?.token_address || "")).filter(Boolean);
+      return `${type} (${items.length} stories): ${addrs.slice(0, 5).join(", ") || "none"}`;
+    }),
+    `\n--- BUY SIGNALS ---`,
+    ...data.buySignalTypes.map((type) => {
+      const items = (data.stories[type] || []).slice(0, 5);
+      return `${type} (${items.length} found):\n${items.map((s) => {
+        const addr = cleanAddress(s?.meta?.token_address || s?.meta?.token?.address || s?.token_address || s?.address || "");
+        const sym = s?.meta?.token_symbol || s?.meta?.token?.symbol || s?.symbol || s?.title || "";
+        const hint = s?.meta?.narrative_hint || s?.meta?.ai_narrative?.slice(0, 120) || "";
+        const qual = s?.meta?.confirmation_quality || s?.meta?.participation_type || "";
+        return JSON.stringify({ address: addr, symbol: sym, score: s?.score, hint, quality: qual });
+      }).join("\n")}`;
+    }),
+    `\n--- SECONDARY SIGNALS ---`,
+    ...data.secondaryTypes.map((type) => {
+      const items = (data.stories[type] || []).slice(0, 3);
+      return `${type} (${items.length}): ${items.map((s) => cleanAddress(s?.meta?.token_address || s?.token_address || "")).filter(Boolean).join(", ") || "none"}`;
+    }),
+    `\n--- TOP 30m GAINERS ---`,
+    JSON.stringify(data.gainers.slice(0, 15))
+  ].join("\n");
+
+  const rawText = callLLMDirect(systemPrompt, userMessage);
+
+  // Extract JSON — try multiple strategies
+  let jsonStr = rawText.trim();
+
+  // Strip markdown fences
+  const fenceMatch = jsonStr.match(/```(?:json)?\s*([\s\S]*?)```/);
+  if (fenceMatch) jsonStr = fenceMatch[1].trim();
+
+  // Find the outermost JSON object: from first { to its matching }
+  const firstBrace = jsonStr.indexOf("{");
+  if (firstBrace !== -1) {
+    let depth = 0, end = -1;
+    for (let i = firstBrace; i < jsonStr.length; i++) {
+      if (jsonStr[i] === "{") depth++;
+      else if (jsonStr[i] === "}") { depth--; if (depth === 0) { end = i; break; } }
+    }
+    if (end !== -1) jsonStr = jsonStr.slice(firstBrace, end + 1);
+    else jsonStr = jsonStr.slice(firstBrace); // truncated — take what we have
+  }
+
+  let result;
+  try {
+    result = JSON.parse(jsonStr);
+  } catch (parseErr) {
+    const preview = rawText.slice(0, 500);
+    throw new Error(`SCOUT_REPLY_NOT_JSON\n${preview}`);
+  }
+
+  // Post-process: enrich candidates with real market data fetched per-address.
+  // The 14B model often leaves numeric fields as empty strings.
+  const now = new Date().toISOString();
+  for (const candidate of result.candidates || []) {
+    const addr = cleanAddress(candidate?.token?.contract_address || "");
+    if (!addr) continue;
+
+    // Fetch per-token price data from E3D
+    let tokenRow = null;
+    try {
+      const rows = endpointArray(fetchJson("/fetchTokenPricesWithHistoryAllRanges", {
+        dataSource: 1, search: addr, limit: 1
+      }));
+      tokenRow = rows.find((r) => cleanAddress(r.address || "") === addr) || rows[0] || null;
+    } catch (_) {}
+
+    // Fall back to story-embedded price data if price DB returns nothing
+    const storyPrice = storyPriceMap.get(addr);
+    if (!tokenRow && !storyPrice) continue;
+
+    // Enrich token name if missing
+    if (!candidate.token.name && tokenRow?.name) candidate.token.name = tokenRow.name;
+    if (!candidate.token.name && storyPrice?.symbol) candidate.token.name = storyPrice.symbol;
+
+    const price = tokenRow?.priceUSD ?? tokenRow?.price_usd ?? storyPrice?.price ?? 0;
+    const liq = tokenRow?.liquidityUSD ?? tokenRow?.effectiveLiquidityUSD ?? tokenRow?.liquidity_usd ?? storyPrice?.liq ?? 0;
+    const mcap = tokenRow?.marketCapUSD ?? tokenRow?.market_cap_usd ?? storyPrice?.mcap ?? 0;
+    const vol24 = tokenRow?.volume24hUSD ?? tokenRow?.volume_24h_usd ?? 0;
+    const chg30m = tokenRow?.changes?.["30M"]?.percent ?? 0;
+    const chg24h = tokenRow?.changes?.["24H"]?.percent ?? 0;
+
+    candidate.market_data = {
+      current_price: price,
+      change_24h_pct: chg24h,
+      change_30m_pct: chg30m,
+      price_timestamp: now,
+      price_source: "e3d",
+      volume_24h_usd: vol24,
+      market_cap_usd: mcap
+    };
+
+    candidate.liquidity_data = {
+      liquidity_usd: liq,
+      liquidity_timestamp: now,
+      liquidity_source: "e3d"
+    };
+
+    const slippageBps = liq > 100000 ? 50 : liq > 20000 ? 150 : liq > 5000 ? 300 : 999;
+    candidate.execution_data = {
+      estimated_slippage_bps: slippageBps,
+      quote_source: "e3d"
+    };
+
+    if (tokenRow.fragilityScore != null) candidate._fragility_score = tokenRow.fragilityScore;
+  }
+
+  return result;
+}
+
+function runHarvestDirect(portfolio, portfolioIntelligence = null) {
+  const createdAt = nowIso();
+  const expiresAt = new Date(Date.now() + 12 * 60 * 60 * 1000).toISOString();
+  const dossier = portfolioIntelligence || buildPortfolioIntelligenceDossier(portfolio);
+
+  const positions = Object.values(portfolio?.positions || {});
+
+  // No positions — nothing to harvest
+  if (positions.length === 0) {
+    return {
+      scan_timestamp: createdAt,
+      portfolio_summary: {
+        market_regime: dossier.market_regime || "unknown",
+        cash_usd: portfolio.cash_usd || 0,
+        equity_usd: portfolio.equity_usd || 0,
+        position_count: 0,
+        tracked_positions: 0,
+        average_thesis_strength: 0,
+        average_thesis_freshness: 0,
+        average_narrative_decay: 0,
+        average_opportunity_score: 0
+      },
+      position_reviews: [],
+      exit_candidates: [],
+      stories_checked: []
+    };
+  }
+
+  // Pre-fetch exit-risk stories for held addresses
+  const heldAddresses = positions.map((p) => cleanAddress(p?.contract_address || "")).filter(Boolean);
+  const exitRiskTypes = ["LIQUIDITY_DRAIN", "WASH_TRADE", "SPREAD_WIDENING", "MOMENTUM_DIVERGENCE", "EXCHANGE_FLOW", "LOOP"];
+  const holdConfirmTypes = ["ACCUMULATION", "SMART_MONEY"];
+  const exitStories = {};
+  for (const type of [...exitRiskTypes, ...holdConfirmTypes]) {
+    try {
+      const url = `${E3D_API_BASE_URL}/stories?type=${type}&chain=ETH&scope=primary&limit=20`;
+      const raw = e3dFetch(url);
+      exitStories[type] = raw?.items || raw?.data || raw || [];
+    } catch (_) { exitStories[type] = []; }
+  }
+
+  // Build per-position story matches
+  const addrSet = new Set(heldAddresses);
+  const storyMatches = {};
+  for (const [type, items] of Object.entries(exitStories)) {
+    storyMatches[type] = items.filter((s) => {
+      const addr = cleanAddress(s?.meta?.token_address || s?.token_address || s?.address || "");
+      return addrSet.has(addr);
+    }).map((s) => ({
+      address: cleanAddress(s?.meta?.token_address || s?.token_address || s?.address || ""),
+      symbol: s?.meta?.token_symbol || s?.symbol || "",
+      score: s?.score,
+      hint: s?.meta?.narrative_hint || ""
+    }));
+  }
+
+  const positionData = dossier.holdings.slice(0, 8).map((item) => ({
+    symbol: item?.token?.symbol || null,
+    contract_address: item?.token?.contract_address || null,
+    category: item?.token?.category || "unknown",
+    quantity: toNum(item?.position?.quantity, 0),
+    avg_entry_price: toNum(item?.position?.avg_entry_price, 0),
+    current_price: toNum(item?.market_data?.current_price, 0),
+    market_value_usd: toNum(item?.position?.market_value_usd, 0),
+    cost_basis_usd: toNum(item?.position?.cost_basis_usd, 0),
+    unrealized_pnl_usd: toNum(item?.position?.market_value_usd, 0) - toNum(item?.position?.cost_basis_usd, 0),
+    thesis_strength: item?.thesis?.strength ?? null,
+    thesis_freshness: item?.thesis?.freshness ?? null,
+    narrative_decay: item?.thesis?.decay ?? null,
+    opportunity_score: item?.thesis?.opportunity_score ?? null,
+    fraud_risk: item?.thesis?.fraud_risk ?? null
+  }));
+
+  const systemPrompt = [
+    "You are Harvest, a crypto portfolio exit-scan agent.",
+    "You have been given pre-fetched E3D exit-risk story data for held positions. Analyze it and return STRICT JSON only — one object, no markdown.",
+    "Classify every held position as hold, monitor, trim, or exit based on the evidence.",
+    "Only add a position to exit_candidates if action is trim or exit.",
+    `Output shape: {scan_timestamp, portfolio_summary, position_reviews[], exit_candidates[], stories_checked[]}`,
+    `Each position_review: {source_agent:"harvest", created_at:"${createdAt}", expires_at:"${expiresAt}", token:{symbol,name,chain:"ethereum",contract_address,category}, position:{quantity,avg_entry_price,current_price,market_value_usd,cost_basis_usd,unrealized_pnl_usd}, action:"hold"|"monitor"|"trim"|"exit", thesis_state, thesis_summary, what_changed, why_now, confidence, conviction_score, opportunity_score, review_priority, summary, evidence[], risks[], what_would_change_my_mind[], next_best_alternative, current_regime, market_data:{current_price,change_24h_pct,price_source:"e3d"}, narrative_data:{story_strength,thesis_health,flow_direction}}`,
+    `Each exit_candidate: same as position_review plus {setup_type, edge_source, suggested_exit_fraction, target_exit_price, decision_price, exit_priority}`
+  ].join("\n");
+
+  const userMessage = [
+    `Harvest task — ${createdAt}`,
+    `Held positions (${positionData.length}):`,
+    JSON.stringify(positionData),
+    `\n--- EXIT RISK STORIES (matched to held addresses) ---`,
+    ...exitRiskTypes.map((type) => {
+      const matches = storyMatches[type] || [];
+      return `${type}: ${matches.length} matches — ${JSON.stringify(matches.slice(0, 3))}`;
+    }),
+    `\n--- HOLD CONFIRM SIGNALS ---`,
+    ...holdConfirmTypes.map((type) => {
+      const matches = storyMatches[type] || [];
+      return `${type}: ${matches.length} matches — ${JSON.stringify(matches.slice(0, 3))}`;
+    })
+  ].join("\n");
+
+  const rawText = callLLMDirect(systemPrompt, userMessage);
+
+  // Extract JSON
+  let jsonStr = rawText.trim();
+  const fenceMatch = jsonStr.match(/```(?:json)?\s*([\s\S]*?)```/);
+  if (fenceMatch) jsonStr = fenceMatch[1].trim();
+  const firstBrace = jsonStr.indexOf("{");
+  if (firstBrace !== -1) {
+    let depth = 0, end = -1;
+    for (let i = firstBrace; i < jsonStr.length; i++) {
+      if (jsonStr[i] === "{") depth++;
+      else if (jsonStr[i] === "}") { depth--; if (depth === 0) { end = i; break; } }
+    }
+    if (end !== -1) jsonStr = jsonStr.slice(firstBrace, end + 1);
+    else jsonStr = jsonStr.slice(firstBrace);
+  }
+
+  try {
+    return JSON.parse(jsonStr);
+  } catch (parseErr) {
+    throw new Error(`HARVEST_REPLY_NOT_JSON\n${rawText.slice(0, 500)}`);
+  }
 }
 
 function buildScoutPrompt(portfolio, portfolioIntelligence = null) {
@@ -1863,65 +2378,15 @@ function buildScoutPrompt(portfolio, portfolioIntelligence = null) {
   const compactPortfolioBaseline = JSON.stringify(portfolioBaseline);
 
   const taskPrompt = [
-    "You are Scout. Return STRICT JSON only.",
-    "Goal: find up to 3 new buy candidates and refresh the current holdings.",
-    "Use story, flow, thesis, and market context. Prefer explicit opportunity evidence over raw momentum.",
-    "Do not include any already-held token in candidates.",
-    "If nothing qualifies, return candidates: [].",
-    "EXCLUSIONS — never include these tokens in candidates:",
-    JSON.stringify(exclusions),
-    "REQUIRED RESEARCH — use WebFetch (endpoints in TOOLS.md) before producing output:",
-    "1. Fetch 30m gainers and losers. Filter against exclusions.",
-    "2. For each promising token: fetch opportunity-stories, risk-stories, and flow/summary.",
-    "3. Score candidates from evidence — use real computed values, not placeholder zeros.",
-    "4. Verify invalidation and liquidity for every candidate before including it.",
-    "Requirements: lowercase 0x addresses, no spaces in addresses, valid JSON, one object only.",
-    "Required shape (fill all numeric fields with real values from your research):",
-    JSON.stringify({
-      scan_timestamp: createdAt,
-      candidates: [
-        {
-          source_agent: "scout",
-          created_at: createdAt,
-          expires_at: expiresAt,
-          token: { symbol: "", name: "", chain: "ethereum", contract_address: "", category: "" },
-          setup_type: "swing",
-          action: "buy",
-          confidence: 0,
-          conviction_score: 0,
-          opportunity_score: 0,
-          why_now: "",
-          evidence: [],
-          risks: [],
-          what_would_change_my_mind: [],
-          next_best_alternative: "",
-          market_data: { current_price: 0, change_24h_pct: 0, price_source: "e3d", market_cap_usd: 0 },
-          liquidity_data: { liquidity_usd: 0, liquidity_source: "e3d" },
-          execution_data: { estimated_slippage_bps: 0, quote_source: "e3d" },
-          portfolio_data: { current_token_exposure_pct: 0, current_category_exposure_pct: 0, current_total_exposure_pct: 0 }
-        }
-      ],
-      holdings_updates: [
-        {
-          symbol: "",
-          contract_address: "",
-          category: "",
-          market_data: { current_price: 0, price_source: "e3d", market_cap_usd: 0 },
-          liquidity_data: { liquidity_usd: 0, liquidity_source: "e3d" },
-          execution_data: { estimated_slippage_bps: 0, quote_source: "e3d" },
-          opportunity_score: 0,
-          conviction_score: 0,
-          liquidity_quality: 0,
-          fraud_risk: 0,
-          why_now: "",
-          risks: []
-        }
-      ]
-    }),
-    "Context:",
-    compactPortfolioBaseline,
-    "Holdings:",
-    JSON.stringify(holdings)
+    `Scout task — ${createdAt}. Return STRICT JSON only (one object, no markdown).`,
+    `Follow the full Research Protocol in TOOLS.md: disqualifier sweep first, then buy signals, then per-candidate deep checks.`,
+    `Return up to 3 buy candidates. Use real values from your research — no placeholder zeros.`,
+    `Exclude held tokens: ${JSON.stringify(exclusions.held_symbols)}`,
+    `Excluded addresses: ${JSON.stringify(exclusions.held_addresses)}`,
+    `Output fields: scan_timestamp, candidates[], holdings_updates[], stories_checked[].`,
+    `Each candidate: source_agent="scout", created_at, expires_at="${expiresAt}", token{symbol,name,chain,contract_address,category}, setup_type, action="buy", confidence, conviction_score, opportunity_score, why_now, evidence[], risks[], entry_zone{low,high}, invalidation_price, targets{target_1,target_2,target_3}, market_data, liquidity_data, execution_data, portfolio_data.`,
+    `stories_checked[]: one entry per story type fetched — {type, found, tokens[]|disqualified_addresses[]}.`,
+    `Portfolio context: ${compactPortfolioBaseline}`
   ].join("\n").trim();
 
   return withAgentContext("scout", taskPrompt);
@@ -1978,12 +2443,12 @@ Your job:
 3. Classify every position as hold, monitor, trim, or exit using live evidence vs the baseline scores
 4. Return STRICT JSON only — no markdown, no questions, no buy ideas
 
-REQUIRED RESEARCH — use WebFetch for each held position before classifying:
-- Risk stories:  https://e3d.ai/api/risk-stories?token_address={address}&chain=ethereum&limit=4
-- Flow summary:  https://e3d.ai/api/flow/summary?token_address={address}
-- Wallet cohort: https://e3d.ai/api/wallet-cohorts/{address}
-For ambiguous positions, also fetch opportunity-stories and token-info (see TOOLS.md for all endpoints).
-For market context: fetch 30m gainers and losers (see TOOLS.md).
+REQUIRED RESEARCH — follow the full Research Protocol in TOOLS.md before classifying:
+1. Run the immediate-exit sweep (LIQUIDITY_DRAIN, RUG_LIQUIDITY_PULL, SPREAD_WIDENING, EXCHANGE_FLOW, MOMENTUM_DIVERGENCE, WASH_TRADE, LOOP) — match against every held address.
+2. Run the positioning-risk sweep (CONCENTRATION_SHIFT, WHALE net OUT, VOLUME_PROFILE_ANOMALY, MIRROR).
+3. Check hold-confirmation signals (ACCUMULATION, SMART_MONEY, EXCHANGE_FLOW net withdrawals).
+4. For each held position: fetch /stories?q={address}&scope=primary&limit=10, flow/summary, wallet-cohort.
+5. Compare live signals against pre-computed thesis scores in context. Live signals take priority.
 
 PORTFOLIO INTELLIGENCE DOSSIER (pre-computed baseline scores):
 ${JSON.stringify(portfolioBaseline)}
@@ -2045,6 +2510,8 @@ Return EXACTLY this shape — one JSON object, no markdown:
 }
 
 RULES: position_reviews covers every held position — exit_candidates only for trim/exit — valid lowercase addresses — one object only.
+Include a top-level "stories_checked" array listing every story type you fetched, with "found" count and any "flagged_addresses" that influenced your decision. This is required for audit.
+Example: [{"type":"LIQUIDITY_DRAIN","found":2,"flagged_addresses":["0x..."]},{"type":"ACCUMULATION","found":0,"flagged_addresses":[]}]
 `.trim();
 
   return withAgentContext("harvest", taskPrompt);
@@ -2135,12 +2602,51 @@ function pruneCooldowns(portfolio) {
   }
 }
 
+function callDirectJson(agentRole, systemPrompt, userPrompt, errorTag) {
+  const rawText = callLLMDirect(systemPrompt, userPrompt);
+  let jsonStr = rawText.trim();
+  const fenceMatch = jsonStr.match(/```(?:json)?\s*([\s\S]*?)```/);
+  if (fenceMatch) jsonStr = fenceMatch[1].trim();
+  const firstBrace = jsonStr.indexOf("{");
+  if (firstBrace !== -1) {
+    let depth = 0, end = -1;
+    for (let i = firstBrace; i < jsonStr.length; i++) {
+      if (jsonStr[i] === "{") depth++;
+      else if (jsonStr[i] === "}") { depth--; if (depth === 0) { end = i; break; } }
+    }
+    if (end !== -1) jsonStr = jsonStr.slice(firstBrace, end + 1);
+    else jsonStr = jsonStr.slice(firstBrace);
+  }
+  try { return JSON.parse(jsonStr); } catch (_) {
+    throw new Error(`${errorTag}_NOT_JSON\n${rawText.slice(0, 400)}`);
+  }
+}
+
+function runRiskDirect(proposal) {
+  const systemPrompt = [
+    "You are Risk, a crypto trade risk validator.",
+    "Validate the proposal and return STRICT JSON only — one object, no markdown.",
+    `Response shape: {decision:"approve_for_executor"|"reject", reason_summary, reason_codes[], risk_score:number(0-100), checks_passed[], checks_failed[], blocker_list[]}`,
+    "Decision: approve_for_executor ONLY IF ALL of these pass:",
+    "  1. contract_address is a valid 42-char hex address",
+    "  2. market_data.current_price > 0",
+    "  3. liquidity_data.liquidity_usd >= 5000",
+    "  4. execution_data.estimated_slippage_bps <= 300",
+    "  5. _fragility_score (if present) < 70",
+    "If any of these fail, decision = reject.",
+    "Ignore missing optional fields like confidence, entry_zone, targets, why_now — they are informational only.",
+    "reason_codes must be exact snake_case strings."
+  ].join("\n");
+  const userPrompt = `Validate this proposal:\n${JSON.stringify(proposal)}`;
+  return callDirectJson("risk", systemPrompt, userPrompt, "RISK_DIRECT");
+}
+
 function runRiskForCandidates(candidates, portfolio) {
   const approved = [];
   const rejected = [];
 
   for (const proposal of candidates) {
-    const risk = callAgent("risk", buildRiskPrompt(proposal));
+    const risk = runRiskDirect(proposal);
     const entry = { proposal, risk };
 
     const decision = String(risk?.decision || "").toLowerCase();
@@ -2164,12 +2670,27 @@ function runRiskForCandidates(candidates, portfolio) {
   return { approved, rejected };
 }
 
+function runExecutorDirect(proposal, portfolio) {
+  const paperMode = portfolio?.settings?.paper_mode ? "enabled" : "disabled";
+  const systemPrompt = [
+    "You are Executor, a crypto trade final-approval agent.",
+    `Paper mode is ${paperMode}.`,
+    "Validate the proposal and return STRICT JSON only — one object, no markdown.",
+    `Allowed executor_decision values: "reject", "paper_trade", "approve_live", "reduce_size", "wait_for_entry", "monitor_only"`,
+    `Response shape: {token, executor_decision, reason_summary, risk_checks[], execution_checks[], portfolio_checks[], approved_size_pct, approved_exit_fraction, max_slippage_bps, entry_status, stop_level, target_plan, paper_trade_ticket, live_execution_allowed, blocker_list[], follow_up_action}`,
+    "Rules: do not originate trades. Preserve capital first. Reject malformed, stale, illiquid, or oversized proposals.",
+    "If paper mode is enabled, prefer paper_trade over approve_live."
+  ].join("\n");
+  const userPrompt = `Validate this proposal:\n${JSON.stringify(proposal)}`;
+  return callDirectJson("executor", systemPrompt, userPrompt, "EXECUTOR_DIRECT");
+}
+
 function runExecutorForActions(actions, portfolio, tradeKind) {
   const reviewed = [];
 
   for (const action of actions) {
     const proposal = buildExecutorProposal(action, portfolio, tradeKind);
-    const review = callAgent("executor", buildExecutorPrompt(proposal, portfolio));
+    const review = runExecutorDirect(proposal, portfolio);
     recordExecutorDecisionEvent({ action, proposal, review }, portfolio, getTrainingContext(), tradeKind);
     reviewed.push({ action, proposal, review, tradeKind });
   }
@@ -2710,11 +3231,12 @@ async function runCycle(runContext = {}) {
   });
 
   try {
-    // 1. SCOUT
-    const scoutPayload = callAgent("scout", buildScoutPrompt(portfolio, portfolioIntelligence));
+    // 1. SCOUT — pre-fetch E3D data, then call LLM directly (no tool loop needed)
+    const scoutPayload = runScoutDirect(portfolio, portfolioIntelligence);
     validateScoutPayload(scoutPayload);
     scoutPayload.candidates = filterScoutCandidatesAgainstPortfolio(scoutPayload.candidates || [], portfolio);
     log("scout", scoutPayload);
+    log("agent_coverage", buildAgentCoverageLog("scout", scoutPayload));
     for (const candidate of scoutPayload.candidates || []) {
       recordCandidateEvent(candidate, portfolio, trainingContext, portfolioIntelligence.prompt_snapshot);
     }
@@ -2733,10 +3255,11 @@ async function runCycle(runContext = {}) {
     }
     if (sellTrades.length) log("sell_trades", sellTrades);
 
-    // 4. HARVEST EXIT SCAN
-    const harvestPayload = callAgent("harvest", buildHarvestPrompt(portfolio, portfolioIntelligence));
+    // 4. HARVEST EXIT SCAN (direct LLM — bypasses OpenClaw)
+    const harvestPayload = runHarvestDirect(portfolio, portfolioIntelligence);
     validateHarvestPayload(harvestPayload);
     log("harvest", harvestPayload);
+    log("agent_coverage", buildAgentCoverageLog("harvest", harvestPayload));
     for (const candidate of harvestPayload.exit_candidates || []) {
       recordHarvestDecisionEvent(candidate, candidate, portfolio, trainingContext, portfolioIntelligence.prompt_snapshot);
     }
@@ -2933,7 +3456,13 @@ async function main() {
   while (!stopRequested && iteration < cli.maxIterations) {
     iteration += 1;
     console.log(`\n🔁 Loop iteration ${iteration}${Number.isFinite(cli.maxIterations) ? `/${cli.maxIterations}` : ""}\n`);
-    await runCycle({ pipeline_run_id: pipelineRunId, cycle_id: crypto.randomUUID(), cycle_index: iteration, debugMode });
+
+    try {
+      await runCycle({ pipeline_run_id: pipelineRunId, cycle_id: crypto.randomUUID(), cycle_index: iteration, debugMode });
+    } catch (err) {
+      log("error", { message: err.message, iteration });
+      console.error("\n🔥 Cycle error (loop continues):\n", err.message);
+    }
 
     if (stopRequested || iteration >= cli.maxIterations) break;
 

@@ -8,6 +8,17 @@ function cls(...parts) {
   return parts.filter(Boolean).join(" ");
 }
 
+function tokenLink(address, symbol, className = "candidate-symbol") {
+  const addr = String(address || "").trim();
+  const label = String(symbol || addr.slice(0, 8) || "?").toUpperCase();
+  if (!addr || addr.length < 10) return React.createElement("span", { className }, label);
+  return React.createElement(
+    "a",
+    { href: `https://e3d.ai/token/${addr}`, target: "_blank", rel: "noopener noreferrer", className: `${className} token-link` },
+    label
+  );
+}
+
 function badgeForRegime(regime) {
   if (regime === "risk_on") return "badge badge-green";
   if (regime === "neutral") return "badge badge-amber";
@@ -34,7 +45,13 @@ function formatPipelineStatus(status) {
 
 function prettyTime(value) {
   if (!value) return "—";
-  return new Date(value).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "—";
+  return date.toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+    timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone
+  });
 }
 
 function prettyDateTime(value) {
@@ -46,7 +63,9 @@ function prettyDateTime(value) {
     month: "short",
     day: "numeric",
     hour: "2-digit",
-    minute: "2-digit"
+    minute: "2-digit",
+    timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+    timeZoneName: "short"
   });
 }
 
@@ -289,7 +308,7 @@ function IntelligenceTokenCard({ item, rank, variant = "positive" }) {
         "div",
         null,
         React.createElement("div", { className: "intelligence-card-rank" }, `#${rank}`),
-        React.createElement("div", { className: "intelligence-card-title" }, `${String(token.symbol || token.name || "—").toUpperCase()} · ${token.name || "Unnamed"}`),
+        React.createElement("div", { className: "intelligence-card-title" }, tokenLink(token.contract_address, token.symbol || token.name || "—"), React.createElement("span", null, ` · ${token.name || "Unnamed"}`)),
         React.createElement("div", { className: "intelligence-card-meta" }, `${token.category || "unknown"} · ${recommendation.action || "watch"}`)
       ),
       React.createElement("div", { className: cls("intelligence-action-pill", variant === "risk" ? "is-risk" : "is-positive") }, recommendation.action || "watch")
@@ -473,10 +492,281 @@ function LaneNode({ lane, className }) {
   );
 }
 
+const BUY_SIGNAL_TYPES = new Set(["MOVER", "SURGE", "ACCUMULATION", "SMART_MONEY", "STEALTH_ACCUMULATION", "BREAKOUT_CONFIRMED"]);
+const ALL_SIGNAL_LABELS = {
+  MOVER: "Mover", SURGE: "Surge", ACCUMULATION: "Accumulation", SMART_MONEY: "Smart Money",
+  STEALTH_ACCUMULATION: "Stealth Accum.", BREAKOUT_CONFIRMED: "Breakout",
+  WASH_TRADE: "Wash Trade", LOOP: "Loop", LIQUIDITY_DRAIN: "Liq. Drain",
+  SPREAD_WIDENING: "Spread", MOMENTUM_DIVERGENCE: "Mom. Div.", EXCHANGE_FLOW: "Exch. Flow",
+  RUG_LIQUIDITY_PULL: "Rug Pull", CONCENTRATION_SHIFT: "Conc. Shift", WHALE: "Whale",
+  VOLUME_PROFILE_ANOMALY: "Vol. Anomaly", MIRROR: "Mirror", FUNNEL: "Funnel",
+  HOTLINKS: "Hotlinks", INSIDER_TIMING: "Insider", TOKEN_QUALITY_SCORE: "Quality",
+  SANDWICH: "Sandwich", CATEGORY: "Category", ECOSYSTEM_SHIFT: "Ecosystem"
+};
+
+function SignalPill({ type, found }) {
+  const label = ALL_SIGNAL_LABELS[type] || type;
+  const isBuy = BUY_SIGNAL_TYPES.has(type);
+  const cls2 = found > 0
+    ? (isBuy ? "signal-pill signal-pill-buy" : "signal-pill signal-pill-danger")
+    : "signal-pill signal-pill-inactive";
+  return React.createElement("span", { className: cls2 }, found > 0 ? `${label} ×${found}` : label);
+}
+
+function CycleCard({ cycle }) {
+  const scout = cycle.scout || {};
+  const harvest = cycle.harvest || {};
+  const approved = Array.isArray(cycle.risk_approved) ? cycle.risk_approved : [];
+  const rejected = Array.isArray(cycle.risk_rejected) ? cycle.risk_rejected : [];
+  const regime = cycle.market_regime || {};
+  const stats = cycle.stats || {};
+
+  const storiesChecked = Array.isArray(scout.stories_checked) ? scout.stories_checked : [];
+  const buySignals = storiesChecked.filter((s) => BUY_SIGNAL_TYPES.has(s.type));
+  const disqualifiers = storiesChecked.filter((s) => !BUY_SIGNAL_TYPES.has(s.type) && s.found > 0);
+  const foundBuyCount = buySignals.reduce((n, s) => n + (s.found || 0), 0);
+
+  const candidates = Array.isArray(scout.candidates) ? scout.candidates : [];
+  const exitCandidates = Array.isArray(harvest.exit_candidates) ? harvest.exit_candidates : [];
+
+  // Build a lookup of which candidates got approved/rejected
+  const approvedAddresses = new Set(approved.map((c) => String(c?.token?.contract_address || c?.contract_address || "").toLowerCase()).filter(Boolean));
+  const rejectedAddresses = new Set(rejected.map((c) => String(c?.token?.contract_address || c?.contract_address || "").toLowerCase()).filter(Boolean));
+
+  const regimeBadge = regime.regime === "risk_on" ? "badge badge-green" : regime.regime === "risk_off" ? "badge badge-red" : "badge badge-amber";
+  const summary = candidates.length
+    ? `${candidates.length} token${candidates.length !== 1 ? "s" : ""} considered · ${approved.length} approved · ${rejected.length} rejected`
+    : storiesChecked.length
+    ? `${storiesChecked.length} story types scanned · ${foundBuyCount} buy signal${foundBuyCount !== 1 ? "s" : ""} found`
+    : "Scanning…";
+
+  return React.createElement(
+    "section",
+    { className: "card cycle-card" },
+    // Header
+    React.createElement(
+      "div",
+      { className: "cycle-header" },
+      React.createElement(
+        "div",
+        null,
+        React.createElement("div", { className: "cycle-title" }, prettyDateTime(cycle.ts)),
+        React.createElement("div", { className: "cycle-summary" }, summary)
+      ),
+      React.createElement(
+        "div",
+        { className: "cycle-header-right" },
+        regime.regime ? React.createElement("span", { className: regimeBadge }, regime.regime.replace(/_/g, " ")) : null,
+        stats.equity_usd ? React.createElement("span", { className: "cycle-equity" }, fmtUsd.format(stats.equity_usd)) : null
+      )
+    ),
+    // Story signals
+    storiesChecked.length > 0 ? React.createElement(
+      "div",
+      { className: "cycle-section" },
+      React.createElement("div", { className: "cycle-section-title" }, "Story signals"),
+      React.createElement(
+        "div",
+        { className: "cycle-signals" },
+        // Buy signals row
+        React.createElement(
+          "div",
+          { className: "cycle-signals-group" },
+          React.createElement("span", { className: "cycle-signals-label" }, "Buy"),
+          React.createElement(
+            "div",
+            { className: "signal-pills" },
+            buySignals.map((s) => React.createElement(SignalPill, { key: s.type, type: s.type, found: s.found }))
+          )
+        ),
+        // Disqualifiers row (only if any fired)
+        disqualifiers.length > 0 ? React.createElement(
+          "div",
+          { className: "cycle-signals-group" },
+          React.createElement("span", { className: "cycle-signals-label" }, "Risk"),
+          React.createElement(
+            "div",
+            { className: "signal-pills" },
+            disqualifiers.map((s) => React.createElement(SignalPill, { key: s.type, type: s.type, found: s.found }))
+          )
+        ) : null
+      )
+    ) : null,
+    // Candidates
+    candidates.length > 0 ? React.createElement(
+      "div",
+      { className: "cycle-section" },
+      React.createElement("div", { className: "cycle-section-title" }, "Tokens considered"),
+      candidates.map((c) => {
+        const addr = String(c?.token?.contract_address || c?.contract_address || "").toLowerCase();
+        const isApproved = approvedAddresses.has(addr);
+        const isRejected = rejectedAddresses.has(addr);
+        const symbol = c?.token?.symbol || c?.symbol || "?";
+        const name = c?.token?.name || c?.name || "";
+        const whyNow = c?.why_now || "";
+        // evidence may be strings or objects {signal, value, quality} — normalise to strings
+        const evidence = (Array.isArray(c?.evidence) ? c.evidence : [])
+          .map((ev) => typeof ev === "string" ? ev : (ev?.signal ? `${ev.signal}${ev.value != null ? ` (${Number(ev.value).toFixed(1)})` : ""}` : JSON.stringify(ev)));
+        const risks = Array.isArray(c?.risks) ? c.risks.slice(0, 2).map((r) => typeof r === "string" ? r : JSON.stringify(r)) : [];
+        const confidence = Number(c?.confidence || 0);
+        const conviction = Number(c?.conviction_score || 0);
+
+        // risk_rejected items are {proposal, risk} wrappers; approved items are plain candidates
+        const riskEntry = [...approved, ...rejected].find((r) => {
+          const candidate = r?.proposal || r;
+          const ra = String(candidate?.token?.contract_address || candidate?.contract_address || "").toLowerCase();
+          return ra === addr;
+        });
+        const riskObj = riskEntry?.risk || riskEntry;
+        const riskReason = riskObj?.reason_summary || riskObj?.risk_summary || riskObj?.summary || null;
+
+        return React.createElement(
+          "div",
+          { className: "candidate-row", key: addr || symbol },
+          React.createElement(
+            "div",
+            { className: "candidate-head" },
+            React.createElement(
+              "div",
+              { className: "candidate-identity" },
+              tokenLink(addr, symbol),
+              name ? React.createElement("span", { className: "candidate-name" }, name) : null
+            ),
+            React.createElement(
+              "div",
+              { className: "candidate-verdict" },
+              isApproved ? React.createElement("span", { className: "verdict-approved" }, "✓ Approved") :
+              isRejected ? React.createElement("span", { className: "verdict-rejected" }, "✗ Rejected") :
+              React.createElement("span", { className: "verdict-pending" }, "Pending")
+            )
+          ),
+          whyNow ? React.createElement("div", { className: "candidate-why" }, whyNow) : null,
+          evidence.length > 0 ? React.createElement(
+            "div",
+            { className: "candidate-evidence" },
+            evidence.slice(0, 4).map((ev, i) => React.createElement("span", { className: "candidate-evidence-tag", key: i }, ev))
+          ) : null,
+          risks.length > 0 ? React.createElement(
+            "div",
+            { className: "candidate-risks" },
+            risks.map((r, i) => React.createElement("span", { className: "candidate-risk-tag", key: i }, r))
+          ) : null,
+          React.createElement(
+            "div",
+            { className: "candidate-scores" },
+            React.createElement("span", null, `Conf ${confidence}`),
+            React.createElement("span", null, `Conviction ${conviction}`),
+            riskReason ? React.createElement("span", { className: isRejected ? "verdict-rejected" : "verdict-approved" }, riskReason) : null
+          )
+        );
+      })
+    ) : null,
+    // Harvest exits
+    exitCandidates.length > 0 ? React.createElement(
+      "div",
+      { className: "cycle-section" },
+      React.createElement("div", { className: "cycle-section-title" }, "Harvest actions"),
+      exitCandidates.map((c, i) => {
+        const symbol = c?.token?.symbol || c?.symbol || "?";
+        const exitAddr = String(c?.token?.contract_address || c?.contract_address || "").toLowerCase();
+        const action = c?.action || "exit";
+        const whyNow = c?.why_now || c?.summary || "";
+        return React.createElement(
+          "div",
+          { className: "harvest-row", key: i },
+          React.createElement(
+            "div",
+            { className: "harvest-head" },
+            tokenLink(exitAddr, symbol),
+            React.createElement("span", { className: "harvest-action" }, action.toUpperCase())
+          ),
+          whyNow ? React.createElement("div", { className: "candidate-why" }, whyNow) : null
+        );
+      })
+    ) : null,
+    // Empty state when no candidates and no signals found
+    candidates.length === 0 && foundBuyCount === 0 && storiesChecked.length > 0 ? React.createElement(
+      "div",
+      { className: "cycle-empty" },
+      "No buy signals in this cycle — all story types returned empty."
+    ) : null
+  );
+}
+
+function AgentActivityPage() {
+  const [cycles, setCycles] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [wsStatus, setWsStatus] = useState("connecting"); // "connecting" | "live" | "reconnecting"
+  const [reconnectKey, setReconnectKey] = useState(0);
+
+  useEffect(() => {
+    setWsStatus("connecting");
+    const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const ws = new WebSocket(`${proto}//${window.location.host}/ws`);
+
+    ws.onopen = () => setWsStatus("live");
+
+    ws.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        if (data.type === "cycles") {
+          setCycles(Array.isArray(data.cycles) ? data.cycles : []);
+          setLoading(false);
+        }
+      } catch {}
+    };
+
+    ws.onerror = () => setWsStatus("reconnecting");
+
+    ws.onclose = () => {
+      setWsStatus("reconnecting");
+      setTimeout(() => setReconnectKey((k) => k + 1), 3000);
+    };
+
+    return () => ws.close();
+  }, [reconnectKey]);
+
+  const statusDot = wsStatus === "live"
+    ? React.createElement("span", { className: "ws-dot ws-dot-live" })
+    : React.createElement("span", { className: "ws-dot ws-dot-dim" });
+
+  const statusLabel = wsStatus === "live" ? "Live" : wsStatus === "reconnecting" ? "Reconnecting…" : "Connecting…";
+
+  const header = React.createElement(
+    "div",
+    { className: "cycle-ws-status" },
+    statusDot,
+    React.createElement("span", null, statusLabel)
+  );
+
+  if (loading) return React.createElement(
+    React.Fragment,
+    null,
+    header,
+    React.createElement("div", { className: "card loading" }, "Waiting for first pipeline cycle…")
+  );
+
+  if (!cycles.length) return React.createElement(
+    React.Fragment,
+    null,
+    header,
+    React.createElement("div", { className: "card" }, React.createElement("div", { className: "cycle-empty" }, "No cycle data yet. Start the pipeline to see agent activity."))
+  );
+
+  return React.createElement(
+    React.Fragment,
+    null,
+    header,
+    cycles.map((cycle, i) => React.createElement(CycleCard, { key: cycle.ts + i, cycle }))
+  );
+}
+
 function getPageFromHash() {
   if (typeof window === "undefined") return "portfolio";
   const hash = String(window.location.hash || "").replace(/^#/, "").toLowerCase();
-  return hash === "orbit" ? "orbit" : "portfolio";
+  if (hash === "orbit") return "orbit";
+  if (hash === "activity") return "activity";
+  return "portfolio";
 }
 
 function resolveTokenName(position) {
@@ -543,7 +833,7 @@ function PortfolioRow({ position }) {
       React.createElement(
         "div",
         { className: "portfolio-token-copy" },
-        React.createElement("div", { className: "portfolio-token-symbol" }, symbol || "—"),
+        tokenLink(position?.contract_address || position?.token?.contract_address, symbol || "—", "portfolio-token-symbol"),
         React.createElement("div", { className: "portfolio-token-name" }, name),
         React.createElement("div", { className: "portfolio-token-meta" }, position.category || "unknown"),
         React.createElement("div", { className: "portfolio-token-address" }, position.contract_address || position?.token?.contract_address || "—"),
@@ -1113,9 +1403,11 @@ function App() {
     activityPanel
   );
 
-  const pageLabel = page === "orbit" ? "Orbit + decision trail" : "Portfolio";
+  const pageLabel = page === "orbit" ? "Orbit + decision trail" : page === "activity" ? "Agent Activity" : "Portfolio";
   const pageNote = page === "orbit"
     ? "Agent orbit, wallet, and decision trail"
+    : page === "activity"
+    ? "Per-cycle story signals, tokens considered, and risk decisions"
     : "Open positions with entry, current value, and delta";
 
   const goToPage = (nextPage) => {
@@ -1147,6 +1439,7 @@ function App() {
             { className: "hero-actions" },
             React.createElement("button", { className: cls("button", page === "portfolio" && "button-active"), onClick: () => goToPage("portfolio") }, "Portfolio"),
             React.createElement("button", { className: cls("button", page === "orbit" && "button-active"), onClick: () => goToPage("orbit") }, "Orbit + trail"),
+            React.createElement("button", { className: cls("button", page === "activity" && "button-active"), onClick: () => goToPage("activity") }, "Activity"),
             React.createElement("button", { className: "button button-primary", onClick: load }, "Refresh now"),
             React.createElement("button", { className: "button button-secondary gear-button", onClick: () => setSettingsOpen(true), title: "OpenClaw settings" }, "⚙ Settings"),
             React.createElement("a", { className: "button button-secondary", href: "/api/activity", target: "_blank", rel: "noreferrer" }, "Raw activity API")
@@ -1237,7 +1530,7 @@ function App() {
           pipelineStatus?.pid ? React.createElement("div", { className: "pipeline-controls-meta" }, `PID ${pipelineStatus.pid}`) : null
         )
       ),
-      page === "orbit" ? orbitPage : portfolioPage,
+      page === "orbit" ? orbitPage : page === "activity" ? React.createElement(AgentActivityPage, null) : portfolioPage,
       React.createElement(SettingsDialog, {
         open: settingsOpen,
         openaiKey,

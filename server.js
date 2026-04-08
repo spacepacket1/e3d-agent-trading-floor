@@ -2,6 +2,7 @@ import fs from "fs";
 import http from "http";
 import path from "path";
 import os from "os";
+import crypto from "crypto";
 import { fileURLToPath } from "url";
 import { execFileSync, spawn } from "child_process";
 
@@ -24,6 +25,9 @@ const CLICKHOUSE_TABLE_NAME = process.env.E3D_CLICKHOUSE_TABLE || "training_even
 const TOKEN_METADATA_CACHE = new Map();
 const TOKEN_METADATA_TTL_MS = 6 * 60 * 60 * 1000;
 const PIPELINE_ENTRYPOINT = path.join(ROOT, "pipeline.js");
+const PIPELINE_PID_FILE = path.join(LOG_DIR, "pipeline.pid");
+const PIPELINE_STDOUT_LOG = path.join(LOG_DIR, "pipeline-stdout.log");
+const PIPELINE_STDERR_LOG = path.join(LOG_DIR, "pipeline-stderr.log");
 const OPENCLAW_CONFIG_FILE = path.join(os.homedir(), ".openclaw", "openclaw.json");
 const OPENCLAW_AGENT_WORKSPACES = {
   scout: path.join(ROOT, "scout"),
@@ -60,6 +64,58 @@ let pipelineState = {
   last_error: null
 };
 
+// ── PID file helpers ──────────────────────────────────────────────────────────
+
+function writePidFile(pid) {
+  try { fs.writeFileSync(PIPELINE_PID_FILE, String(pid), "utf8"); } catch {}
+}
+
+function clearPidFile() {
+  try { fs.unlinkSync(PIPELINE_PID_FILE); } catch {}
+}
+
+function readPidFile() {
+  try {
+    const n = parseInt(fs.readFileSync(PIPELINE_PID_FILE, "utf8").trim(), 10);
+    return Number.isFinite(n) && n > 0 ? n : null;
+  } catch { return null; }
+}
+
+function isProcessAlive(pid) {
+  if (!pid || !Number.isFinite(pid)) return false;
+  try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
+// Poll until an externally-spawned pipeline (recovered after server restart) exits.
+let _recoveryPollTimer = null;
+function watchExternalPipeline(pid) {
+  clearInterval(_recoveryPollTimer);
+  _recoveryPollTimer = setInterval(() => {
+    if (!isProcessAlive(pid)) {
+      clearInterval(_recoveryPollTimer);
+      _recoveryPollTimer = null;
+      clearPidFile();
+      if (pipelineState.pid === pid) {
+        setPipelineState({ running: false, pid: null, mode: "stopped" });
+        wsBroadcast({ type: "pipeline_status", status: getPipelineStatus() });
+      }
+    }
+  }, 5000);
+}
+
+// Called once at startup — reattach to a pipeline that survived a server restart.
+function recoverPipelineIfRunning() {
+  const pid = readPidFile();
+  if (!pid || !isProcessAlive(pid)) {
+    clearPidFile();
+    return false;
+  }
+  setPipelineState({ running: true, pid, mode: "loop", started_at: null, last_error: null });
+  watchExternalPipeline(pid);
+  console.log(`[server] Recovered running pipeline PID ${pid}`);
+  return true;
+}
+
 function readJsonFile(filePath, fallback = null) {
   try {
     if (!fs.existsSync(filePath)) return fallback;
@@ -76,7 +132,8 @@ function nowLocalIso() {
   const absMinutes = Math.abs(offsetMinutes);
   const hours = String(Math.floor(absMinutes / 60)).padStart(2, "0");
   const minutes = String(absMinutes % 60).padStart(2, "0");
-  return `${date.toISOString().slice(0, 19)}${sign}${hours}:${minutes}`;
+  const local = new Date(date.getTime() + offsetMinutes * 60000);
+  return `${local.toISOString().slice(0, 19)}${sign}${hours}:${minutes}`;
 }
 
 function logExternalApi(stage, data) {
@@ -232,10 +289,11 @@ function clearClickHouseState() {
 }
 
 function clearSystemState() {
-  const pipelineWasRunning = Boolean(pipelineProcess) && pipelineState.running;
-  if (pipelineWasRunning) {
-    stopPipelineProcess("SIGINT");
-  }
+  const status = getPipelineStatus();
+  const pipelineWasRunning = status.running;
+  if (pipelineWasRunning) stopPipelineProcess("SIGINT");
+  clearPidFile();
+  clearInterval(_recoveryPollTimer);
 
   clearLocalStateFiles();
   TOKEN_METADATA_CACHE.clear();
@@ -271,56 +329,75 @@ function runShell(command, args, options = {}) {
 }
 
 function getPipelineStatus() {
-  return {
-    ...pipelineState,
-    running: Boolean(pipelineProcess) && pipelineState.running,
-    pid: pipelineProcess?.pid ?? pipelineState.pid ?? null
-  };
+  const pid = pipelineProcess?.pid ?? pipelineState.pid ?? null;
+  const alive = isProcessAlive(pid);
+  if (pipelineState.running && !alive) {
+    // Process died without us knowing (e.g. OOM kill) — reconcile
+    pipelineProcess = null;
+    clearPidFile();
+    setPipelineState({ running: false, pid: null, mode: "stopped" });
+  }
+  return { ...pipelineState, running: pipelineState.running && alive, pid };
 }
 
 function setPipelineState(nextState) {
-  pipelineState = {
-    ...pipelineState,
-    ...nextState
-  };
+  pipelineState = { ...pipelineState, ...nextState };
 }
 
 function stopPipelineProcess(signal = "SIGINT") {
-  if (!pipelineProcess) {
+  const pid = pipelineProcess?.pid ?? pipelineState.pid ?? null;
+  if (!pid || !isProcessAlive(pid)) {
+    pipelineProcess = null;
+    clearPidFile();
     setPipelineState({ running: false, mode: "stopped", pid: null });
     return false;
   }
-
   try {
     pipelineState.stop_requested_at = nowLocalIso();
-    pipelineProcess.kill(signal);
+    process.kill(pid, signal);
   } catch (err) {
-    setPipelineState({
-      running: false,
-      mode: "stopped",
-      pid: null,
-      last_error: err.message
-    });
     pipelineProcess = null;
+    clearPidFile();
+    setPipelineState({ running: false, mode: "stopped", pid: null, last_error: err.message });
     return false;
   }
-
+  pipelineProcess = null;
   return true;
 }
 
 function startPipelineProcess(intervalSeconds = 300) {
-  if (pipelineProcess) {
-    stopPipelineProcess("SIGINT");
+  // Stop any currently managed process
+  if (pipelineProcess) stopPipelineProcess("SIGINT");
+
+  // Kill any orphaned pipeline PID from before a server restart
+  const orphanPid = readPidFile();
+  if (orphanPid && isProcessAlive(orphanPid)) {
+    try { process.kill(orphanPid, "SIGINT"); } catch {}
   }
+  clearPidFile();
+  clearInterval(_recoveryPollTimer);
 
   const safeIntervalSeconds = Math.max(1, Number(intervalSeconds) || 300);
+
+  // Redirect pipeline stdout/stderr to log files so the process outlives the server.
+  const outFd = fs.openSync(PIPELINE_STDOUT_LOG, "a");
+  const errFd = fs.openSync(PIPELINE_STDERR_LOG, "a");
+
   const child = spawn(process.execPath, [PIPELINE_ENTRYPOINT, "--loop", "--interval-seconds", String(safeIntervalSeconds)], {
     cwd: ROOT,
     env: process.env,
-    stdio: ["ignore", "pipe", "pipe"]
+    stdio: ["ignore", outFd, errFd],
+    detached: true   // survives server restart
   });
 
+  fs.closeSync(outFd);
+  fs.closeSync(errFd);
+
+  child.unref(); // server exit won't kill the pipeline
+
   pipelineProcess = child;
+  writePidFile(child.pid);
+
   setPipelineState({
     running: true,
     pid: child.pid,
@@ -333,19 +410,10 @@ function startPipelineProcess(intervalSeconds = 300) {
     last_error: null
   });
 
-  child.stdout.on("data", (chunk) => {
-    process.stdout.write(chunk);
-  });
-
-  child.stderr.on("data", (chunk) => {
-    process.stderr.write(chunk);
-  });
-
   child.on("exit", (code, signal) => {
     const wasCurrent = pipelineProcess === child;
-    if (wasCurrent) {
-      pipelineProcess = null;
-    }
+    if (wasCurrent) pipelineProcess = null;
+    clearPidFile();
 
     setPipelineState({
       running: false,
@@ -358,15 +426,9 @@ function startPipelineProcess(intervalSeconds = 300) {
   });
 
   child.on("error", (err) => {
-    if (pipelineProcess === child) {
-      pipelineProcess = null;
-    }
-    setPipelineState({
-      running: false,
-      pid: null,
-      mode: "stopped",
-      last_error: err.message
-    });
+    if (pipelineProcess === child) pipelineProcess = null;
+    clearPidFile();
+    setPipelineState({ running: false, pid: null, mode: "stopped", last_error: err.message });
   });
 
   return getPipelineStatus();
@@ -699,6 +761,25 @@ async function loadActivity() {
   };
 }
 
+function groupPipelineIntoCycles(entries) {
+  const cycles = [];
+  let cur = null;
+  for (const e of entries) {
+    if (e.stage === "scout") {
+      if (cur) cycles.push(cur);
+      cur = { ts: e.ts, scout: e.data || {}, harvest: null, risk_approved: null, risk_rejected: null, market_regime: null, stats: null };
+    } else if (cur) {
+      if (e.stage === "harvest") cur.harvest = e.data || {};
+      else if (e.stage === "risk_approved") cur.risk_approved = Array.isArray(e.data) ? e.data : [];
+      else if (e.stage === "risk_rejected") cur.risk_rejected = Array.isArray(e.data) ? e.data : [];
+      else if (e.stage === "market_regime") cur.market_regime = e.data || {};
+      else if (e.stage === "stats") cur.stats = e.data || {};
+    }
+  }
+  if (cur) cycles.push(cur);
+  return cycles.reverse();
+}
+
 function summarizePipelineStage(stage, data) {
   if (stage === "market_regime") {
     return {
@@ -841,6 +922,13 @@ async function handleRequest(req, res) {
     return;
   }
 
+  if (url.pathname === "/api/cycles") {
+    const pipeline = readJsonLines(PIPELINE_LOG, 600);
+    const cycles = groupPipelineIntoCycles(pipeline);
+    sendJson(res, 200, { cycles: cycles.slice(0, 25) });
+    return;
+  }
+
   if (url.pathname === "/api/summary") {
     const [portfolio, activity] = await Promise.all([loadPortfolioState(), loadActivity()]);
     const positions = Object.values(portfolio.positions || {});
@@ -880,12 +968,89 @@ async function handleRequest(req, res) {
   res.end("Not found");
 }
 
+// ── WebSocket server ─────────────────────────────────────────────────────────
+const WS_MAGIC = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+const wsClients = new Set();
+
+function wsFrame(text) {
+  const payload = Buffer.from(text, "utf8");
+  const len = payload.length;
+  const header = len < 126 ? Buffer.alloc(2) : len < 65536 ? Buffer.alloc(4) : Buffer.alloc(10);
+  header[0] = 0x81; // FIN + text opcode
+  if (len < 126) {
+    header[1] = len;
+  } else if (len < 65536) {
+    header[1] = 126;
+    header.writeUInt16BE(len, 2);
+  } else {
+    header[1] = 127;
+    header.writeBigUInt64BE(BigInt(len), 2);
+  }
+  return Buffer.concat([header, payload]);
+}
+
+function wsSend(socket, data) {
+  try { socket.write(wsFrame(JSON.stringify(data))); } catch { wsClients.delete(socket); }
+}
+
+function wsBroadcast(data) {
+  for (const socket of wsClients) wsSend(socket, data);
+}
+
+function wsPushCycles(socket) {
+  const cycles = groupPipelineIntoCycles(readJsonLines(PIPELINE_LOG, 600));
+  wsSend(socket, { type: "cycles", cycles: cycles.slice(0, 25) });
+}
+
+function wsHandleUpgrade(req, socket) {
+  if (req.url !== "/ws") {
+    socket.write("HTTP/1.1 404 Not Found\r\n\r\n");
+    socket.destroy();
+    return;
+  }
+  const key = req.headers["sec-websocket-key"];
+  if (!key) { socket.destroy(); return; }
+
+  const accept = crypto.createHash("sha1").update(key + WS_MAGIC).digest("base64");
+  socket.write(
+    "HTTP/1.1 101 Switching Protocols\r\n" +
+    "Upgrade: websocket\r\nConnection: Upgrade\r\n" +
+    `Sec-WebSocket-Accept: ${accept}\r\n\r\n`
+  );
+
+  socket.on("data", (buf) => {
+    if (buf.length >= 2 && (buf[0] & 0x0f) === 8) { wsClients.delete(socket); socket.destroy(); }
+  });
+  socket.on("close", () => wsClients.delete(socket));
+  socket.on("error", () => wsClients.delete(socket));
+
+  wsClients.add(socket);
+  wsPushCycles(socket); // send current state immediately on connect
+}
+
+// Watch log dir so we catch both file creation and appends
+let wsBroadcastTimer = null;
+fs.watch(LOG_DIR, { persistent: false }, (_, filename) => {
+  if (filename !== "pipeline.jsonl") return;
+  clearTimeout(wsBroadcastTimer);
+  wsBroadcastTimer = setTimeout(() => {
+    const cycles = groupPipelineIntoCycles(readJsonLines(PIPELINE_LOG, 600));
+    wsBroadcast({ type: "cycles", cycles: cycles.slice(0, 25) });
+  }, 400);
+});
+
+// ── HTTP server ───────────────────────────────────────────────────────────────
 const server = http.createServer((req, res) => {
   handleRequest(req, res).catch((err) => {
     res.writeHead(500, { "Content-Type": "application/json; charset=utf-8" });
     res.end(JSON.stringify({ ok: false, error: err.message }));
   });
 });
+
+server.on("upgrade", wsHandleUpgrade);
+
+// Reattach to any pipeline that survived a previous server restart
+recoverPipelineIfRunning();
 
 server.listen(PORT, HOST, () => {
   console.log(`Dashboard server running at http://${HOST}:${PORT}`);
