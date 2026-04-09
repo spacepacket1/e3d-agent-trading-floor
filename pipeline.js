@@ -1869,15 +1869,18 @@ function callLLMDirect(systemPrompt, userMessage, { maxRetries = 2 } = {}) {
 }
 
 // Rotate token universe fetch criteria across cycles to avoid always seeing the same tokens.
-// Sort rotation — effectiveLiquidityUSD and change_24h_pct are the most reliable
-// signals in the E3D token DB (volume24hUSD and change_30m_pct are often 0).
+// Sort rotation. Only three fields have reliable non-zero data across the DB:
+//   volume24hUSD       — ~54 tokens with real on-chain DEX volume (highest signal)
+//   effectiveLiquidityUSD — ~50+ tokens with measured pool depth
+//   change_24h_pct     — price change available for most tokens
+// change_30m_pct and volume are 0 for the majority of the 7,500-token DB.
 const SCOUT_SORT_ROTATION = [
-  { sortBy: "effectiveLiquidityUSD", sortDir: "desc" },
-  { sortBy: "change_24h_pct",        sortDir: "desc" },
+  { sortBy: "volume24hUSD",          sortDir: "desc" },  // on-chain activity
+  { sortBy: "effectiveLiquidityUSD", sortDir: "desc" },  // deepest pools
+  { sortBy: "change_24h_pct",        sortDir: "desc" },  // daily winners
+  { sortBy: "volume24hUSD",          sortDir: "desc" },
   { sortBy: "change_24h_pct",        sortDir: "asc"  },  // oversold / reversal
   { sortBy: "effectiveLiquidityUSD", sortDir: "desc" },
-  { sortBy: "marketCapUSD",          sortDir: "desc" },
-  { sortBy: "change_24h_pct",        sortDir: "desc" },
 ];
 let _scoutCycleIndex = 0;
 
@@ -1925,22 +1928,26 @@ function fetchScoutData() {
     dataSource: 1, ...sortParams, limit: 50
   })).map(mapToken);
 
-  // Secondary: by 24h change to ensure we always have some movers
-  const byChange24h = endpointArray(fetchJson("/fetchTokenPricesWithHistoryAllRanges", {
-    dataSource: 1, sortBy: "change_24h_pct", sortDir: "desc", limit: 30
+  // Secondary lens: always include the top volume tokens regardless of primary sort,
+  // since those ~54 are the ones with real on-chain activity in E3D's coverage.
+  const byVolume = endpointArray(fetchJson("/fetchTokenPricesWithHistoryAllRanges", {
+    dataSource: 1, sortBy: "volume24hUSD", sortDir: "desc", limit: 54
   })).map(mapToken);
 
-  // Merge, deduplicate, then surface tokens with real liquidity first
+  // Merge, deduplicate, then surface tokens with real activity first
   const seen = new Set();
   const raw = [];
-  for (const t of [...primary, ...byChange24h]) {
+  for (const t of [...primary, ...byVolume]) {
     if (!t.address || seen.has(t.address)) continue;
     seen.add(t.address);
     raw.push(t);
   }
 
-  // Sort the merged universe: liquid tokens first, then by 24h change
+  // Sort merged universe: tokens with on-chain volume first (highest signal),
+  // then by effective liquidity, then by 24h change as tiebreaker.
   const tokenUniverse = raw.sort((a, b) => {
+    const volDiff = (b.volume_24h_usd || 0) - (a.volume_24h_usd || 0);
+    if (volDiff !== 0) return volDiff;
     const liqDiff = (b.liquidity_usd || 0) - (a.liquidity_usd || 0);
     if (liqDiff !== 0) return liqDiff;
     return (b.change_24h || 0) - (a.change_24h || 0);
