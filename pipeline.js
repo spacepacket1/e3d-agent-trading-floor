@@ -1931,7 +1931,7 @@ function fetchScoutData() {
   // Secondary lens: always include the top volume tokens regardless of primary sort,
   // since those ~54 are the ones with real on-chain activity in E3D's coverage.
   const byVolume = endpointArray(fetchJson("/fetchTokenPricesWithHistoryAllRanges", {
-    dataSource: 1, sortBy: "volume24hUSD", sortDir: "desc", limit: 54
+    dataSource: 1, sortBy: "volume24hUSD", sortDir: "desc", limit: 200
   })).map(mapToken);
 
   // Merge, deduplicate, then surface tokens with real activity first
