@@ -1869,13 +1869,15 @@ function callLLMDirect(systemPrompt, userMessage, { maxRetries = 2 } = {}) {
 }
 
 // Rotate token universe fetch criteria across cycles to avoid always seeing the same tokens.
+// Sort rotation — effectiveLiquidityUSD and change_24h_pct are the most reliable
+// signals in the E3D token DB (volume24hUSD and change_30m_pct are often 0).
 const SCOUT_SORT_ROTATION = [
-  { sortBy: "change_30m_pct", sortDir: "desc" },
-  { sortBy: "change_1h_pct",  sortDir: "desc" },
-  { sortBy: "change_24h_pct", sortDir: "desc" },
-  { sortBy: "volume_24h_usd", sortDir: "desc" },
-  { sortBy: "change_30m_pct", sortDir: "asc"  },  // losers/reversal candidates
-  { sortBy: "change_1h_pct",  sortDir: "asc"  },
+  { sortBy: "effectiveLiquidityUSD", sortDir: "desc" },
+  { sortBy: "change_24h_pct",        sortDir: "desc" },
+  { sortBy: "change_24h_pct",        sortDir: "asc"  },  // oversold / reversal
+  { sortBy: "effectiveLiquidityUSD", sortDir: "desc" },
+  { sortBy: "marketCapUSD",          sortDir: "desc" },
+  { sortBy: "change_24h_pct",        sortDir: "desc" },
 ];
 let _scoutCycleIndex = 0;
 
@@ -1890,7 +1892,6 @@ function fetchScoutData() {
     "SANDWICH", "MIRROR", "VOLUME_PROFILE_ANOMALY", "FUNNEL", "WHALE"]);
 
   // Fetch all available stories in one call (no type/chain filter — combining them kills results).
-  // The API returns one story per active story_type; bucket them locally.
   const allStories = endpointArray(fetchJson("/stories", { limit: 100, chain: "ETH" }));
   const stories = {};
   for (const s of allStories) {
@@ -1900,7 +1901,7 @@ function fetchScoutData() {
     stories[t].push(s);
   }
 
-  // Rotate sort criteria so each cycle surfaces different tokens
+  // Rotate sort criteria each cycle
   const sortParams = SCOUT_SORT_ROTATION[_scoutCycleIndex % SCOUT_SORT_ROTATION.length];
   _scoutCycleIndex++;
 
@@ -1910,33 +1911,40 @@ function fetchScoutData() {
     address: cleanAddress(t.address || t.contract_address || ""),
     price_usd: t.priceUSD ?? t.price_usd ?? t.priceUsd ?? null,
     change_30m: t.changes?.["30M"]?.percent ?? t.change_30m_pct ?? null,
-    change_1h: t.changes?.["1H"]?.percent ?? t.change_1h_pct ?? null,
     change_24h: t.changes?.["24H"]?.percent ?? t.change_24h_pct ?? null,
     market_cap_usd: t.marketCapUSD ?? t.market_cap_usd ?? null,
-    liquidity_usd: t.liquidityUSD ?? t.effectiveLiquidityUSD ?? t.liquidity_usd ?? null,
-    volume_24h_usd: t.volume24hUSD ?? t.volume_24h_usd ?? null,
+    // effectiveLiquidityUSD is the real DEX depth; liquidityUSD is often 0
+    // even when effectiveLiquidityUSD is non-zero — use || not ?? to prefer non-zero
+    liquidity_usd: t.effectiveLiquidityUSD || t.liquidityUSD || t.liquidity_usd || null,
+    volume_24h_usd: t.volume24hUSD || t.volume_24h_usd || null,
     fragility_score: t.fragilityScore ?? null
   });
 
-  // Primary sort: rotated criteria
-  const gainers = endpointArray(fetchJson("/fetchTokenPricesWithHistoryAllRanges", {
+  // Primary list: rotated sort criterion, limit 50
+  const primary = endpointArray(fetchJson("/fetchTokenPricesWithHistoryAllRanges", {
     dataSource: 1, ...sortParams, limit: 50
   })).map(mapToken);
 
-  // Always also pull top 30m gainers as a second lens (deduplicated below)
-  const topGainers = endpointArray(fetchJson("/fetchTokenPricesWithHistoryAllRanges", {
-    dataSource: 1, sortBy: "change_30m_pct", sortDir: "desc", limit: 30
+  // Secondary: by 24h change to ensure we always have some movers
+  const byChange24h = endpointArray(fetchJson("/fetchTokenPricesWithHistoryAllRanges", {
+    dataSource: 1, sortBy: "change_24h_pct", sortDir: "desc", limit: 30
   })).map(mapToken);
 
-  // Merge and deduplicate by address; primary sort list takes precedence
+  // Merge, deduplicate, then surface tokens with real liquidity first
   const seen = new Set();
-  const tokenUniverse = [];
-  for (const t of [...gainers, ...topGainers]) {
-    const addr = t.address;
-    if (!addr || seen.has(addr)) continue;
-    seen.add(addr);
-    tokenUniverse.push(t);
+  const raw = [];
+  for (const t of [...primary, ...byChange24h]) {
+    if (!t.address || seen.has(t.address)) continue;
+    seen.add(t.address);
+    raw.push(t);
   }
+
+  // Sort the merged universe: liquid tokens first, then by 24h change
+  const tokenUniverse = raw.sort((a, b) => {
+    const liqDiff = (b.liquidity_usd || 0) - (a.liquidity_usd || 0);
+    if (liqDiff !== 0) return liqDiff;
+    return (b.change_24h || 0) - (a.change_24h || 0);
+  });
 
   return { stories, tokenUniverse, disqualifierTypes, buySignalTypes, secondaryTypes, sortLabel: `${sortParams.sortBy} ${sortParams.sortDir}` };
 }
@@ -1999,7 +2007,7 @@ function runScoutDirect(portfolio, portfolioIntelligence = null) {
   // subjects to tokens that actually have market data.
   const tokenByAddr = new Map(
     data.tokenUniverse
-      .filter((t) => t.address && t.price_usd > 0)
+      .filter((t) => t.address && (t.price_usd > 0 || t.liquidity_usd > 0))
       .map((t) => [t.address, t])
   );
 
@@ -2042,7 +2050,7 @@ function runScoutDirect(portfolio, portfolioIntelligence = null) {
   const userMessage = [
     `Scout task — ${createdAt} [token universe sorted by: ${data.sortLabel}]`,
     `Portfolio: cash=$${portfolio?.cash_usd ?? 100000} positions=${Object.keys(portfolio?.positions || {}).length}`,
-    `Tokens with price data in universe: ${tokenByAddr.size} of ${data.tokenUniverse.length}`,
+    `Token universe: ${data.tokenUniverse.length} total, ${data.tokenUniverse.filter(t => (t.liquidity_usd||0) > 5000).length} with liq>$5k, ${tokenByAddr.size} with price or liq data`,
     `\n--- DISQUALIFIERS (exclude these addresses) ---`,
     ...disqualifierStories.map(([type, items]) => {
       const addrs = items.map((s) => cleanAddress(s?.meta?.primary?.address || s?.primary_token || "")).filter(Boolean);
