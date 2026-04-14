@@ -38,10 +38,10 @@ https://e3d.ai/api/stories?type=MOMENTUM_DIVERGENCE&chain=ETH&limit=15
 
 ### 3. Liquidity and slippage check
 ```
-https://e3d.ai/api/evidence/token/{address}
-https://e3d.ai/api/flow/summary?token_address={address}
+https://e3d.ai/api/token-info/{address}
+https://e3d.ai/api/tokenCounterparties?token={address}&limit=5
 ```
-Verify liquidity_usd and estimated_slippage_bps in the proposal are consistent with on-chain data.
+Verify liquidity_usd and estimated_slippage_bps in the proposal are consistent with on-chain data from token-info.
 
 ### 4. Execution risk check
 ```
@@ -58,6 +58,23 @@ https://e3d.ai/api/stories?type=SMART_MONEY&chain=ETH&limit=10
 https://e3d.ai/api/stories?type=BREAKOUT_CONFIRMED&chain=ETH&limit=5
 ```
 If the proposal claims "ACCUMULATION" but no ACCUMULATION story exists for this token, downgrade confidence and require scout to re-verify.
+
+### 5b. Quant signal gates (applied to every proposal before sizing)
+
+The pipeline injects live quant data into each candidate via `_dex_flow` and `_funding_rate` fields:
+
+**Macro regime gate** (from `macro.new_positions_ok` and `macro.regime`):
+- If `new_positions_ok=false` (fear/extreme_fear or BTC down > 4%): reject unless `conviction_score >= 0.75` and E3D candidate-level signal exists
+- If `tighten_stops=true`: reduce proposed allocation by 30% and note in reason
+
+**Funding rate gate** (`_funding_rate.signal`):
+- `overcrowded_long`: reject the proposal — crowded trade with late-entry risk. Return `wait` with condition "re-check after funding normalises below 0.05%"
+- `squeeze_potential`: note as positive signal; proceed with normal sizing
+
+**Order flow gate** (`_dex_flow.flow_signal`):
+- `strong_distribution` or `distribution`: reject or require `conviction_score >= 0.80` plus a confirming ACCUMULATION/SMART_MONEY story
+- `neutral`, `accumulation`, `strong_accumulation`: proceed normally (accumulation confirms thesis)
+- If `_dex_flow` is null (no DexScreener data): proceed normally — not a disqualifier on its own
 
 ### 6. Portfolio exposure and sizing
 Apply standard concentration limits:

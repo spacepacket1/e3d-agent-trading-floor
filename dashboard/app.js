@@ -373,7 +373,7 @@ function IntelligencePanel({ intelligence, floorState }) {
         React.createElement("h2", null, "Intelligence"),
         React.createElement("span", { className: "panel-note" }, "Waiting for the first dossier snapshot")
       ),
-      React.createElement("div", { className: "empty-state" }, "Run the pipeline to populate opportunity stories, thesis state, and wallet cohorts.")
+      React.createElement("div", { className: "empty-state" }, "Run the E3D Trading Agents to populate opportunity stories, thesis state, and wallet cohorts.")
     );
   }
 
@@ -743,14 +743,14 @@ function AgentActivityPage() {
     React.Fragment,
     null,
     header,
-    React.createElement("div", { className: "card loading" }, "Waiting for first pipeline cycle…")
+    React.createElement("div", { className: "card loading" }, "Waiting for the first E3D Trading Agents cycle…")
   );
 
   if (!cycles.length) return React.createElement(
     React.Fragment,
     null,
     header,
-    React.createElement("div", { className: "card" }, React.createElement("div", { className: "cycle-empty" }, "No cycle data yet. Start the pipeline to see agent activity."))
+    React.createElement("div", { className: "card" }, React.createElement("div", { className: "cycle-empty" }, "No cycle data yet. Start the E3D Trading Agents to see agent activity."))
   );
 
   return React.createElement(
@@ -761,9 +761,227 @@ function AgentActivityPage() {
   );
 }
 
+// ── Network Debug Feed ────────────────────────────────────────────────────────
+// Renders pipeline log entries as single-line expandable rows like a browser
+// network / debugger tab. Shows API calls (url + status + timing) and LLM calls.
+
+function fmtBytes(n) {
+  if (!n || n < 0) return "";
+  if (n >= 1048576) return (n / 1048576).toFixed(1) + " MB";
+  if (n >= 1024) return (n / 1024).toFixed(1) + " KB";
+  return n + " B";
+}
+function fmtMs(n) {
+  if (!n || n < 0) return "";
+  if (n >= 60000) return (n / 60000).toFixed(1) + " min";
+  if (n >= 1000) return (n / 1000).toFixed(1) + "s";
+  return n + "ms";
+}
+function shortTs(ts) {
+  if (!ts) return "";
+  const d = new Date(ts);
+  if (isNaN(d)) return String(ts).slice(11, 19);
+  return d.toTimeString().slice(0, 8);
+}
+function shortPath(url) {
+  try {
+    const u = new URL(url);
+    let p = u.pathname;
+    if (u.search) p += u.search.slice(0, 60) + (u.search.length > 60 ? "…" : "");
+    return p;
+  } catch { return String(url || "").slice(0, 80); }
+}
+
+function NetRow({ entry, defaultOpen }) {
+  const [open, setOpen] = useState(!!defaultOpen);
+  const { stage, ts, data } = entry;
+
+  // ── Classify entry type ──────────────────────────────────────────────────
+  let rowClass = "net-row";
+  let badge = "";
+  let badgeClass = "net-badge";
+  let label = "";
+  let meta = "";
+  let statusEl = null;
+
+  if (stage === "e3d_api_response") {
+    badge = "API";
+    badgeClass += " net-badge-api";
+    label = shortPath(data.url || "");
+    const ok = data.status >= 200 && data.status < 300;
+    statusEl = React.createElement("span", { className: ok ? "net-status-ok" : "net-status-err" }, data.status);
+    meta = [fmtMs(data.duration_ms), fmtBytes(data.bytes)].filter(Boolean).join("  ");
+  } else if (stage === "e3d_api_error") {
+    badge = "API";
+    badgeClass += " net-badge-api net-badge-err";
+    label = shortPath(data.url || "");
+    statusEl = React.createElement("span", { className: "net-status-err" }, "ERR");
+    meta = data.message ? data.message.slice(0, 60) : "";
+  } else if (stage === "e3d_api_budget_exceeded") {
+    badge = "API";
+    badgeClass += " net-badge-warn";
+    label = "rate limit / budget exceeded";
+    statusEl = React.createElement("span", { className: "net-status-warn" }, "429");
+  } else if (stage === "llm_request") {
+    badge = "LLM ▶";
+    badgeClass += " net-badge-llm";
+    label = (data.agent || "").toUpperCase();
+    meta = `${(data.prompt_chars / 1000).toFixed(1)}K chars`;
+  } else if (stage === "llm_response") {
+    badge = "LLM ✓";
+    badgeClass += " net-badge-llm net-badge-llm-ok";
+    label = (data.agent || "").toUpperCase();
+    statusEl = React.createElement("span", { className: "net-status-ok" }, "200");
+    const toks = data.total_tokens ? `${data.total_tokens} tok` : `${(data.output_chars / 1000).toFixed(1)}K chars`;
+    meta = [fmtMs(data.duration_ms), toks, data.finish_reason === "length" ? "⚠ TRUNCATED" : ""].filter(Boolean).join("  ");
+  } else if (stage === "llm_error") {
+    badge = "LLM ✗";
+    badgeClass += " net-badge-llm net-badge-err";
+    label = (data.agent || "").toUpperCase();
+    statusEl = React.createElement("span", { className: "net-status-err" }, "ERR");
+    meta = fmtMs(data.duration_ms);
+  } else if (stage === "scout") {
+    badge = "SCOUT";
+    badgeClass += " net-badge-agent";
+    const cands = Array.isArray(data.candidates) ? data.candidates : [];
+    label = cands.length
+      ? `${cands.length} candidate${cands.length !== 1 ? "s" : ""}: ${cands.map(c => c?.token?.symbol || "?").join(", ")}`
+      : "0 candidates";
+    statusEl = React.createElement("span", { className: cands.length ? "net-status-ok" : "net-status-warn" }, cands.length ? "✓" : "–");
+  } else if (stage === "harvest") {
+    badge = "HARVEST";
+    badgeClass += " net-badge-agent";
+    const ps = data.portfolio_summary || {};
+    const exits = (data.exit_candidates || []).map(x => x?.token?.symbol || "?").filter(Boolean);
+    label = `hold=${ps.hold_count || 0} monitor=${ps.monitor_count || 0} trim=${ps.trim_count || 0} exit=${ps.exit_count || 0}` +
+      (exits.length ? `  →exit: ${exits.join(", ")}` : "");
+    statusEl = React.createElement("span", { className: "net-status-ok" }, "✓");
+  } else if (stage === "executor_buy" || stage === "buy_trades") {
+    badge = "BUY";
+    badgeClass += " net-badge-buy";
+    const items = Array.isArray(data) ? data : [data];
+    label = items.map(i => `${i.symbol || i.token?.symbol || "?"} $${(i.allocation_usd || i.amount_usd || 0).toFixed(0)}`).join(", ");
+    statusEl = React.createElement("span", { className: "net-status-ok" }, "✓");
+  } else if (stage === "executor_exit" || stage === "sell_trades") {
+    badge = "EXIT";
+    badgeClass += " net-badge-exit";
+    const items = Array.isArray(data) ? data : [data];
+    label = items.map(i => `${i.symbol || "?"} ${i.decision || i.reason || ""}`).join(", ");
+    statusEl = React.createElement("span", { className: "net-status-warn" }, "↩");
+  } else if (stage === "quant_context") {
+    badge = "QUANT";
+    badgeClass += " net-badge-quant";
+    label = `regime=${data.macro_regime || "?"}  BTC ${data.btc_24h >= 0 ? "+" : ""}${data.btc_24h ?? "?"}%  FG=${data.fear_greed ?? "?"}  flow=${data.token_flow_count ?? 0} tokens`;
+  } else if (stage === "scout_flow_enrichment") {
+    badge = "FLOW";
+    badgeClass += " net-badge-quant";
+    label = `DexScreener enrichment — ${data.flow_tokens_total ?? 0} tokens with flow data`;
+  } else if (stage === "scout_candidate_dropped") {
+    badge = "DROP";
+    badgeClass += " net-badge-err";
+    label = `${data.reason || "?"} — ${data.addr || ""}`;
+    statusEl = React.createElement("span", { className: "net-status-err" }, "✗");
+  } else {
+    badge = stage.toUpperCase().slice(0, 8);
+    label = JSON.stringify(data).slice(0, 80);
+  }
+
+  const expandedContent = open
+    ? React.createElement("pre", { className: "net-expanded" }, JSON.stringify(data, null, 2))
+    : null;
+
+  return React.createElement(
+    "div",
+    { className: rowClass },
+    React.createElement(
+      "div",
+      { className: "net-row-line", onClick: () => setOpen(o => !o) },
+      React.createElement("span", { className: "net-chevron" }, open ? "▼" : "▶"),
+      React.createElement("span", { className: badgeClass }, badge),
+      React.createElement("span", { className: "net-label" }, label),
+      React.createElement("span", { className: "net-spacer" }),
+      statusEl,
+      meta ? React.createElement("span", { className: "net-meta" }, meta) : null,
+      React.createElement("span", { className: "net-time" }, shortTs(ts))
+    ),
+    expandedContent
+  );
+}
+
+function NetworkDebugFeed() {
+  const [entries, setEntries] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [filter, setFilter] = useState("all"); // "all" | "api" | "llm" | "agent"
+
+  useEffect(() => {
+    let cancelled = false;
+    async function load() {
+      try {
+        const res = await fetch("/api/pipeline-log");
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const { entries: raw } = await res.json();
+        if (!cancelled) setEntries([...raw].reverse()); // newest first
+      } catch {}
+      finally { if (!cancelled) setLoading(false); }
+    }
+    load();
+    const id = setInterval(load, 15000); // refresh every 15s
+    return () => { cancelled = true; clearInterval(id); };
+  }, []);
+
+  const API_STAGES = new Set(["e3d_api_response", "e3d_api_error", "e3d_api_budget_exceeded"]);
+  const LLM_STAGES = new Set(["llm_request", "llm_response", "llm_error"]);
+  const AGENT_STAGES = new Set(["scout", "harvest", "executor_buy", "executor_exit", "sell_trades", "buy_trades", "scout_candidate_dropped"]);
+
+  const visible = entries.filter(e => {
+    if (filter === "api") return API_STAGES.has(e.stage);
+    if (filter === "llm") return LLM_STAGES.has(e.stage);
+    if (filter === "agent") return AGENT_STAGES.has(e.stage);
+    return true;
+  });
+
+  const filterBar = React.createElement(
+    "div",
+    { className: "net-filter-bar" },
+    ["all", "api", "llm", "agent"].map(f =>
+      React.createElement("button", {
+        key: f,
+        className: "net-filter-btn" + (filter === f ? " net-filter-active" : ""),
+        onClick: () => setFilter(f)
+      }, f.toUpperCase())
+    )
+  );
+
+  return React.createElement(
+    "div",
+    { className: "card panel" },
+    React.createElement(
+      "div",
+      { className: "panel-head" },
+      React.createElement("h2", null, "Agent Network Activity"),
+      React.createElement("span", { className: "panel-note" }, loading ? "Loading…" : `${visible.length} entries`)
+    ),
+    filterBar,
+    loading
+      ? React.createElement("div", { className: "net-empty" }, "Loading pipeline log…")
+      : visible.length === 0
+        ? React.createElement("div", { className: "net-empty" }, "No entries yet — start the pipeline.")
+        : React.createElement(
+            "div",
+            { className: "net-list" },
+            visible.slice(0, 200).map((e, i) =>
+              React.createElement(NetRow, { key: `${e.ts}-${e.stage}-${i}`, entry: e })
+            )
+          )
+  );
+}
+
 function getPageFromHash() {
   if (typeof window === "undefined") return "portfolio";
   const hash = String(window.location.hash || "").replace(/^#/, "").toLowerCase();
+  if (hash === "opportunities" || hash === "opportunity") return "opportunities";
+  if (hash === "history") return "history";
+  if (hash === "settings" || hash === "auth") return "settings";
   if (hash === "orbit") return "orbit";
   if (hash === "activity") return "activity";
   return "portfolio";
@@ -788,7 +1006,18 @@ function resolveTokenGlyph(position) {
 function resolveDelta(position) {
   const quantity = Number(position?.quantity || 0);
   const purchasedPrice = Number(position?.avg_entry_price || 0);
-  const currentPrice = Number(position?.current_price || 0);
+  const storedCurrentPrice = Number(position?.current_price || 0);
+  const storedCurrentValueUsd = Number(
+    position?.current_value_usd != null
+      ? position.current_value_usd
+      : position?.market_value_usd != null
+        ? position.market_value_usd
+        : 0
+  );
+  const fallbackPrice = quantity > 0
+    ? (storedCurrentValueUsd > 0 ? storedCurrentValueUsd / quantity : purchasedPrice)
+    : purchasedPrice;
+  const currentPrice = storedCurrentPrice > 0 ? storedCurrentPrice : fallbackPrice;
   const avgEntryUsd = purchasedPrice * quantity;
   const currentPriceUsd = currentPrice * quantity;
   const costUsd = Number(position?.cost_usd != null ? position.cost_usd : avgEntryUsd) || 0;
@@ -798,7 +1027,7 @@ function resolveDelta(position) {
       : position?.market_value_usd != null
         ? position.market_value_usd
         : currentPriceUsd
-  ) || 0;
+  ) || (currentPriceUsd > 0 ? currentPriceUsd : costUsd);
   const deltaUsd = currentValueUsd - costUsd;
   const deltaPct = costUsd > 0 ? (deltaUsd / costUsd) * 100 : 0;
   return { quantity, purchasedPrice, currentPrice, costUsd, currentValueUsd, deltaUsd, deltaPct };
@@ -976,7 +1205,8 @@ function TradingLane({ state, portfolio }) {
 }
 
 function PositionRow({ position }) {
-  const value = position.market_value_usd || 0;
+  const { currentValueUsd } = resolveDelta(position);
+  const value = currentValueUsd;
   return React.createElement(
     "div",
     { className: "position-row" },
@@ -1316,7 +1546,7 @@ function App() {
   }
 
   async function resetSystem() {
-    const confirmed = typeof window !== "undefined" ? window.confirm("Reset the entire trading floor? This will stop the pipeline, clear MongoDB, ClickHouse, and local logs.") : true;
+    const confirmed = typeof window !== "undefined" ? window.confirm("Reset the entire trading floor? This will stop the E3D Trading Agents, clear MongoDB, ClickHouse, and local logs.") : true;
     if (!confirmed) return;
 
     try {
@@ -1347,7 +1577,7 @@ function App() {
       const data = await res.json();
       setPipelineStatus(data);
       setIntervalSeconds(Number(data.interval_seconds || intervalSeconds || 300));
-      setPipelineMessage("Pipeline loop started.");
+      setPipelineMessage("E3D Trading Agents loop started.");
     } catch (err) {
       setPipelineError(err.message);
     }
@@ -1361,7 +1591,7 @@ function App() {
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       setPipelineStatus(data.pipeline || null);
-      setPipelineMessage("Pipeline stop requested.");
+      setPipelineMessage("E3D Trading Agents stop requested.");
     } catch (err) {
       setPipelineError(err.message);
     }
@@ -1408,6 +1638,7 @@ function App() {
     (floorState.flow || []).some((stage) => stage.status && stage.status !== "waiting") ||
     (floorState.meters || []).some((meter) => Number(meter.value || 0) > 0)
   );
+  const pipelineRunning = Boolean(pipelineStatus?.running);
   const orbitNodes = [
     { lane: lanes[0], className: "orbit-node orbit-scout", title: "Scout" },
     { lane: lanes[2], className: "orbit-node orbit-risk", title: "Risk" },
@@ -1519,7 +1750,18 @@ function App() {
     )
   );
 
-  const activityPanel = React.createElement(
+  const orbitPage = React.createElement(
+    React.Fragment,
+    null,
+    React.createElement(
+      "section",
+      { className: "page-grid page-grid-orbit" },
+      React.createElement("div", { className: "page-column page-column-orbit-main" }, orbitPanel),
+      React.createElement("div", { className: "page-column page-column-orbit-trail" }, decisionTrailPanel)
+    )
+  );
+
+  const activityTrailPanel = React.createElement(
     "section",
     { className: "card panel" },
     React.createElement("div", { className: "panel-head" },
@@ -1559,42 +1801,140 @@ function App() {
   );
 
   const portfolioPage = React.createElement(
-    React.Fragment,
-    null,
-    React.createElement(IntelligencePanel, { intelligence, floorState }),
-    React.createElement(
-      "section",
-      { className: "page-grid page-grid-portfolio" },
-      React.createElement("div", { className: "page-column page-column-portfolio" }, portfolioPanel),
-      React.createElement("div", { className: "page-column page-column-portfolio" }, historyPanel)
-    )
+    "div",
+    { className: "content-column-main" },
+    portfolioPanel
   );
 
-  const orbitPage = React.createElement(
+  const opportunitiesPage = React.createElement(
+    "div",
+    { className: "content-column-main" },
+    React.createElement(IntelligencePanel, { intelligence, floorState })
+  );
+
+  const historyPage = React.createElement(
+    "div",
+    { className: "content-column-main" },
+    historyPanel
+  );
+
+  const activityPage = React.createElement(
     React.Fragment,
     null,
+    React.createElement(NetworkDebugFeed, null),
+    React.createElement(AgentActivityPage, null),
+    activityTrailPanel
+  );
+
+  const settingsPage = React.createElement(
+    "div",
+    { className: "content-column-main" },
     React.createElement(
       "section",
-      { className: "page-grid page-grid-orbit" },
-      React.createElement("div", { className: "page-column page-column-orbit-main" }, orbitPanel),
-      React.createElement("div", { className: "page-column page-column-orbit-trail" }, decisionTrailPanel)
+      { className: "card pipeline-controls-strip" },
+      React.createElement(
+        "div",
+        { className: "pipeline-controls-strip-head" },
+        React.createElement("span", { className: "pipeline-controls-title" }, "E3D Trading Agents"),
+        React.createElement("span", { className: badgeForPipelineStatus(pipelineStatus) }, formatPipelineStatus(pipelineStatus))
+      ),
+      React.createElement(
+        "div",
+        { className: "pipeline-controls-strip-body" },
+        React.createElement(
+          "div",
+          { className: "pipeline-control-row pipeline-control-row-inline" },
+          React.createElement("label", { className: "pipeline-control-label", htmlFor: "pipeline-interval" }, "Cycle interval (sec)"),
+          React.createElement("input", {
+            id: "pipeline-interval",
+            className: "pipeline-control-input",
+            type: "number",
+            min: 1,
+            step: 1,
+            value: intervalSeconds,
+            onChange: (event) => setIntervalSeconds(event.target.value)
+          })
+        ),
+        React.createElement(
+          "div",
+          { className: "pipeline-control-actions" },
+          React.createElement(
+            "button",
+            { className: "button button-primary", onClick: startPipeline, disabled: pipelineRunning },
+            pipelineRunning ? "Agents running" : "Start agents"
+          ),
+          React.createElement(
+            "button",
+            { className: "button button-secondary", onClick: stopPipeline, disabled: !pipelineRunning },
+            "Stop agents"
+          ),
+          React.createElement(
+            "button",
+            { className: "button button-danger", onClick: resetSystem },
+            "Reset all"
+          )
+        ),
+        React.createElement("div", { className: "pipeline-controls-note" }, "Starts the E3D Trading Agents loop with your chosen interval."),
+        pipelineMessage ? React.createElement("div", { className: "pipeline-controls-message" }, pipelineMessage) : null,
+        pipelineError ? React.createElement("div", { className: "pipeline-controls-error" }, pipelineError) : null,
+        pipelineStatus?.pid ? React.createElement("div", { className: "pipeline-controls-meta" }, `PID ${pipelineStatus.pid}`) : null
+      )
     ),
-    activityPanel
+    React.createElement(E3DAuthPanel, {
+      mode: authMode,
+      onModeChange: setAuthMode,
+      loginEmail: authEmail,
+      onLoginEmailChange: setAuthEmail,
+      loginPassword: authPassword,
+      onLoginPasswordChange: setAuthPassword,
+      apiKey: authApiKey,
+      onApiKeyChange: setAuthApiKey,
+      authStatus,
+      statusLoading: authLoading,
+      statusMessage: authMessage,
+      statusError: authError,
+      connectLoading: authConnectLoading,
+      clearLoading: authClearLoading,
+      onConnect: connectE3dAuth,
+      onClear: clearE3dAuth,
+      onRefresh: loadAuthStatus
+    })
   );
 
-  const pageLabel = page === "orbit" ? "Orbit + decision trail" : page === "activity" ? "Agent Activity" : "Portfolio";
-  const pageNote = page === "orbit"
-    ? "Agent orbit, wallet, and decision trail"
-    : page === "activity"
-    ? "Per-cycle story signals, tokens considered, and risk decisions"
-    : "Open positions with entry, current value, and delta";
+  const pageLabelMap = {
+    portfolio: "Portfolio",
+    opportunities: "Best Opportunities + Weakest Positions",
+    history: "History",
+    settings: "Settings",
+    orbit: "Orbit + wallet",
+    activity: "Agent Activity"
+  };
+  const pageNoteMap = {
+    portfolio: "Open positions with entry, current value, and delta",
+    opportunities: "High-conviction opportunities and the weakest current positions",
+    history: "Sold positions with entry, exit, and realized PnL",
+    settings: "Manage e3d.ai login, API key access, and pipeline controls",
+    orbit: "Agent orbit and wallet view",
+    activity: "Per-cycle story signals, tokens considered, and risk decisions"
+  };
+  const pageLabel = pageLabelMap[page] || pageLabelMap.portfolio;
+  const pageNote = pageNoteMap[page] || pageNoteMap.portfolio;
 
   const goToPage = (nextPage) => {
     if (typeof window === "undefined") return;
     window.location.hash = `#${nextPage}`;
   };
-
-  const pipelineRunning = Boolean(pipelineStatus?.running);
+  const pageContent = page === "opportunities"
+    ? opportunitiesPage
+    : page === "history"
+      ? historyPage
+      : page === "settings"
+        ? settingsPage
+        : page === "orbit"
+          ? orbitPage
+          : page === "activity"
+            ? activityPage
+            : portfolioPage;
 
   return React.createElement(
     React.Fragment,
@@ -1602,133 +1942,62 @@ function App() {
     React.createElement("div", { className: "bg-orb bg-orb-1" }),
     React.createElement("div", { className: "bg-orb bg-orb-2" }),
     React.createElement(
-      "main",
-      { className: "shell" },
+      "div",
+      { className: "hero card" },
       React.createElement(
-        "header",
-        { className: "hero card" },
+        "div",
+        { className: "hero-copy" },
+        React.createElement("div", { className: "eyebrow" }, "E3D Agent Trading Floor"),
+        React.createElement("h1", { className: "hero-title" }, pageLabel),
+        React.createElement("p", null, pageNote),
         React.createElement(
           "div",
-          { className: "hero-copy" },
-          React.createElement("div", { className: "eyebrow" }, "E3D Agent Trading Floor"),
-          React.createElement("h1", { className: "hero-title" }, pageLabel),
-          React.createElement("p", null, pageNote),
-          React.createElement(
-            "div",
-            { className: "hero-actions" },
-            React.createElement("button", { className: cls("button", page === "portfolio" && "button-active"), onClick: () => goToPage("portfolio") }, "Portfolio"),
-            React.createElement("button", { className: cls("button", page === "orbit" && "button-active"), onClick: () => goToPage("orbit") }, "Orbit + trail"),
-            React.createElement("button", { className: cls("button", page === "activity" && "button-active"), onClick: () => goToPage("activity") }, "Activity"),
-            React.createElement("button", { className: "button button-primary", onClick: load }, "Refresh now"),
-            React.createElement("a", { className: "button button-secondary", href: "/api/activity", target: "_blank", rel: "noreferrer" }, "Raw activity API")
-          )
-        ),
+          { className: "hero-actions" },
+          React.createElement("button", { className: cls("button", page === "portfolio" && "button-active"), onClick: () => goToPage("portfolio") }, "Portfolio"),
+          React.createElement("button", { className: cls("button", page === "opportunities" && "button-active"), onClick: () => goToPage("opportunities") }, "Opportunities"),
+          React.createElement("button", { className: cls("button", page === "history" && "button-active"), onClick: () => goToPage("history") }, "History"),
+          React.createElement("button", { className: cls("button", page === "settings" && "button-active"), onClick: () => goToPage("settings") }, "Settings"),
+          React.createElement("button", { className: cls("button", page === "orbit" && "button-active"), onClick: () => goToPage("orbit") }, "Orbit"),
+          React.createElement("button", { className: cls("button", page === "activity" && "button-active"), onClick: () => goToPage("activity") }, "Activity"),
+          React.createElement("button", { className: "button button-primary", onClick: load }, "Refresh now"),
+          React.createElement("a", { className: "button button-secondary", href: "/api/activity", target: "_blank", rel: "noreferrer" }, "Raw activity API")
+        )
+      ),
+      React.createElement(
+        "div",
+        { className: "hero-side" },
         React.createElement(
           "div",
-          { className: "hero-side" },
+          { className: "hero-side-top" },
+          React.createElement("div", { className: badgeForRegime(portfolio.market_regime) }, portfolio.market_regime || "unknown"),
           React.createElement(
             "div",
-            { className: "hero-side-top" },
-            React.createElement("div", { className: badgeForRegime(portfolio.market_regime) }, portfolio.market_regime || "unknown"),
-            React.createElement(
-              "div",
-              { className: "hero-side-stats" },
-              React.createElement("div", { className: "hero-side-stat" },
-                React.createElement("div", { className: "hero-side-label" }, "Positions"),
-                React.createElement("div", { className: "hero-side-value" }, String(portfolio.open_positions ?? 0))
-              ),
-              React.createElement("div", { className: "hero-side-stat" },
-                React.createElement("div", { className: "hero-side-label" }, "Updated"),
-                React.createElement("div", { className: "hero-side-value" }, lastUpdated ? lastUpdated.toLocaleTimeString() : "—")
-              )
+            { className: "hero-side-stats" },
+            React.createElement("div", { className: "hero-side-stat" },
+              React.createElement("div", { className: "hero-side-label" }, "Positions"),
+              React.createElement("div", { className: "hero-side-value" }, String(portfolio.open_positions ?? 0))
+            ),
+            React.createElement("div", { className: "hero-side-stat" },
+              React.createElement("div", { className: "hero-side-label" }, "Updated"),
+              React.createElement("div", { className: "hero-side-value" }, lastUpdated ? lastUpdated.toLocaleTimeString() : "—")
             )
           )
         )
-      ),
-      loading && React.createElement("div", { className: "card loading" }, "Loading dashboard…"),
-      error && React.createElement("div", { className: "card error" }, `Dashboard error: ${error}`),
-      React.createElement(
-        "section",
-        { className: "metrics-grid" },
-        React.createElement(MetricCard, { label: "Cash", value: fmtUsd.format(portfolio.cash_usd || 0), sublabel: "Available buying power" }),
-        React.createElement(MetricCard, { label: "Equity", value: fmtUsd.format(portfolio.equity_usd || 0), sublabel: "Cash + open positions" }),
-        React.createElement(MetricCard, { label: "Realized PnL", value: fmtUsd.format(portfolio.realized_pnl_usd || 0), sublabel: "Closed trades" }),
-        React.createElement(MetricCard, { label: "Unrealized PnL", value: fmtUsd.format(portfolio.unrealized_pnl_usd || 0), sublabel: "Open positions" }),
-        React.createElement(MetricCard, { label: "Max Drawdown", value: `${fmtNum.format((portfolio.max_drawdown_pct || 0) * 100)}%`, sublabel: "Peak-to-trough" }),
-        React.createElement(MetricCard, { label: "Events", value: String(events.length), sublabel: "Latest agent + trade activity" })
-      ),
-      React.createElement(
-        "section",
-        { className: "card pipeline-controls-strip" },
-        React.createElement(
-          "div",
-          { className: "pipeline-controls-strip-head" },
-          React.createElement("span", { className: "pipeline-controls-title" }, "Pipeline controls"),
-          React.createElement("span", { className: badgeForPipelineStatus(pipelineStatus) }, formatPipelineStatus(pipelineStatus))
-        ),
-        React.createElement(
-          "div",
-          { className: "pipeline-controls-strip-body" },
-          React.createElement(
-            "div",
-            { className: "pipeline-control-row pipeline-control-row-inline" },
-            React.createElement("label", { className: "pipeline-control-label", htmlFor: "pipeline-interval" }, "Loop interval (sec)"),
-            React.createElement("input", {
-              id: "pipeline-interval",
-              className: "pipeline-control-input",
-              type: "number",
-              min: 1,
-              step: 1,
-              value: intervalSeconds,
-              onChange: (event) => setIntervalSeconds(event.target.value)
-            })
-          ),
-          React.createElement(
-            "div",
-            { className: "pipeline-control-actions" },
-            React.createElement(
-              "button",
-              { className: "button button-primary", onClick: startPipeline, disabled: pipelineRunning },
-              pipelineRunning ? "Running" : "Start pipeline"
-            ),
-            React.createElement(
-              "button",
-              { className: "button button-secondary", onClick: stopPipeline, disabled: !pipelineRunning },
-              "Stop pipeline"
-            ),
-            React.createElement(
-              "button",
-              { className: "button button-danger", onClick: resetSystem },
-              "Reset all"
-            )
-          ),
-          React.createElement("div", { className: "pipeline-controls-note" }, "Starts `node pipeline.js --loop` with your chosen interval."),
-          pipelineMessage ? React.createElement("div", { className: "pipeline-controls-message" }, pipelineMessage) : null,
-          pipelineError ? React.createElement("div", { className: "pipeline-controls-error" }, pipelineError) : null,
-          pipelineStatus?.pid ? React.createElement("div", { className: "pipeline-controls-meta" }, `PID ${pipelineStatus.pid}`) : null
-        )
-      ),
-      React.createElement(E3DAuthPanel, {
-        mode: authMode,
-        onModeChange: setAuthMode,
-        loginEmail: authEmail,
-        onLoginEmailChange: setAuthEmail,
-        loginPassword: authPassword,
-        onLoginPasswordChange: setAuthPassword,
-        apiKey: authApiKey,
-        onApiKeyChange: setAuthApiKey,
-        authStatus,
-        statusLoading: authLoading,
-        statusMessage: authMessage,
-        statusError: authError,
-        connectLoading: authConnectLoading,
-        clearLoading: authClearLoading,
-        onConnect: connectE3dAuth,
-        onClear: clearE3dAuth,
-        onRefresh: loadAuthStatus
-      }),
-      page === "orbit" ? orbitPage : page === "activity" ? React.createElement(AgentActivityPage, null) : portfolioPage
-    )
+      )
+    ),
+    loading && React.createElement("div", { className: "card loading" }, "Loading dashboard…"),
+    error && React.createElement("div", { className: "card error" }, `Dashboard error: ${error}`),
+    React.createElement(
+      "section",
+      { className: "metrics-grid" },
+      React.createElement(MetricCard, { label: "Cash", value: fmtUsd.format(portfolio.cash_usd || 0), sublabel: "Available buying power" }),
+      React.createElement(MetricCard, { label: "Equity", value: fmtUsd.format(portfolio.equity_usd || 0), sublabel: "Cash + open positions" }),
+      React.createElement(MetricCard, { label: "Realized PnL", value: fmtUsd.format(portfolio.realized_pnl_usd || 0), sublabel: "Closed trades" }),
+      React.createElement(MetricCard, { label: "Unrealized PnL", value: fmtUsd.format(portfolio.unrealized_pnl_usd || 0), sublabel: "Open positions" }),
+      React.createElement(MetricCard, { label: "Max Drawdown", value: `${fmtNum.format((portfolio.max_drawdown_pct || 0) * 100)}%`, sublabel: "Peak-to-trough" }),
+      React.createElement(MetricCard, { label: "Events", value: String(events.length), sublabel: "Latest agent + trade activity" })
+    ),
+    pageContent
   );
 }
 

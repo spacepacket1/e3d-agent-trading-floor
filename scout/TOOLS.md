@@ -75,17 +75,28 @@ https://e3d.ai/api/stories?type=CATEGORY&chain=ETH&limit=5
 - `ECOSYSTEM_SHIFT` — macro chain-level rotation. Use for sector context, not single-token decisions.
 - `CATEGORY` — sector momentum. If a category is rotating in, find the leaders.
 
+### Step 0 — E3D agent candidates and theses (check before running story sweeps)
+
+These are pre-computed by the E3D agent system and represent the strongest multi-signal convergence:
+
+```
+https://e3d.ai/api/candidates?status=new,promoted&limit=25
+https://e3d.ai/api/theses?status=active&limit=25
+```
+
+- `candidates` — tokens where multiple story types have converged across time. Fields: `convergence_score`, `signal_count`, `story_types`, `direction_hint`, `signal_summary`, `thesis_conviction`, `fraud_risk`, `liquidity_quality`. Use as your **primary** candidate source.
+- `theses` — structured investment theses with `direction` (LONG/SHORT/AVOID), `conviction`, `target_1/2/3`, `invalidation_price`, `fraud_risk`. A LONG thesis with conviction ≥ 60 is a strong buy signal.
+
+If E3D candidates map to tokens in your universe, prioritise them before running the full story sweep below.
+
 ### Step 4 — Per-token deep research
 
 For each surviving candidate (not disqualified), fetch:
 
 ```
-https://e3d.ai/api/stories?q={address}&scope=primary&limit=10
-https://e3d.ai/api/stories?q={address}&scope=primary&type=THESIS&limit=3
-https://e3d.ai/api/evidence/token/{address}
-https://e3d.ai/api/flow/summary?token_address={address}
-https://e3d.ai/api/wallet-cohorts/{address}
+https://e3d.ai/api/stories?q={address}&scope=opportunity&limit=10
 https://e3d.ai/api/token-info/{address}
+https://e3d.ai/api/tokenCounterparties?token={address}&limit=5
 ```
 
 Also verify the token is not in the SANDWICH feed (execution risk at this venue):
@@ -105,16 +116,55 @@ Price API returns `changes["30M"].percent` and `changes["24H"].percent` in neste
 
 ---
 
+## Quant Signal Integration
+
+Each cycle the pipeline injects live quant data into your context. Use it to rank and gate candidates:
+
+### Order Flow Signals (DexScreener — injected as `flow_signal` on tokens)
+
+| flow_signal | buy_sell_ratio_1h | Meaning | Action |
+|---|---|---|---|
+| strong_accumulation | ≥ 2.0 | Heavy buying pressure | Confirms buy thesis — TIER 1 eligible |
+| accumulation | ≥ 1.4 | Net buying | Supports buy thesis — TIER 2 eligible |
+| neutral | 0.8 – 1.4 | Balanced flow | Neutral — use other signals to decide |
+| distribution | 0.5 – 0.8 | Net selling | Contradicts buy thesis — skip unless overwhelming story |
+| strong_distribution | < 0.5 | Heavy selling | Hard skip — wait for flow reversal |
+
+### Funding Rate Signals (Binance perpetuals — injected as `_funding_rate`)
+
+| signal | rate_per_8h | Meaning | Action |
+|---|---|---|---|
+| overcrowded_long | > 0.1% | Too many longs — crowded trade | Skip new entries; late to the trade |
+| mild_long_bias | 0.05–0.1% | Slight long tilt | Proceed with normal sizing |
+| neutral | -0.03 – 0.05% | Balanced positioning | Full size OK |
+| squeeze_potential | < -0.03% | Shorts crowded | Positive signal — squeeze may lift price |
+
+### Macro Regime Gate (injected as `new_positions_ok`, `regime`, `tighten_stops`)
+
+- `new_positions_ok=false` (regime=fear/extreme_fear or BTC down > 4%): **only propose TIER 1 setups with conviction ≥ 0.75**
+- `tighten_stops=true` (extreme greed or BTC up > 10%): **size down 30%, note in risks[]**
+- Normal regime: proceed with standard sizing
+
+### Entry Tier Ranking
+
+| Tier | Criteria | Size |
+|---|---|---|
+| TIER 1 | E3D candidate/thesis + flow=accumulation/strong_accumulation + funding=neutral/squeeze | Full (1× risk_per_trade) |
+| TIER 2 | Story signal (ACCUMULATION/SMART_MONEY/THESIS) + flow=neutral or better | Standard (0.75×) |
+| TIER 3 | Story signal only, flow unknown | Small (0.5×) |
+| SKIP | flow=distribution/strong_distribution without overwhelming story evidence OR funding=overcrowded_long | Do not propose |
+
 ## High-Conviction Combo Signals
 
-These multi-story combinations are the strongest buy signals E3D can produce:
+These multi-story + quant combinations are the strongest buy signals:
 
 | Combo | Interpretation |
 |---|---|
-| ACCUMULATION + BREAKOUT_CONFIRMED | Structural buy + price confirmation — rare and strong |
-| SMART_MONEY (3+) + STEALTH_ACCUMULATION | Multiple smart wallets building hidden position |
-| MOVER + SURGE (broad) | Price + activity double confirmation |
-| TOKEN_QUALITY_SCORE high + SMART_MONEY | Quality new token + smart wallets arriving |
+| ACCUMULATION + BREAKOUT_CONFIRMED + flow=strong_accumulation | Structural buy + price + order flow triple confirmation |
+| SMART_MONEY (3+) + STEALTH_ACCUMULATION + funding=squeeze_potential | Smart wallets + hidden size + short-squeeze fuel |
+| E3D candidate (convergence_score > 0.7) + flow=accumulation | E3D multi-signal + live order flow confirmation |
+| MOVER + SURGE (broad) + flow=accumulation | Price + activity + sustained buying pressure |
+| TOKEN_QUALITY_SCORE high + SMART_MONEY + funding=neutral | Quality new token + smart wallets + not crowded |
 | INSIDER_TIMING + FUNNEL (staging) | Pre-event buying + capital staging = high-conviction setup |
 
 ---

@@ -38,8 +38,8 @@ https://e3d.ai/api/stories?type=SPREAD_WIDENING&chain=ETH&limit=15
 
 ### 4. Live liquidity confirmation
 ```
-https://e3d.ai/api/flow/summary?token_address={address}
-https://e3d.ai/api/evidence/token/{address}
+https://e3d.ai/api/token-info/{address}
+https://e3d.ai/api/tokenCounterparties?token={address}&limit=5
 ```
 Confirm liquidity_usd and estimated_slippage_bps are within the approved bounds from Risk.
 

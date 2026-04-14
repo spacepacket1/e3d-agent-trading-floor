@@ -4,6 +4,7 @@ import crypto from "crypto";
 import { execFileSync } from "child_process";
 import { fileURLToPath } from "url";
 import { buildCurlAuthArgs } from "./e3dAuthClient.js";
+import { buildCycleQuantContext, enrichCandidateQuant, batchEnrichTokenFlow } from "./marketData.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -29,10 +30,11 @@ const E3D_DOSSIER_MAX_STORIES = 4;
 const E3D_DOSSIER_MAX_COUNTERPARTIES = 5;
 
 // Rate-limit budget management.
-// Tiers: free=50/day @5000ms, premium=500/day @1000ms, enterprise=1000/day @10ms
-// Default to premium-safe: 1100ms between requests, max 450 per run (leaves 50 buffer).
-const E3D_REQUEST_MIN_INTERVAL_MS = Number(process.env.E3D_REQUEST_MIN_INTERVAL_MS || 1100);
-const E3D_REQUEST_DAILY_BUDGET = Number(process.env.E3D_REQUEST_DAILY_BUDGET || 450);
+// Tiers: free=100/day @5000ms, premium=1000/day @1000ms, enterprise=100000/day @10ms
+// Enterprise-safe: 500ms between requests, 90000/day cap (leaves 10% buffer).
+// Note: /stories has a separate burst limit — avoid hammering it back-to-back.
+const E3D_REQUEST_MIN_INTERVAL_MS = Number(process.env.E3D_REQUEST_MIN_INTERVAL_MS || 500);
+const E3D_REQUEST_DAILY_BUDGET = Number(process.env.E3D_REQUEST_DAILY_BUDGET || 90000);
 let _e3dRequestCount = 0;
 let _e3dLastRequestAt = 0;
 const E3D_DOSSIER_CACHE = new Map();
@@ -90,6 +92,29 @@ function runShell(command, args, options = {}) {
   });
 }
 
+// Repair truncated JSON from LLM responses that hit max_tokens mid-output.
+// Closes any unclosed strings, objects, and arrays so JSON.parse can succeed.
+function repairTruncatedJson(str) {
+  const stack = [];
+  let inString = false;
+  let escape = false;
+  for (let i = 0; i < str.length; i++) {
+    const c = str[i];
+    if (escape) { escape = false; continue; }
+    if (c === "\\" && inString) { escape = true; continue; }
+    if (c === '"') { inString = !inString; continue; }
+    if (inString) continue;
+    if (c === "{") stack.push("}");
+    else if (c === "[") stack.push("]");
+    else if (c === "}" || c === "]") stack.pop();
+  }
+  // Strip trailing comma/colon that would produce invalid JSON, then close open structures
+  let repaired = str.trimEnd().replace(/[,:{]\s*$/, "");
+  if (inString) repaired += '"';
+  while (stack.length > 0) repaired += stack.pop();
+  return repaired;
+}
+
 function validateHarvestPayload(payload) {
   if (!payload || typeof payload !== "object") {
     throw new Error("INVALID_HARVEST_PAYLOAD");
@@ -135,34 +160,37 @@ function validateScoutPayload(payload) {
     throw new Error("SCOUT_CANDIDATES_NOT_ARRAY");
   }
 
-  payload.candidates.forEach((proposal) => {
+  const validCandidates = [];
+  for (const proposal of payload.candidates) {
     if (!proposal || typeof proposal !== "object") {
-      throw new Error("INVALID_SCOUT_PROPOSAL");
+      log("scout_candidate_dropped", { reason: "INVALID_SCOUT_PROPOSAL" });
+      continue;
     }
-
     if (!proposal.token || typeof proposal.token !== "object") {
-      throw new Error("SCOUT_TOKEN_MISSING");
+      log("scout_candidate_dropped", { reason: "SCOUT_TOKEN_MISSING", proposal });
+      continue;
     }
 
     const addr = cleanAddress(proposal.token.contract_address);
     proposal.token.contract_address = addr;
 
     if (!proposal.token.symbol || typeof proposal.token.symbol !== "string") {
-      throw new Error("SCOUT_TOKEN_SYMBOL_MISSING");
+      log("scout_candidate_dropped", { reason: "SCOUT_TOKEN_SYMBOL_MISSING", addr });
+      continue;
     }
-
     if (!isEvmAddress(addr)) {
-      throw new Error(`INVALID_SCOUT_ADDRESS:${addr}`);
+      log("scout_candidate_dropped", { reason: "INVALID_SCOUT_ADDRESS", addr });
+      continue;
     }
-
     if (!proposal.entry_zone || typeof proposal.entry_zone !== "object") {
-      throw new Error("SCOUT_ENTRY_ZONE_MISSING");
+      proposal.entry_zone = { low: null, high: null };
     }
-
     if (!proposal.targets || typeof proposal.targets !== "object") {
-      throw new Error("SCOUT_TARGETS_MISSING");
+      proposal.targets = { target_1: null, target_2: null, target_3: null };
     }
-  });
+    validCandidates.push(proposal);
+  }
+  payload.candidates = validCandidates;
 
   if (payload.holdings_updates != null && !Array.isArray(payload.holdings_updates)) {
     throw new Error("SCOUT_HOLDINGS_UPDATES_NOT_ARRAY");
@@ -257,11 +285,7 @@ function buildScoutIntelUrls(portfolioIntelligence) {
     if (address) {
       urls.push(`${E3D_API_BASE_URL}/addressMeta?address=${encodeURIComponent(address)}`);
       urls.push(`${E3D_API_BASE_URL}/token-info/${encodeURIComponent(address)}`);
-      urls.push(`${E3D_API_BASE_URL}/evidence/token/${encodeURIComponent(address)}`);
-      urls.push(`${E3D_API_BASE_URL}/stories?q=${encodeURIComponent(address)}&scope=primary&limit=${E3D_DOSSIER_MAX_STORIES}`);
-      urls.push(`${E3D_API_BASE_URL}/stories?q=${encodeURIComponent(address)}&scope=primary&type=THESIS&limit=3`);
-      urls.push(`${E3D_API_BASE_URL}/wallet-cohorts/${encodeURIComponent(address)}`);
-      urls.push(`${E3D_API_BASE_URL}/flow/summary?token_address=${encodeURIComponent(address)}`);
+      urls.push(`${E3D_API_BASE_URL}/stories?q=${encodeURIComponent(address)}&scope=opportunity&limit=${E3D_DOSSIER_MAX_STORIES}`);
       urls.push(`${E3D_API_BASE_URL}/addressCounterparties?address=${encodeURIComponent(address)}&limit=${E3D_DOSSIER_MAX_COUNTERPARTIES}`);
       urls.push(`${E3D_API_BASE_URL}/tokenCounterparties?token=${encodeURIComponent(address)}&limit=${E3D_DOSSIER_MAX_COUNTERPARTIES}`);
       urls.push(`${E3D_API_BASE_URL}/stories?q=${encodeURIComponent(address)}&scope=any&limit=${E3D_DOSSIER_MAX_STORIES}`);
@@ -319,11 +343,7 @@ function fetchScoutIntelDebug(portfolioIntelligence) {
       symbol: symbol || null,
       identity: fetchJson("/addressMeta", { address }),
       token_info: fetchJson(`/token-info/${encodeURIComponent(address)}`),
-      evidence: fetchJson(`/evidence/token/${encodeURIComponent(address)}`),
-      stories_primary: fetchJson("/stories", { q: address, scope: "primary", limit: E3D_DOSSIER_MAX_STORIES }),
-      theses: fetchJson("/stories", { q: address, scope: "primary", type: "THESIS", limit: 3 }),
-      wallet_cohort: fetchJson(`/wallet-cohorts/${encodeURIComponent(address)}`),
-      flow_summary: fetchJson("/flow/summary", { token_address: address }),
+      stories_opportunity: fetchJson("/stories", { q: address, scope: "opportunity", limit: E3D_DOSSIER_MAX_STORIES }),
       address_counterparties: fetchJson("/addressCounterparties", { address, limit: E3D_DOSSIER_MAX_COUNTERPARTIES }),
       token_counterparties: fetchJson("/tokenCounterparties", { token: address, limit: E3D_DOSSIER_MAX_COUNTERPARTIES }),
       stories_by_address: fetchJson("/stories", { q: address, scope: "any", limit: E3D_DOSSIER_MAX_STORIES }),
@@ -493,15 +513,14 @@ function syncPortfolioToMongo(portfolio) {
       );
     `;
 
+    // Pipe script via stdin to avoid ARG_MAX when the portfolio JSON is large
     runShell("docker", [
       "exec",
       "-i",
       MONGO_CONTAINER_NAME,
       "mongosh",
-      "--quiet",
-      "--eval",
-      mongoScript
-    ]);
+      "--quiet"
+    ], { input: mongoScript });
   } catch (err) {
     log("mongo_sync_error", { message: err.message });
   }
@@ -1027,7 +1046,7 @@ function fetchJson(pathname, query = {}, fallback = null) {
     const startedAt = Date.now();
     log("e3d_api_request", { url, pathname, query, req_num: _e3dRequestCount });
     const marker = "__E3D_HTTP_STATUS__";
-    const stdout = runShell("curl", ["-s", "--max-time", "12", "-L", "-o", "-", "-w", `${marker}%{http_code}`, ...buildCurlAuthArgs(url), url]);
+    const stdout = runShell("curl", ["-s", "--max-time", "30", "-L", "-o", "-", "-w", `${marker}%{http_code}`, ...buildCurlAuthArgs(url), url]);
     const output = String(stdout || "");
     const markerIndex = output.lastIndexOf(marker);
     const text = markerIndex >= 0 ? output.slice(0, markerIndex).trim() : output.trim();
@@ -1065,7 +1084,7 @@ function e3dFetch(url, fallback = null) {
 function asArray(value) {
   if (Array.isArray(value)) return value;
   if (!value || typeof value !== "object") return [];
-  for (const key of ["stories", "items", "data", "results", "theses", "opportunities", "wallets", "rows"]) {
+  for (const key of ["stories", "candidates", "tokens", "items", "data", "results", "theses", "opportunities", "wallets", "rows"]) {
     if (Array.isArray(value[key])) return value[key];
   }
   return [];
@@ -1206,7 +1225,15 @@ function summarizeStories(stories, source, limit = E3D_DOSSIER_MAX_STORIES) {
   return mergeUniqueStories(endpointArray(stories))
     .map((story) => summarizeStory(story, source))
     .filter(Boolean)
-    .sort((a, b) => toNum(b.score, 0) - toNum(a.score, 0) || new Date(b.ts_created || 0).getTime() - new Date(a.ts_created || 0).getTime())
+    .sort((a, b) => {
+      const aPriority = String(a?.story_type || "").toUpperCase() === "THESIS" ? 2 : a.tone === "opportunity" ? 1 : 0;
+      const bPriority = String(b?.story_type || "").toUpperCase() === "THESIS" ? 2 : b.tone === "opportunity" ? 1 : 0;
+      return (
+        bPriority - aPriority ||
+        toNum(b.score, 0) - toNum(a.score, 0) ||
+        new Date(b.ts_created || 0).getTime() - new Date(a.ts_created || 0).getTime()
+      );
+    })
     .slice(0, limit);
 }
 
@@ -1385,16 +1412,17 @@ function deriveActionTilt(metrics) {
   return "watch";
 }
 
-function computeDossierScores({ position, stories, opportunityStories, riskStories, counterparties, tokenCounterparties, marketData, flowSummary, walletCohort }) {
+function computeDossierScores({ position, stories, opportunityStories, thesisStories, riskStories, counterparties, tokenCounterparties, marketData, flowSummary, walletCohort }) {
   const allStories = endpointArray(stories);
   const opportunityList = endpointArray(opportunityStories);
+  const thesisList = endpointArray(thesisStories);
   const riskList = endpointArray(riskStories);
   const latestStoryDates = allStories
     .map((story) => daysSince(story?.ts_created || story?.created_at || story?.timestamp))
     .filter((value) => Number.isFinite(value));
   const latestStoryAgeDays = latestStoryDates.length ? Math.min(...latestStoryDates) : NaN;
   const derivedStoryCount = allStories.reduce((sum, story) => sum + toNum(story?.derived_count || story?.meta?.derived_count, 0), 0);
-  const positiveStoryCount = allStories.filter((story) => classifyStoryTone(story) === "opportunity").length + opportunityList.length;
+  const positiveStoryCount = allStories.filter((story) => classifyStoryTone(story) === "opportunity").length + opportunityList.length + thesisList.length;
   const negativeStoryCount = allStories.filter((story) => classifyStoryTone(story) === "risk").length + riskList.length;
   const conflictCount = allStories.filter((story) => classifyStoryTone(story) === "mixed").length;
   const counterpartyCount = endpointArray(counterparties).length + endpointArray(tokenCounterparties).length;
@@ -1413,10 +1441,10 @@ function computeDossierScores({ position, stories, opportunityStories, riskStori
   );
 
   const thesisFreshness = clampScore(
-    100 - (Number.isFinite(latestStoryAgeDays) ? latestStoryAgeDays * 12 : 35) + Math.min(10, positiveStoryCount * 2)
+    100 - (Number.isFinite(latestStoryAgeDays) ? latestStoryAgeDays * 12 : 35) + Math.min(12, positiveStoryCount * 2 + thesisList.length * 2)
   );
   const thesisStrength = clampScore(
-    20 + positiveStoryCount * 14 + derivedStoryCount * 3 + (counterpartyCount > 0 ? 8 : 0) + (marketChange > 0 ? Math.min(12, marketChange) : 0) - negativeStoryCount * 9 - conflictCount * 4
+    20 + positiveStoryCount * 14 + thesisList.length * 10 + derivedStoryCount * 3 + (counterpartyCount > 0 ? 8 : 0) + (marketChange > 0 ? Math.min(12, marketChange) : 0) - negativeStoryCount * 9 - conflictCount * 4
   );
   const narrativeDecay = clampScore(
     100 - thesisFreshness + negativeStoryCount * 10 + conflictCount * 6 + Math.max(0, latestStoryAgeDays - 7) * 2
@@ -1474,6 +1502,8 @@ function setCachedDossier(cacheKey, value) {
 // Shared market context fetched once per cycle and passed into per-position dossiers.
 // Avoids re-fetching gainers/losers/token-universe for every held position.
 let _cycleMarketContext = null;
+// Quant context: DexScreener order flow, macro regime, Binance funding rates — reset each cycle.
+let _cycleQuantContext = null;
 
 function getOrFetchCycleMarketContext() {
   if (_cycleMarketContext) return _cycleMarketContext;
@@ -1484,7 +1514,15 @@ function getOrFetchCycleMarketContext() {
   const trendingLosers = summarizeTrendingTokens(fetchJson("/fetchTokenPricesWithHistoryAllRanges", {
     dataSource: E3D_TOKENS_DATA_SOURCE, sortBy: "change_30m_pct", sortDir: "asc", limit: 50
   }), "losers", 8);
-  _cycleMarketContext = { tokenUniverse, trendingGainers, trendingLosers };
+  // Fetch global stories once per cycle. Both the dossier and Scout use this cached copy,
+  // eliminating N per-position stories API calls and keeping us well under the rate limit.
+  // Retry once on 429 — a cold-start burst from the dashboard can briefly exhaust the budget.
+  let allStories = endpointArray(fetchJson("/stories", { limit: 200, chain: "ETH" }));
+  if (!allStories.length) {
+    sleepSync(15000);
+    allStories = endpointArray(fetchJson("/stories", { limit: 200, chain: "ETH" }));
+  }
+  _cycleMarketContext = { tokenUniverse, trendingGainers, trendingLosers, allStories };
   return _cycleMarketContext;
 }
 
@@ -1496,8 +1534,8 @@ function buildTokenIntelligenceDossier(position, portfolio, options = {}) {
   const cached = getCachedDossier(cacheKey);
   if (cached) return cached;
 
-  // Use shared cycle-level market data — 3 calls instead of 3 × N positions
-  const { tokenUniverse, trendingGainers, trendingLosers } = getOrFetchCycleMarketContext();
+  // Use shared cycle-level market data and stories — fetched once, reused for every position
+  const { tokenUniverse, trendingGainers, trendingLosers, allStories: cycleStories } = getOrFetchCycleMarketContext();
   const marketFeed = mergeUniqueTokens(trendingGainers, trendingLosers, tokenUniverse);
 
   const identity = address ? fetchJson("/addressMeta", { address }) : null;
@@ -1507,21 +1545,22 @@ function buildTokenIntelligenceDossier(position, portfolio, options = {}) {
     search: address || symbol || undefined,
     limit: 25
   }));
-  const capabilityEvidence = address ? fetchJson(`/evidence/token/${encodeURIComponent(address)}`) : null;
-  // Fetch primary stories only — merging scope=any and symbol-based calls added 2 extra calls
-  // per position for data that largely overlaps with scope=primary.
-  const tokenStories = address ? endpointArray(fetchJson("/stories", { q: address, scope: "primary", limit: E3D_DOSSIER_MAX_STORIES })) : [];
-  const thesisRows = address ? endpointArray(fetchJson("/stories", { q: address, scope: "primary", type: "THESIS", limit: 3 })) : [];
-  const walletCohort = address ? fetchJson(`/wallet-cohorts/${encodeURIComponent(address)}`) : null;
-  const flowSummary = address ? fetchJson("/flow/summary", { token_address: address }) : null;
+  // Use the cycle-level cached stories filtered to this address — no extra API call.
+  // This preserves the stories rate limit budget for the Scout's global call.
+  const tokenStories = address
+    ? (cycleStories || []).filter(s => {
+        const sAddr = cleanAddress(s?.meta?.token_address || s?.primary_token || s?.meta?.primary?.address || s?.address || "");
+        return sAddr === address;
+      }).slice(0, E3D_DOSSIER_MAX_STORIES)
+    : [];
+  const thesisRows = tokenStories.filter((story) => {
+    const storyType = String(story?.story_type || story?.type || "").toUpperCase();
+    return storyType === "THESIS";
+  }).slice(0, 3);
+  const riskRows = tokenStories.filter((story) => classifyStoryTone(story) === "risk").slice(0, 3);
   const counterparties = address ? summarizeCounterparties(fetchJson("/addressCounterparties", { address, limit: E3D_DOSSIER_MAX_COUNTERPARTIES })) : [];
   const tokenCounterparties = address ? summarizeCounterparties(fetchJson("/tokenCounterparties", { token: address, limit: E3D_DOSSIER_MAX_COUNTERPARTIES })) : [];
-  const capabilityStories = mergeUniqueStories(
-    endpointArray(capabilityEvidence?.stories),
-    endpointArray(capabilityEvidence?.storys),
-    tokenStories,
-    thesisRows
-  );
+  const capabilityStories = tokenStories;
   const stories = summarizeStories(capabilityStories, "dossier", E3D_DOSSIER_MAX_STORIES);
   const marketData = extractMarketSnapshot(position, identity, tokenInfo, marketFeed);
   const transactionSnapshot = summarizeTransactions(recentTransactions, "fetchTransactionsDB", 25);
@@ -1543,12 +1582,13 @@ function buildTokenIntelligenceDossier(position, portfolio, options = {}) {
     position,
     stories: capabilityStories,
     opportunityStories: tokenStories,
-    riskStories: thesisRows,
+    thesisStories: thesisRows,
+    riskStories: riskRows,
     counterparties,
     tokenCounterparties,
     marketData,
-    flowSummary,
-    walletCohort
+    flowSummary: null,
+    walletCohort: null
   });
   const action = deriveActionTilt({ ...scores, pnl_pct: scores.pnl_pct });
   const strongestStory = stories[0] || null;
@@ -1592,8 +1632,6 @@ function buildTokenIntelligenceDossier(position, portfolio, options = {}) {
     },
     theses: endpointArray(thesisRows).slice(0, 3),
     flow: {
-      wallet_cohort: walletCohort || null,
-      flow_summary: flowSummary || null,
       counterparties,
       token_counterparties: tokenCounterparties,
       counterparty_count: counterparties.length + tokenCounterparties.length,
@@ -1650,8 +1688,7 @@ function buildTokenIntelligenceDossier(position, portfolio, options = {}) {
       },
       flow: {
         counterparty_count: counterparties.length + tokenCounterparties.length,
-        wallet_cohort_label: walletCohort?.cohort_label || walletCohort?.label || null,
-        flow_direction: flowSummary?.direction || flowSummary?.flow_direction || walletCohort?.flow_direction || "neutral"
+        flow_direction: "neutral"
       },
       recommendation: {
         action,
@@ -1812,7 +1849,7 @@ function buildAgentCoverageLog(agentId, payload) {
 const LLM_BASE_URL = process.env.LLM_BASE_URL || "http://127.0.0.1:5050";
 const LLM_MODEL = process.env.LLM_MODEL || "mlx-community/Qwen2.5-14B-Instruct-4bit";
 
-function callLLMDirect(systemPrompt, userMessage, { maxRetries = 2 } = {}) {
+function callLLMDirect(systemPrompt, userMessage, { maxRetries = 2, agent = "unknown" } = {}) {
   const bodyObj = {
     model: LLM_MODEL,
     messages: [
@@ -1828,6 +1865,16 @@ function callLLMDirect(systemPrompt, userMessage, { maxRetries = 2 } = {}) {
   // Write body to a temp file so curl can read it via -d @file (avoids ARG_MAX
   // and stdin-piping issues with execFileSync).
   const tmpFile = `/tmp/llm-req-${reqId}.json`;
+
+  const startMs = nowMs();
+  log("llm_request", {
+    req_id: reqId,
+    agent,
+    model: LLM_MODEL,
+    prompt_chars: systemPrompt.length + userMessage.length,
+    system_chars: systemPrompt.length,
+    user_chars: userMessage.length,
+  });
 
   let lastErr;
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
@@ -1859,12 +1906,24 @@ function callLLMDirect(systemPrompt, userMessage, { maxRetries = 2 } = {}) {
       if (typeof text !== "string" || !text.trim()) {
         throw new Error(`LLM_EMPTY_RESPONSE\n${stdout.slice(0, 500)}`);
       }
+      const durationMs = nowMs() - startMs;
+      log("llm_response", {
+        req_id: reqId,
+        agent,
+        duration_ms: durationMs,
+        output_chars: text.length,
+        prompt_tokens: parsed?.usage?.prompt_tokens ?? null,
+        completion_tokens: parsed?.usage?.completion_tokens ?? null,
+        total_tokens: parsed?.usage?.total_tokens ?? null,
+        finish_reason: parsed?.choices?.[0]?.finish_reason ?? null,
+      });
       return text.trim();
     } catch (err) {
       lastErr = err;
       if (attempt < maxRetries) sleepSync(5000);
     }
   }
+  log("llm_error", { req_id: reqId, agent, duration_ms: nowMs() - startMs, error: lastErr?.message?.slice(0, 200) });
   throw lastErr;
 }
 
@@ -1894,15 +1953,24 @@ function fetchScoutData() {
   const secondaryTypes = new Set(["CONCENTRATION_SHIFT", "INSIDER_TIMING", "TOKEN_QUALITY_SCORE",
     "SANDWICH", "MIRROR", "VOLUME_PROFILE_ANOMALY", "FUNNEL", "WHALE"]);
 
-  // Fetch all available stories in one call (no type/chain filter — combining them kills results).
-  const allStories = endpointArray(fetchJson("/stories", { limit: 100, chain: "ETH" }));
+  // Use the cycle-level cached global stories — already fetched by getOrFetchCycleMarketContext().
+  // This is the single stories API call for the entire cycle; no per-position calls are made.
+  const { allStories: cycleAllStories } = getOrFetchCycleMarketContext();
+  const allStories = cycleAllStories || [];
   const stories = {};
-  for (const s of allStories) {
+  const thesisStories = [];
+  const seenStoryIds = new Set();
+  function addStory(s) {
     const t = String(s?.story_type || s?.type || "").toUpperCase();
-    if (!t) continue;
+    if (!t) return;
     if (!stories[t]) stories[t] = [];
+    const sid = s?.id || s?.story_id || null;
+    if (sid && seenStoryIds.has(sid)) return;
+    if (sid) seenStoryIds.add(sid);
     stories[t].push(s);
+    if (t === "THESIS") thesisStories.push(s);
   }
+  for (const s of allStories) addStory(s);
 
   // Rotate sort criteria each cycle
   const sortParams = SCOUT_SORT_ROTATION[_scoutCycleIndex % SCOUT_SORT_ROTATION.length];
@@ -1945,7 +2013,7 @@ function fetchScoutData() {
 
   // Sort merged universe: tokens with on-chain volume first (highest signal),
   // then by effective liquidity, then by 24h change as tiebreaker.
-  const tokenUniverse = raw.sort((a, b) => {
+  const tokenUniverseAll = raw.sort((a, b) => {
     const volDiff = (b.volume_24h_usd || 0) - (a.volume_24h_usd || 0);
     if (volDiff !== 0) return volDiff;
     const liqDiff = (b.liquidity_usd || 0) - (a.liquidity_usd || 0);
@@ -1953,7 +2021,65 @@ function fetchScoutData() {
     return (b.change_24h || 0) - (a.change_24h || 0);
   });
 
-  return { stories, tokenUniverse, disqualifierTypes, buySignalTypes, secondaryTypes, sortLabel: `${sortParams.sortBy} ${sortParams.sortDir}` };
+  // Strip stablecoins, gold tokens, and base/wrapped assets — these are not momentum-trading
+  // candidates and dominate the volume ranking, causing the LLM to propose them when
+  // there are no stories to guide it toward real opportunities.
+  const nonTradeablePattern = /^(USDC?|USDT|DAI|USDS|BUSD|TUSD|FRAX|LUSD|SUSD|GUSD|PYUSD|FDUSD|USDE|SUSDE|USDY|USDP|HUSD|MUSD|CRVUSD|GHO|PYUSD|XAUt|PAXG|CACHE|XAUT|WETH|WBTC|cbBTC|rETH|stETH|wstETH|cbETH|ankrETH|BETH|sETH2|ETH2x|STETH)$/i;
+  const tokenUniverse = tokenUniverseAll.filter(t => !nonTradeablePattern.test(t.symbol || ""));
+
+  // Enrich universe with story-mentioned tokens not in the top-volume list.
+  // Stories (ACCUMULATION, SMART_MONEY, THESIS, etc.) often fire on tokens accumulating
+  // before they show up in volume rankings — that's the alpha window. Fetch price data
+  // for up to 5 high-signal story addresses and add them so Scout can propose them.
+  const highSignalStoryTypes = new Set(["THESIS", "ACCUMULATION", "SMART_MONEY", "STEALTH_ACCUMULATION", "BREAKOUT_CONFIRMED"]);
+  const enrichQueue = [];
+  for (const [type, items] of Object.entries(stories)) {
+    if (!highSignalStoryTypes.has(type)) continue;
+    for (const s of items) {
+      const addr = cleanAddress(s?.meta?.token_address || s?.primary_token || s?.address || "");
+      if (addr && !seen.has(addr)) enrichQueue.push({ addr, score: s?.score ?? 0, type });
+    }
+  }
+  enrichQueue.sort((a, b) => b.score - a.score);
+  for (const { addr } of enrichQueue.slice(0, 5)) {
+    try {
+      const rows = endpointArray(fetchJson("/fetchTokenPricesWithHistoryAllRanges", {
+        dataSource: 1, search: addr, limit: 1
+      }));
+      const row = rows.find((r) => cleanAddress(r.address || r.contract_address || "") === addr) || rows[0];
+      if (!row) continue;
+      const enriched = mapToken(row);
+      if (enriched.address && (enriched.price_usd ?? 0) > 0 && !seen.has(enriched.address) &&
+          !nonTradeablePattern.test(enriched.symbol || "")) {
+        seen.add(enriched.address);
+        tokenUniverse.push(enriched);
+      }
+    } catch (_) {}
+  }
+  log("scout_story_enrichment", { queued: enrichQueue.length, added: tokenUniverse.length - tokenUniverseAll.length + tokenUniverseAll.filter(t => nonTradeablePattern.test(t.symbol || "")).length });
+
+  const thesisSignalStories = thesisStories.length ? thesisStories : endpointArray(stories.THESIS);
+
+  // No per-token supplemental stories calls here — the global limit=200 call above is the
+  // stories budget for the cycle. The dossier phase already consumed per-position calls,
+  // and the /stories endpoint rate-limits at ~5-6 calls per window; adding more here
+  // causes 429s that knock out the global call entirely.
+
+  const storyTypeDist = Object.fromEntries(Object.entries(stories).map(([k, v]) => [k, v.length]));
+  log("scout_story_types", { types: Object.keys(storyTypeDist).length, dist: storyTypeDist });
+
+  // Fetch pre-computed multi-signal convergence candidates from the E3D agent system.
+  // These are tokens where multiple story types have converged — much stronger signal
+  // than any single story type alone. Joined with thesis data when one exists.
+  const e3dCandidates = endpointArray(fetchJson("/candidates", { status: "new,promoted", limit: 25 }));
+  log("scout_e3d_candidates", { count: e3dCandidates.length });
+
+  // Fetch structured investment theses — direction, conviction, price targets, invalidation.
+  // Higher signal quality than THESIS-type stories since these are the agent's finalised views.
+  const e3dTheses = endpointArray(fetchJson("/theses", { status: "active", limit: 25 }));
+  log("scout_e3d_theses", { count: e3dTheses.length });
+
+  return { stories, thesisSignalStories, tokenUniverse, disqualifierTypes, buySignalTypes, secondaryTypes, sortLabel: `${sortParams.sortBy} ${sortParams.sortDir}`, e3dCandidates, e3dTheses };
 }
 
 function runScoutDirect(portfolio, portfolioIntelligence = null) {
@@ -1972,6 +2098,31 @@ function runScoutDirect(portfolio, portfolioIntelligence = null) {
 
   // Pre-fetch all E3D data
   const data = fetchScoutData();
+
+  // Expand token_flow to cover top-60 liquid tokens in the universe (not just held positions).
+  // This lets Scout rank candidates by live order flow even when e3d.ai has no candidates/theses.
+  // Two DexScreener batch calls (30 addrs each) — ~600ms total.
+  if (_cycleQuantContext) {
+    const topTokens = data.tokenUniverse
+      .filter(t => t.address && (t.liquidity_usd ?? 0) > 5000)
+      .slice(0, 60);
+    _cycleQuantContext.token_flow = batchEnrichTokenFlow(topTokens, _cycleQuantContext.token_flow || {});
+    log("scout_flow_enrichment", { flow_tokens_total: Object.keys(_cycleQuantContext.token_flow).length });
+  }
+
+  // Overlay DexScreener order-flow onto all universe tokens that now have flow data.
+  if (_cycleQuantContext?.token_flow) {
+    for (const t of data.tokenUniverse) {
+      const addr = cleanAddress(t.address || "");
+      const flow = addr ? _cycleQuantContext.token_flow[addr] : null;
+      if (flow) {
+        t.flow_signal         = flow.flow_signal;
+        t.buy_sell_ratio_1h   = flow.buy_sell_ratio_1h;
+        t.price_change_1h_pct = flow.price_change_1h_pct;
+        if ((flow.price_usd ?? 0) > 0 && !(t.price_usd > 0)) t.price_usd = flow.price_usd;
+      }
+    }
+  }
 
   // Build story-based price fallback: address → story meta with price data
   const storyPriceMap = new Map();
@@ -2033,7 +2184,9 @@ function runScoutDirect(portfolio, portfolioIntelligence = null) {
       in_token_universe: !!tokenMatch,
       token_symbol: tokenMatch?.symbol || null,
       price_usd: tokenMatch?.price_usd ?? null,
+      volume_24h_usd: tokenMatch?.volume_24h_usd ?? null,
       change_30m: tokenMatch?.change_30m ?? null,
+      change_24h: tokenMatch?.change_24h ?? null,
       liquidity_usd: tokenMatch?.liquidity_usd ?? null,
     });
   };
@@ -2042,28 +2195,124 @@ function runScoutDirect(portfolio, portfolioIntelligence = null) {
     "You are Scout, a crypto trading research agent.",
     "You have been given pre-fetched E3D market intelligence data. Return STRICT JSON only — one object, no markdown, no commentary.",
     "",
+    "SIGNAL PRIORITY (highest to lowest):",
+    "1. E3D AGENT CANDIDATES — pre-computed multi-signal convergence analysis. These are the strongest signals: the E3D agent has already correlated multiple story types across time. Use these as your primary candidates when available.",
+    "2. E3D THESES — structured investment theses with direction, conviction, and price targets. Treat a LONG thesis with conviction >= 60 as a strong buy signal.",
+    "3. THESIS STORIES — THESIS-type on-chain stories. Use when no structured thesis exists for a token.",
+    "4. BUY SIGNAL STORIES — single-story signals (ACCUMULATION, SMART_MONEY, etc.).",
+    "5. TOKEN UNIVERSE MOMENTUM — fallback: use momentum (change_30m, change_24h) if no signal-backed token qualifies.",
+    "",
+    "WHERE ALPHA COMES FROM — what a crypto hedge fund looks for:",
+    "- EARLY ACCUMULATION: ACCUMULATION or SMART_MONEY story on a token where change_24h is still modest (< 20%). Smart money accumulates BEFORE price moves — this is the window.",
+    "- FRESH THESIS: A THESIS story or E3D structured thesis that just appeared (new conviction signal). New theses represent a fresh catalyst being discovered.",
+    "- MULTI-SIGNAL CONVERGENCE: A token appearing in 2+ story types simultaneously (e.g. ACCUMULATION + SURGE, or THESIS + BREAKOUT_CONFIRMED). Convergence is the strongest signal.",
+    "- BREAKOUT CONFIRMATION: BREAKOUT_CONFIRMED story with volume_24h_usd > 0 and positive change_30m. Momentum with on-chain confirmation.",
+    "- Do NOT just pick the highest-volume token. Volume-chasing is late entry. Find the signal BEFORE the crowd arrives.",
+    "",
+    "QUANT SIGNAL TIERS — use these to rank and filter candidates:",
+    "TIER 1 (open aggressively, full size): E3D candidate/thesis + flow_signal=accumulation or strong_accumulation + funding=neutral or squeeze_potential",
+    "TIER 2 (open, standard size): story signal (ACCUMULATION/SMART_MONEY/THESIS) + flow_signal=neutral or better",
+    "TIER 3 (open small, watch closely): story signal only OR flow_signal=strong_accumulation with no story — live buying pressure is a valid entry trigger",
+    "FLOW-ONLY ENTRY (when E3D candidates/theses are empty): propose tokens with flow_signal=strong_accumulation (buy_sell_ratio_1h >= 2.0) and liquidity_usd > 20000 as TIER 3 entries. This is valid alpha — order flow leads price.",
+    "SKIP: flow_signal=distribution or strong_distribution without overwhelming story evidence. funding_signal=overcrowded_long (crowded trade — late entry risk).",
+    "MACRO GATE: If new_positions_ok=false (macro regime=fear/extreme_fear), only propose TIER 1 setups with conviction >= 0.75.",
+    "",
     "CRITICAL RULES:",
-    "1. Only propose tokens that appear in the TOKEN UNIVERSE with price_usd > 0 and liquidity_usd > 5000.",
-    "2. Stories show ON-CHAIN SIGNALS. A story's subject address may be a wallet, LP, or contract — NOT necessarily a tradeable token. Only use stories where in_token_universe=true or where the story confirms activity around a token from the TOKEN UNIVERSE.",
-    "3. Do NOT use the story type name (MOVER, SURGE, THESIS, etc.) as a token symbol. Use the token symbol from the TOKEN UNIVERSE.",
-    "4. If no story subject matches a token with real price and liquidity data, propose the best candidates from the TOKEN UNIVERSE based on momentum (change_30m, change_24h) alone.",
-    "5. Exclude addresses in DISQUALIFIERS and already-held: " + `symbols=${JSON.stringify([...heldSymbols])} addresses=${JSON.stringify([...heldAddresses])}`,
+    "1. Only propose tokens in the TOKEN UNIVERSE with price_usd > 0 and liquidity_usd > 5000. Story-enriched tokens (added from THESIS/ACCUMULATION/SMART_MONEY stories) appear in the TOKEN UNIVERSE list with in_token_universe=true — treat them as first-class candidates.",
+    "2. NEVER propose stablecoins (USDT, USDC, DAI, USDS, FRAX, LUSD, GHO, USDE, etc.), gold/commodity tokens (XAUt, PAXG), or wrapped/base assets (WETH, WBTC, wstETH, cbETH, rETH, stETH). Already filtered from TOKEN UNIVERSE.",
+    "3. Stories show ON-CHAIN SIGNALS. A story's subject may be a wallet, LP, or contract — only use it as a candidate if in_token_universe=true.",
+    "4. Do NOT use story type names (MOVER, SURGE, THESIS, etc.) as token symbols. Use the symbol from TOKEN UNIVERSE.",
+    "5. Return up to 3 candidates. If no strong signal exists, return fewer rather than proposing weak setups.",
+    "6. Exclude addresses in DISQUALIFIERS and already-held: " + `symbols=${JSON.stringify([...heldSymbols])} addresses=${JSON.stringify([...heldAddresses])}`,
     "",
     `Output shape: {scan_timestamp, candidates[], holdings_updates[], stories_checked[]}`,
     `Each candidate: {source_agent:"scout", created_at:"${createdAt}", expires_at:"${expiresAt}", token:{symbol,name,chain:"ethereum",contract_address,category}, setup_type, action:"buy", confidence, conviction_score, opportunity_score, why_now, evidence[], risks[], entry_zone:{low,high}, invalidation_price, targets:{target_1,target_2,target_3}, market_data:{current_price,change_24h_pct,change_30m_pct,price_source:"e3d",market_cap_usd}, liquidity_data:{liquidity_usd,liquidity_source:"e3d"}, execution_data:{estimated_slippage_bps,quote_source:"e3d"}, portfolio_data:{current_token_exposure_pct:0,current_category_exposure_pct:0,current_total_exposure_pct:0}}`,
-    `stories_checked[]: one entry per story type seen — {type, found, tokens[]} — tokens[] = token_symbol values only`
+    `stories_checked[]: one entry per EVERY story type present in the ON-CHAIN SIGNALS section — {type, found, tokens[]}. List ALL types, even ones with in_token_universe=false (set found=false, tokens=[]). Do NOT invent story types that are not in the data.`
   ].join("\n");
+
+  const allStoryTypes = Object.keys(data.stories);
+
+  const formatCandidate = (c) => {
+    const addr = cleanAddress(c?.token_address || c?.address || c?.contract_address || "");
+    const tokenMatch = addr ? tokenByAddr.get(addr) : null;
+    return JSON.stringify({
+      address: addr,
+      symbol: tokenMatch?.symbol || c?.symbol || null,
+      convergence_score: c?.convergence_score ?? null,
+      signal_count: c?.signal_count ?? null,
+      story_types: c?.story_types || null,
+      direction_hint: c?.direction_hint || null,
+      signal_summary: (c?.signal_summary || "").slice(0, 200),
+      thesis_conviction: c?.thesis_conviction ?? null,
+      fraud_risk: c?.fraud_risk ?? null,
+      liquidity_quality: c?.liquidity_quality ?? null,
+      in_token_universe: !!tokenMatch,
+      price_usd: tokenMatch?.price_usd ?? null,
+      volume_24h_usd: tokenMatch?.volume_24h_usd ?? null,
+      liquidity_usd: tokenMatch?.liquidity_usd ?? null,
+    });
+  };
+
+  const formatThesis = (t) => {
+    const addr = cleanAddress(t?.token_address || t?.address || t?.contract_address || "");
+    const tokenMatch = addr ? tokenByAddr.get(addr) : null;
+    return JSON.stringify({
+      address: addr,
+      symbol: tokenMatch?.symbol || t?.symbol || null,
+      direction: t?.direction || null,
+      conviction: t?.conviction ?? null,
+      thesis_text: (t?.thesis || t?.thesis_text || t?.summary || "").slice(0, 200),
+      target_1: t?.target_1 ?? null,
+      target_2: t?.target_2 ?? null,
+      invalidation_price: t?.invalidation_price ?? null,
+      fraud_risk: t?.fraud_risk ?? null,
+      liquidity_quality: t?.liquidity_quality ?? null,
+      in_token_universe: !!tokenMatch,
+      price_usd: tokenMatch?.price_usd ?? null,
+    });
+  };
+
+  // Build macro regime block from quant context
+  const quantMacro = _cycleQuantContext?.macro ?? null;
+  const macroLines = quantMacro ? [
+    `\n--- MACRO REGIME (live quant data) ---`,
+    `regime=${quantMacro.regime}  new_positions_ok=${quantMacro.new_positions_ok}  tighten_stops=${quantMacro.tighten_stops}`,
+    quantMacro.btc ? `BTC: $${quantMacro.btc.price.toLocaleString("en-US", { maximumFractionDigits: 0 })} (${quantMacro.btc.change_24h_pct > 0 ? "+" : ""}${quantMacro.btc.change_24h_pct}% 24h)` : "",
+    quantMacro.fear_greed ? `Fear&Greed: ${quantMacro.fear_greed.value}/100 — ${quantMacro.fear_greed.label}` : "",
+    !quantMacro.new_positions_ok ? "⚠ MACRO GATE: new_positions_ok=false — only propose TIER 1 setups with conviction >= 0.75" : "",
+    quantMacro.tighten_stops ? "⚠ TIGHTEN STOPS: high greed or BTC pullback — size down, tighten invalidation levels" : "",
+  ].filter(Boolean) : [];
+
+  // Build funding rate warning for Scout (overcrowded longs to avoid)
+  const overcrowdedSymbols = Object.entries(_cycleQuantContext?.funding_rates || {})
+    .filter(([, f]) => f.signal === "overcrowded_long")
+    .map(([sym]) => sym);
+  const fundingLines = overcrowdedSymbols.length ? [
+    `\n--- FUNDING RATE WARNINGS ---`,
+    `Overcrowded longs (avoid new entries): ${overcrowdedSymbols.join(", ")}`,
+  ] : [];
 
   const userMessage = [
     `Scout task — ${createdAt} [token universe sorted by: ${data.sortLabel}]`,
     `Portfolio: cash=$${portfolio?.cash_usd ?? 100000} positions=${Object.keys(portfolio?.positions || {}).length}`,
-    `Token universe: ${data.tokenUniverse.length} total, ${data.tokenUniverse.filter(t => (t.liquidity_usd||0) > 5000).length} with liq>$5k, ${tokenByAddr.size} with price or liq data`,
+    ...macroLines,
+    ...fundingLines,
+    `Token universe: ${data.tokenUniverse.length} tradeable tokens (stablecoins/wrapped assets excluded), ${data.tokenUniverse.filter(t => (t.liquidity_usd||0) > 5000).length} with liq>$5k`,
+    `Story types in data (you must report all of these in stories_checked): ${allStoryTypes.join(", ")}`,
+    `\n--- E3D AGENT CANDIDATES (primary signal — multi-story convergence, use these first) ---`,
+    data.e3dCandidates.length ? data.e3dCandidates.map(formatCandidate).join("\n") : "none currently",
+    `\n--- E3D THESES (structured investment theses — direction + conviction + price targets) ---`,
+    data.e3dTheses.filter(t => t?.direction === "LONG" || t?.direction === "long").length
+      ? data.e3dTheses.filter(t => t?.direction === "LONG" || t?.direction === "long").slice(0, 8).map(formatThesis).join("\n")
+      : "none currently",
     `\n--- DISQUALIFIERS (exclude these addresses) ---`,
     ...disqualifierStories.map(([type, items]) => {
-      const addrs = items.map((s) => cleanAddress(s?.meta?.primary?.address || s?.primary_token || "")).filter(Boolean);
+      const addrs = items.map((s) => cleanAddress(s?.meta?.token?.address || s?.primary_token || "")).filter(Boolean);
       return `${type}: ${addrs.slice(0, 5).join(", ") || "none"}`;
     }),
     disqualifierStories.length === 0 ? "none" : "",
+    `\n--- THESIS STORIES (fallback signal layer) ---`,
+    data.thesisSignalStories.length ? data.thesisSignalStories.slice(0, 5).map(formatStory).join("\n") : "none currently",
     `\n--- ON-CHAIN SIGNALS (stories — check in_token_universe before using as candidate) ---`,
     ...buySignalStories.map(([type, items]) => {
       return `${type} (${items.length}):\n${items.slice(0, 5).map(formatStory).join("\n")}`;
@@ -2072,12 +2321,19 @@ function runScoutDirect(portfolio, portfolioIntelligence = null) {
       return `${type} (${items.length}):\n${items.slice(0, 3).map(formatStory).join("\n")}`;
     }),
     buySignalStories.length + secondaryStories.length === 0 ? "none currently" : "",
-    `\n--- TOKEN UNIVERSE (${data.tokenUniverse.length} tokens with market data, sorted by ${data.sortLabel}) ---`,
-    `Use these for candidates. Pick tokens with strong momentum and sufficient liquidity (>5000 USD).`,
-    JSON.stringify(data.tokenUniverse.slice(0, 25))
+    `\n--- TOKEN UNIVERSE (${data.tokenUniverse.length} tradeable tokens after filtering stablecoins/wrapped assets, sorted by ${data.sortLabel}) ---`,
+    (() => {
+      const withFlow = data.tokenUniverse.filter(t => t.flow_signal);
+      const accum = withFlow.filter(t => t.flow_signal === "strong_accumulation" || t.flow_signal === "accumulation");
+      const distrib = withFlow.filter(t => t.flow_signal === "strong_distribution" || t.flow_signal === "distribution");
+      return `Flow coverage: ${withFlow.length}/${data.tokenUniverse.length} tokens have DexScreener data. Accumulation signals: ${accum.length} tokens. Distribution signals: ${distrib.length} tokens.` +
+        (accum.length ? `\nFlow-based candidates (buy_sell_ratio_1h): ${accum.slice(0, 8).map(t => `${t.symbol}(${t.flow_signal},ratio=${t.buy_sell_ratio_1h},liq=$${(t.liquidity_usd||0).toFixed(0)})`).join(", ")}` : "") +
+        `\nPick tokens with story signal first; if E3D candidates/theses are empty, use strong_accumulation flow as TIER 3 entry (min liq $20k).`;
+    })(),
+    JSON.stringify(data.tokenUniverse.slice(0, 100))
   ].join("\n");
 
-  const rawText = callLLMDirect(systemPrompt, userMessage);
+  const rawText = callLLMDirect(systemPrompt, userMessage, { agent: "scout" });
 
   // Extract JSON — try multiple strategies
   let jsonStr = rawText.trim();
@@ -2102,8 +2358,14 @@ function runScoutDirect(portfolio, portfolioIntelligence = null) {
   try {
     result = JSON.parse(jsonStr);
   } catch (parseErr) {
-    const preview = rawText.slice(0, 500);
-    throw new Error(`SCOUT_REPLY_NOT_JSON\n${preview}`);
+    // LLM may have hit max_tokens mid-response — try to repair truncated JSON
+    try {
+      result = JSON.parse(repairTruncatedJson(jsonStr));
+      log("scout_json_repaired", { raw_length: rawText.length });
+    } catch (_) {
+      const preview = rawText.slice(0, 500);
+      throw new Error(`SCOUT_REPLY_NOT_JSON\n${preview}`);
+    }
   }
 
   // Post-process: enrich candidates with real market data fetched per-address.
@@ -2160,6 +2422,51 @@ function runScoutDirect(portfolio, portfolioIntelligence = null) {
     };
 
     if (tokenRow.fragilityScore != null) candidate._fragility_score = tokenRow.fragilityScore;
+
+    // Enrich with live DexScreener order flow + Binance funding rate.
+    // enrichCandidateQuant does a live DexScreener lookup if addr not already in token_flow cache.
+    if (_cycleQuantContext) {
+      const { flow, funding } = enrichCandidateQuant(addr, candidate?.token?.symbol, _cycleQuantContext);
+      if (flow) {
+        candidate._dex_flow = {
+          flow_signal:          flow.flow_signal,
+          buy_sell_ratio_1h:    flow.buy_sell_ratio_1h,
+          buy_sell_ratio_24h:   flow.buy_sell_ratio_24h,
+          volume_1h_usd:        flow.volume_1h_usd,
+          price_change_1h_pct:  flow.price_change_1h_pct,
+          price_change_24h_pct: flow.price_change_24h_pct,
+        };
+        // Prefer DexScreener price for market_data when e3d has nothing
+        if ((flow.price_usd ?? 0) > 0 && !(candidate.market_data?.current_price > 0)) {
+          if (!candidate.market_data) candidate.market_data = {};
+          candidate.market_data.current_price = flow.price_usd;
+          candidate.market_data.price_source = "dexscreener";
+        }
+      }
+      if (funding) {
+        candidate._funding_rate = {
+          rate_per_8h:      funding.rate_per_8h,
+          signal:           funding.signal,
+          avoid_new_longs:  funding.avoid_new_longs,
+        };
+      }
+    }
+  }
+
+  // Refresh held position prices from the universe fetched this cycle so Harvest
+  // sees real unrealized P&L instead of $0 entry-price deltas.
+  refreshPositionPrices(portfolio, data.tokenUniverse);
+  // DexScreener prices are more real-time — overlay them for held positions that have flow data.
+  if (_cycleQuantContext?.token_flow) {
+    for (const pos of Object.values(portfolio.positions)) {
+      const addr = cleanAddress(pos.contract_address || "");
+      const flow = addr ? _cycleQuantContext.token_flow[addr] : null;
+      if ((flow?.price_usd ?? 0) > 0 && flow.price_usd !== pos.current_price) {
+        pos.current_price    = flow.price_usd;
+        pos.market_value_usd = pos.quantity * flow.price_usd;
+        pos.last_updated_at  = nowIso();
+      }
+    }
   }
 
   return result;
@@ -2193,14 +2500,14 @@ function runHarvestDirect(portfolio, portfolioIntelligence = null) {
     };
   }
 
-  // Pre-fetch exit-risk stories for held addresses — fetch all at once, bucket locally
-  // (type+chain filter combination returns 0 results from the API)
+  // Use cycle-level cached stories — already fetched once by getOrFetchCycleMarketContext().
   const heldAddresses = positions.map((p) => cleanAddress(p?.contract_address || "")).filter(Boolean);
   const exitRiskTypes = ["LIQUIDITY_DRAIN", "WASH_TRADE", "SPREAD_WIDENING", "MOMENTUM_DIVERGENCE", "EXCHANGE_FLOW", "LOOP",
     "SECURITY_RISK", "RUG_LIQUIDITY_PULL"];
   const holdConfirmTypes = ["ACCUMULATION", "SMART_MONEY", "MOVER", "SURGE", "FLOW", "CLUSTER"];
 
-  const allHarvestStories = endpointArray(e3dFetch(`${E3D_API_BASE_URL}/stories?limit=100&chain=ETH`));
+  const { allStories: cycleHarvestStories } = getOrFetchCycleMarketContext();
+  const allHarvestStories = cycleHarvestStories || [];
   const exitStories = {};
   for (const s of allHarvestStories) {
     const t = String(s?.story_type || s?.type || "").toUpperCase();
@@ -2224,37 +2531,85 @@ function runHarvestDirect(portfolio, portfolioIntelligence = null) {
     }));
   }
 
-  const positionData = dossier.holdings.slice(0, 8).map((item) => ({
-    symbol: item?.token?.symbol || null,
-    contract_address: item?.token?.contract_address || null,
-    category: item?.token?.category || "unknown",
-    quantity: toNum(item?.position?.quantity, 0),
-    avg_entry_price: toNum(item?.position?.avg_entry_price, 0),
-    current_price: toNum(item?.market_data?.current_price, 0),
-    market_value_usd: toNum(item?.position?.market_value_usd, 0),
-    cost_basis_usd: toNum(item?.position?.cost_basis_usd, 0),
-    unrealized_pnl_usd: toNum(item?.position?.market_value_usd, 0) - toNum(item?.position?.cost_basis_usd, 0),
-    thesis_strength: item?.thesis?.strength ?? null,
-    thesis_freshness: item?.thesis?.freshness ?? null,
-    narrative_decay: item?.thesis?.decay ?? null,
-    opportunity_score: item?.thesis?.opportunity_score ?? null,
-    fraud_risk: item?.thesis?.fraud_risk ?? null
-  }));
+  // Build positionData using live portfolio prices (refreshed by runScoutDirect) rather than
+  // the stale dossier prices, and augment with DexScreener flow + funding rate signals.
+  const positionData = dossier.holdings.slice(0, 8).map((item) => {
+    const sym  = item?.token?.symbol || null;
+    const addr = cleanAddress(item?.token?.contract_address || "");
+    // Prefer live portfolio position price over dossier (dossier is built before price refresh)
+    const livePos    = sym && portfolio.positions[sym] ? portfolio.positions[sym] : null;
+    const livePrice  = livePos?.current_price ?? toNum(item?.market_data?.current_price, 0);
+    const costBasis  = toNum(item?.position?.cost_basis_usd, 0);
+    const qty        = livePos?.quantity ?? toNum(item?.position?.quantity, 0);
+    const marketVal  = qty * livePrice;
+    const pnlUsd     = marketVal - costBasis;
+    const pnlPct     = costBasis > 0 ? +(pnlUsd / costBasis * 100).toFixed(2) : 0;
+    const flowData   = addr ? (_cycleQuantContext?.token_flow?.[addr] ?? null) : null;
+    const funding    = sym  ? (_cycleQuantContext?.funding_rates?.[sym] ?? null) : null;
+    return {
+      symbol:              sym,
+      contract_address:    addr || null,
+      category:            item?.token?.category || "unknown",
+      quantity:            qty,
+      avg_entry_price:     toNum(item?.position?.avg_entry_price, 0),
+      current_price:       livePrice,
+      market_value_usd:    +marketVal.toFixed(2),
+      cost_basis_usd:      costBasis,
+      unrealized_pnl_usd:  +pnlUsd.toFixed(2),
+      unrealized_pnl_pct:  pnlPct,
+      thesis_strength:     item?.thesis?.strength ?? null,
+      thesis_freshness:    item?.thesis?.freshness ?? null,
+      narrative_decay:     item?.thesis?.decay ?? null,
+      opportunity_score:   item?.thesis?.opportunity_score ?? null,
+      fraud_risk:          item?.thesis?.fraud_risk ?? null,
+      ...(flowData ? {
+        flow_signal:          flowData.flow_signal,
+        buy_sell_ratio_1h:    flowData.buy_sell_ratio_1h,
+        price_change_1h_pct:  flowData.price_change_1h_pct,
+      } : {}),
+      ...(funding ? {
+        funding_signal:       funding.signal,
+        funding_rate_per_8h:  funding.rate_per_8h,
+      } : {}),
+    };
+  });
 
   const systemPrompt = [
     "You are Harvest, a crypto portfolio exit-scan agent.",
-    "You have been given pre-fetched E3D exit-risk story data for held positions. Analyze it and return STRICT JSON only — one object, no markdown.",
-    "Classify every held position as hold, monitor, trim, or exit based on the evidence.",
+    "You have been given pre-fetched E3D exit-risk story data for held positions, live quant signals, and macro context. Analyze all of it and return STRICT JSON only — one object, no markdown.",
+    "Classify every held position as hold, monitor, trim, or exit based on ALL available evidence.",
     "Only add a position to exit_candidates if action is trim or exit.",
+    "",
+    "QUANT EXIT SIGNALS — apply these to every position:",
+    "- flow_signal=strong_distribution or distribution: bearish order flow — lean toward trim or exit unless strong hold-confirm story exists",
+    "- flow_signal=strong_accumulation or accumulation: bullish order flow — lean toward hold; only exit if story evidence is strong",
+    "- funding_signal=overcrowded_long: longs are crowded — reduce exposure on rally; set tighter stop",
+    "- funding_signal=squeeze_potential: shorts crowded — hold/buy the dip; squeeze may lift price",
+    "- tighten_stops=true (macro): take partial profits on all positions > 15% gain; tighten stops to -5%",
+    "- regime=extreme_fear: only exit confirmed deteriorating positions; avoid panic-selling healthy ones",
+    "- unrealized_pnl_pct > 25%: consider partial profit-taking unless Tier 1 conviction",
+    "- unrealized_pnl_pct < -8%: flag for stop review; exit if thesis invalid and no recovery signal",
+    "",
     `Output shape: {scan_timestamp, portfolio_summary, position_reviews[], exit_candidates[], stories_checked[]}`,
-    `Each position_review: {source_agent:"harvest", created_at:"${createdAt}", expires_at:"${expiresAt}", token:{symbol,name,chain:"ethereum",contract_address,category}, position:{quantity,avg_entry_price,current_price,market_value_usd,cost_basis_usd,unrealized_pnl_usd}, action:"hold"|"monitor"|"trim"|"exit", thesis_state, thesis_summary, what_changed, why_now, confidence, conviction_score, opportunity_score, review_priority, summary, evidence[], risks[], what_would_change_my_mind[], next_best_alternative, current_regime, market_data:{current_price,change_24h_pct,price_source:"e3d"}, narrative_data:{story_strength,thesis_health,flow_direction}}`,
+    `Each position_review: {source_agent:"harvest", created_at:"${createdAt}", expires_at:"${expiresAt}", token:{symbol,name,chain:"ethereum",contract_address,category}, position:{quantity,avg_entry_price,current_price,market_value_usd,cost_basis_usd,unrealized_pnl_usd,unrealized_pnl_pct}, action:"hold"|"monitor"|"trim"|"exit", thesis_state, thesis_summary, what_changed, why_now, confidence, conviction_score, opportunity_score, review_priority, summary, evidence[], risks[], what_would_change_my_mind[], next_best_alternative, current_regime, market_data:{current_price,change_24h_pct,price_source:"e3d"}, narrative_data:{story_strength,thesis_health,flow_direction}}`,
     `Each exit_candidate: same as position_review plus {setup_type, edge_source, suggested_exit_fraction, target_exit_price, decision_price, exit_priority}`
   ].join("\n");
 
+  // Build macro context block for Harvest
+  const harvestMacro = _cycleQuantContext?.macro ?? null;
+  const harvestMacroLines = harvestMacro ? [
+    `\n--- MACRO REGIME (live) ---`,
+    `regime=${harvestMacro.regime}  tighten_stops=${harvestMacro.tighten_stops}  new_positions_ok=${harvestMacro.new_positions_ok}`,
+    harvestMacro.btc    ? `BTC: $${harvestMacro.btc.price.toLocaleString("en-US", { maximumFractionDigits: 0 })} (${harvestMacro.btc.change_24h_pct > 0 ? "+" : ""}${harvestMacro.btc.change_24h_pct}% 24h)` : "",
+    harvestMacro.fear_greed ? `Fear&Greed: ${harvestMacro.fear_greed.value}/100 — ${harvestMacro.fear_greed.label}` : "",
+    harvestMacro.tighten_stops ? "⚠ TIGHTEN STOPS: take partial profits on positions > 15% gain; tighten all stops" : "Stops: normal — no macro-driven tightening required",
+  ].filter(Boolean) : [];
+
   const userMessage = [
     `Harvest task — ${createdAt}`,
-    `Held positions (${positionData.length}):`,
+    `Held positions (${positionData.length}) — prices are live (refreshed this cycle), pnl_pct is real:`,
     JSON.stringify(positionData),
+    ...harvestMacroLines,
     `\n--- EXIT RISK STORIES (matched to held addresses) ---`,
     ...exitRiskTypes.map((type) => {
       const matches = storyMatches[type] || [];
@@ -2267,7 +2622,7 @@ function runHarvestDirect(portfolio, portfolioIntelligence = null) {
     })
   ].join("\n");
 
-  const rawText = callLLMDirect(systemPrompt, userMessage);
+  const rawText = callLLMDirect(systemPrompt, userMessage, { agent: "harvest" });
 
   // Extract JSON
   let jsonStr = rawText.trim();
@@ -2287,7 +2642,14 @@ function runHarvestDirect(portfolio, portfolioIntelligence = null) {
   try {
     return JSON.parse(jsonStr);
   } catch (parseErr) {
-    throw new Error(`HARVEST_REPLY_NOT_JSON\n${rawText.slice(0, 500)}`);
+    // LLM may have hit max_tokens mid-response — try to repair truncated JSON
+    try {
+      const repaired = JSON.parse(repairTruncatedJson(jsonStr));
+      log("harvest_json_repaired", { raw_length: rawText.length });
+      return repaired;
+    } catch (_) {
+      throw new Error(`HARVEST_REPLY_NOT_JSON\n${rawText.slice(0, 500)}`);
+    }
   }
 }
 
@@ -2400,7 +2762,7 @@ REQUIRED RESEARCH — follow the full Research Protocol in TOOLS.md before class
 1. Run the immediate-exit sweep (LIQUIDITY_DRAIN, RUG_LIQUIDITY_PULL, SPREAD_WIDENING, EXCHANGE_FLOW, MOMENTUM_DIVERGENCE, WASH_TRADE, LOOP) — match against every held address.
 2. Run the positioning-risk sweep (CONCENTRATION_SHIFT, WHALE net OUT, VOLUME_PROFILE_ANOMALY, MIRROR).
 3. Check hold-confirmation signals (ACCUMULATION, SMART_MONEY, EXCHANGE_FLOW net withdrawals).
-4. For each held position: fetch /stories?q={address}&scope=primary&limit=10, flow/summary, wallet-cohort.
+4. For each held position: fetch /stories?q={address}&scope=opportunity&limit=10 and /stories?q={address}&scope=risk&limit=10.
 5. Compare live signals against pre-computed thesis scores in context. Live signals take priority.
 
 PORTFOLIO INTELLIGENCE DOSSIER (pre-computed baseline scores):
@@ -2693,6 +3055,32 @@ function buildPaperTradeTicket(candidate, allocationUsd, review, reason) {
   };
 }
 
+// Update held position prices using the token universe fetched this cycle.
+// Prevents positions from being stuck at their entry price indefinitely —
+// accurate prices are required for Harvest to make meaningful exit decisions.
+function refreshPositionPrices(portfolio, tokenUniverse) {
+  if (!Array.isArray(tokenUniverse) || !tokenUniverse.length) return;
+  const priceMap = new Map();
+  for (const t of tokenUniverse) {
+    const addr = cleanAddress(t.address || "");
+    if (addr && (t.price_usd ?? 0) > 0) priceMap.set(addr, t);
+  }
+  const refreshed = [];
+  for (const pos of Object.values(portfolio.positions)) {
+    const addr = cleanAddress(pos.contract_address || "");
+    if (!addr) continue;
+    const t = priceMap.get(addr);
+    if (!t || !((t.price_usd ?? 0) > 0)) continue;
+    const oldPrice = pos.current_price;
+    pos.current_price = t.price_usd;
+    pos.market_value_usd = pos.quantity * t.price_usd;
+    if ((t.liquidity_usd ?? 0) > 0) pos.liquidity_usd = t.liquidity_usd;
+    pos.last_updated_at = nowIso();
+    refreshed.push({ symbol: pos.symbol, old_price: oldPrice, new_price: t.price_usd });
+  }
+  if (refreshed.length) log("position_prices_refreshed", { count: refreshed.length, positions: refreshed });
+}
+
 function updateHoldingsFromScout(portfolio, updates) {
   const byAddr = new Map();
   for (const u of updates) {
@@ -2725,6 +3113,11 @@ function updateHoldingsFromScout(portfolio, updates) {
   }
 }
 
+// Symbols that should never be held as trading positions.
+// If one ends up in the portfolio (Scout hallucinated it, rotation logic opened it, etc.)
+// it gets force-exited here before any further cycle logic runs.
+const FORCE_EXIT_PATTERN = /^(USDC?|USDT|DAI|USDS|BUSD|TUSD|FRAX|LUSD|SUSD|GUSD|PYUSD|FDUSD|USDE|SUSDE|USDY|USDP|HUSD|MUSD|CRVUSD|GHO|RLUSD|USDX|USDK|USDM|XAUt|PAXG|CACHE|XAUT|WETH|WBTC|cbBTC|rETH|stETH|wstETH|cbETH|ankrETH|BETH|sETH2|ETH2x|STETH)$/i;
+
 function evaluateSellActions(portfolio) {
   const actions = [];
   const targetPct = portfolio.settings.target_partial_pct;
@@ -2732,6 +3125,13 @@ function evaluateSellActions(portfolio) {
   for (const pos of Object.values(portfolio.positions)) {
     const price = toNum(pos.current_price, 0);
     if (!(price > 0)) continue;
+
+    // Force-exit stablecoins and wrapped/base assets that slipped into the portfolio.
+    // These provide no trading alpha and consume position slots.
+    if (FORCE_EXIT_PATTERN.test(pos.symbol || "")) {
+      actions.push({ type: "sell", symbol: pos.symbol, fraction: 1.0, reason: "non_tradeable_force_exit" });
+      continue;
+    }
 
     if (price <= toNum(pos.stop_price, 0)) {
       actions.push({
@@ -2953,6 +3353,11 @@ function openPosition(portfolio, candidate, allocationUsd, reason = "buy") {
   if (portfolio.cash_usd < allocationUsd) return null;
 
   const symbol = candidate.token.symbol;
+
+  // Guard: don't open a new position slot when already at the limit
+  if (!portfolio.positions[symbol] && Object.keys(portfolio.positions).length >= portfolio.settings.max_open_positions) {
+    return null;
+  }
   const quantity = allocationUsd / price;
   const context = getTrainingContext();
   const training = ensureCandidateTrainingMetadata(candidate, context);
@@ -3154,9 +3559,22 @@ async function runCycle(runContext = {}) {
 
   // Reset per-cycle state
   _cycleMarketContext = null;
+  _cycleQuantContext = null;
 
   const portfolio = loadPortfolio();
   pruneCooldowns(portfolio);
+  // Build quant context: DexScreener flow for held positions, macro regime, Binance funding rates.
+  // Four external API calls total — all synchronous curl, completing in ~3s.
+  _cycleQuantContext = buildCycleQuantContext(portfolio);
+  log("quant_context", {
+    macro_regime: _cycleQuantContext.macro?.regime,
+    new_positions_ok: _cycleQuantContext.macro?.new_positions_ok,
+    tighten_stops: _cycleQuantContext.macro?.tighten_stops,
+    btc_24h: _cycleQuantContext.macro?.btc?.change_24h_pct ?? null,
+    fear_greed: _cycleQuantContext.macro?.fear_greed?.value ?? null,
+    token_flow_count: Object.keys(_cycleQuantContext.token_flow || {}).length,
+    funding_rates_count: Object.keys(_cycleQuantContext.funding_rates || {}).length,
+  });
   const portfolioIntelligence = buildPortfolioIntelligenceDossier(portfolio);
   if (runContext.debugMode) {
     const debugSnapshot = buildDebugHandoffSnapshot(portfolio, portfolioIntelligence, runContext);

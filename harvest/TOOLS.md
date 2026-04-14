@@ -70,11 +70,10 @@ https://e3d.ai/api/stories?type=CONCENTRATION_SHIFT&chain=ETH&limit=15
 For each held position, fetch live signals:
 
 ```
-https://e3d.ai/api/stories?q={address}&scope=primary&limit=10
-https://e3d.ai/api/stories?q={address}&scope=primary&type=THESIS&limit=3
-https://e3d.ai/api/flow/summary?token_address={address}
-https://e3d.ai/api/wallet-cohorts/{address}
-https://e3d.ai/api/evidence/token/{address}
+https://e3d.ai/api/stories?q={address}&scope=opportunity&limit=10
+https://e3d.ai/api/stories?q={address}&scope=risk&limit=10
+https://e3d.ai/api/tokenCounterparties?token={address}&limit=5
+https://e3d.ai/api/addressCounterparties?address={address}&limit=5
 ```
 
 Compare what you find against the pre-computed thesis scores in the context dossier. If live signals contradict the baseline, trust the live signals.
@@ -91,18 +90,66 @@ https://e3d.ai/api/fetchTokenPricesWithHistoryAllRanges?dataSource=1&sortBy=chan
 
 ---
 
+## Quant Exit Signals
+
+Each cycle the pipeline injects live quant data into your context (`flow_signal`, `funding_signal`, macro regime). Use these alongside story signals:
+
+### Order Flow Exit Signals (DexScreener `flow_signal` + `buy_sell_ratio_1h`)
+
+| flow_signal | Meaning | Action |
+|---|---|---|
+| strong_distribution (ratio < 0.5) | Heavy selling — position bleeding | Trim or exit unless hold-confirm story overrides |
+| distribution (ratio 0.5–0.8) | Net selling | Flag for monitor; trim if combined with weak thesis |
+| neutral (ratio 0.8–1.4) | Balanced | Hold unless story signals say exit |
+| accumulation (ratio 1.4–2.0) | Net buying into position | Hold; flow confirms thesis |
+| strong_accumulation (ratio ≥ 2.0) | Heavy demand | Hold; ignore minor story noise |
+
+### Funding Rate Exit Signals (Binance perpetuals `funding_signal`)
+
+| signal | Meaning | Action |
+|---|---|---|
+| overcrowded_long | Too many longs open — crowded trade | Trim on next 5–10% rally; tighten stop |
+| mild_long_bias | Slight long tilt | Normal; monitor |
+| neutral | Balanced positioning | Hold or exit based on story |
+| squeeze_potential | Shorts crowded — squeeze risk | Hold or add; squeeze can gap price up |
+
+### Macro Regime Context (`regime`, `tighten_stops`)
+
+| Condition | Action |
+|---|---|
+| tighten_stops=true | Take partial profits on positions > 15% gain; tighten all stops to –5% |
+| regime=extreme_greed | Scale back on crowded longs; lock in gains selectively |
+| regime=fear or extreme_fear | Only exit confirmed deteriorating positions; do not panic-sell healthy thesis |
+| regime=neutral | Standard exit criteria apply |
+
+### P&L Thresholds (positions report real `unrealized_pnl_pct` this cycle)
+
+| P&L | Action |
+|---|---|
+| > +25% gain | Consider 25–50% partial profit-take unless Tier 1 thesis and strong accumulation flow |
+| > +15% gain + tighten_stops=true | Take 25% partial profits |
+| < –8% loss | Review stop; exit if thesis is invalid and no recovery signal present |
+| < –15% loss | Exit unless extraordinary recovery evidence |
+
 ## Decision Framework
 
-| Story signal on held token | Recommended action |
+| Signals on held token | Recommended action |
 |---|---|
 | LIQUIDITY_DRAIN or RUG_LIQUIDITY_PULL | exit (immediate) |
 | LOOP or WASH_TRADE | exit |
-| SPREAD_WIDENING | trim / exit |
+| SPREAD_WIDENING + flow=distribution | exit |
+| SPREAD_WIDENING alone | trim |
 | EXCHANGE_FLOW net deposits + MOMENTUM_DIVERGENCE | trim |
+| flow=strong_distribution + no hold-confirm story | trim |
+| funding=overcrowded_long + pnl > +15% | trim on rally |
 | CONCENTRATION_SHIFT decreasing + WHALE OUT | trim / monitor |
 | VOLUME_PROFILE_ANOMALY or MIRROR | monitor (increase scrutiny) |
+| flow=distribution + pnl < –5% | monitor; tighten stop |
+| ACCUMULATION + SMART_MONEY + flow=accumulation | hold strong |
 | ACCUMULATION + SMART_MONEY continuing | hold |
+| funding=squeeze_potential | hold; do not exit into short squeeze |
 | EXCHANGE_FLOW withdrawals | hold |
+| flow=strong_accumulation + no exit story | hold |
 | No negative signals, thesis metrics stable | hold |
 
 ---

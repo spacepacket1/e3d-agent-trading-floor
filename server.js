@@ -86,6 +86,25 @@ function isProcessAlive(pid) {
   try { process.kill(pid, 0); return true; } catch { return false; }
 }
 
+function killProcessGroup(pid, signal = "SIGTERM") {
+  if (!pid || !Number.isFinite(pid)) return false;
+
+  const attempts = [
+    () => process.kill(-pid, signal),
+    () => process.kill(pid, signal)
+  ];
+
+  for (const attempt of attempts) {
+    try {
+      attempt();
+      return true;
+    } catch {
+    }
+  }
+
+  return false;
+}
+
 // Poll until an externally-spawned pipeline (recovered after server restart) exits.
 let _recoveryPollTimer = null;
 function watchExternalPipeline(pid) {
@@ -195,10 +214,9 @@ function clearMongoState() {
       "-i",
       MONGO_CONTAINER_NAME,
       "mongosh",
-      "--quiet",
-      "--eval",
-      script
+      "--quiet"
     ], {
+      input: script,
       env: {
         ...process.env,
         MONGO_DATABASE_NAME
@@ -225,7 +243,7 @@ function clearClickHouseState() {
 function clearSystemState() {
   const status = getPipelineStatus();
   const pipelineWasRunning = status.running;
-  if (pipelineWasRunning) stopPipelineProcess("SIGINT");
+  if (pipelineWasRunning) stopPipelineProcess();
   clearPidFile();
   clearInterval(_recoveryPollTimer);
 
@@ -278,7 +296,7 @@ function setPipelineState(nextState) {
   pipelineState = { ...pipelineState, ...nextState };
 }
 
-function stopPipelineProcess(signal = "SIGINT") {
+function stopPipelineProcess(signal = "SIGTERM") {
   const pid = pipelineProcess?.pid ?? pipelineState.pid ?? null;
   if (!pid || !isProcessAlive(pid)) {
     pipelineProcess = null;
@@ -287,21 +305,40 @@ function stopPipelineProcess(signal = "SIGINT") {
     return false;
   }
   try {
-    pipelineState.stop_requested_at = nowLocalIso();
-    process.kill(pid, signal);
+    const stopRequestedAt = nowLocalIso();
+    const stopped = killProcessGroup(pid, signal);
+    if (!stopped) {
+      throw new Error(`Unable to signal process ${pid}`);
+    }
+    setPipelineState({
+      running: false,
+      mode: "stopped",
+      pid: null,
+      stop_requested_at: stopRequestedAt,
+      signal,
+      last_error: null
+    });
+    pipelineProcess = null;
+    setTimeout(() => {
+      if (isProcessAlive(pid)) {
+        try {
+          killProcessGroup(pid, "SIGKILL");
+        } catch {
+        }
+      }
+    }, 1500);
   } catch (err) {
     pipelineProcess = null;
     clearPidFile();
     setPipelineState({ running: false, mode: "stopped", pid: null, last_error: err.message });
     return false;
   }
-  pipelineProcess = null;
   return true;
 }
 
 function startPipelineProcess(intervalSeconds = 300) {
   // Stop any currently managed process
-  if (pipelineProcess) stopPipelineProcess("SIGINT");
+  if (pipelineProcess) stopPipelineProcess();
 
   // Kill any orphaned pipeline PID from before a server restart
   const orphanPid = readPidFile();
@@ -397,12 +434,15 @@ function unwrapTokenCandidates(payload) {
 function normalizeTokenMetadata(payload, address) {
   const candidate = unwrapTokenCandidates(payload).find((item) => item && typeof item === "object") || null;
   if (!candidate) return null;
+  const currentPrice = asNumber(candidate.current_price, asNumber(candidate.priceUSD, asNumber(candidate.price_usd, asNumber(candidate.price, NaN))));
   return {
     contract_address: String(candidate.contract_address || candidate.address || address || "").toLowerCase(),
     symbol: candidate.symbol || candidate.ticker || null,
     name: candidate.name || candidate.token_name || candidate.display_name || candidate.title || null,
     icon_url: candidate.icon_url || candidate.icon || candidate.logo_url || candidate.image_url || candidate.token_icon_url || null,
-    image_url: candidate.image_url || candidate.icon || candidate.logo_url || candidate.icon_url || candidate.token_image_url || null
+    image_url: candidate.image_url || candidate.icon || candidate.logo_url || candidate.icon_url || candidate.token_image_url || null,
+    current_price: Number.isFinite(currentPrice) ? currentPrice : null,
+    price_usd: Number.isFinite(currentPrice) ? currentPrice : null
   };
 }
 
@@ -416,7 +456,7 @@ async function fetchTokenMetadata(address) {
   }
 
   const urls = [
-    `https://e3d.ai/api/token/${encodeURIComponent(cleanAddress)}`,
+    `https://e3d.ai/api/token-info/${encodeURIComponent(cleanAddress)}`,
     `https://e3d.ai/api/fetchTokenPricesWithHistoryAllRanges?search=${encodeURIComponent(cleanAddress)}&limit=1&offset=0&hideNoCirc=1`
   ];
 
@@ -454,11 +494,26 @@ async function fetchTokenMetadata(address) {
 
 async function enrichPortfolioPosition(pos) {
   const quantity = asNumber(pos.quantity, 0);
-  const currentPrice = asNumber(pos.current_price, 0);
   const avgEntryPrice = asNumber(pos.avg_entry_price, 0);
-  const currentValueUsd = asNumber(pos.market_value_usd, currentPrice * quantity);
   const costUsd = avgEntryPrice * quantity;
   const tokenMeta = await fetchTokenMetadata(pos.contract_address);
+  const storedCurrentPrice = asNumber(pos.current_price, NaN);
+  const storedCurrentValueUsd = asNumber(pos.current_value_usd, asNumber(pos.market_value_usd, 0));
+  const fallbackPrice = quantity > 0
+    ? (storedCurrentValueUsd > 0 ? storedCurrentValueUsd / quantity : avgEntryPrice)
+    : avgEntryPrice;
+  const currentPrice = asNumber(
+    tokenMeta?.current_price,
+    asNumber(
+      tokenMeta?.price_usd,
+      Number.isFinite(storedCurrentPrice) && storedCurrentPrice > 0 ? storedCurrentPrice : fallbackPrice
+    )
+  );
+  const liveCurrentValueUsd = currentPrice > 0 ? currentPrice * quantity : 0;
+  const currentValueUsd = asNumber(
+    liveCurrentValueUsd,
+    storedCurrentValueUsd > 0 ? storedCurrentValueUsd : costUsd
+  );
   const openedAt = pos.opened_at || pos.purchased_at || pos.bought_at || pos.created_at || null;
 
   return {
@@ -527,10 +582,9 @@ function tryLoadPortfolioFromMongo() {
       "-i",
       MONGO_CONTAINER_NAME,
       "mongosh",
-      "--quiet",
-      "--eval",
-      script
+      "--quiet"
     ], {
+      input: script,
       env: {
         ...process.env,
         MONGO_DATABASE_NAME
@@ -778,8 +832,9 @@ async function handleRequest(req, res) {
   if (req.method === "OPTIONS") {
     res.writeHead(204, {
       "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "GET,OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type"
+      "Access-Control-Allow-Methods": "GET,POST,PUT,PATCH,DELETE,OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Requested-With",
+      "Access-Control-Max-Age": "86400"
     });
     res.end();
     return;
@@ -857,7 +912,7 @@ async function handleRequest(req, res) {
   }
 
   if (url.pathname === "/api/pipeline/stop" && req.method === "POST") {
-    const stopped = stopPipelineProcess("SIGINT");
+    const stopped = stopPipelineProcess();
     sendJson(res, 200, {
       ok: stopped,
       pipeline: getPipelineStatus()
@@ -888,6 +943,24 @@ async function handleRequest(req, res) {
     return;
   }
 
+  if (url.pathname === "/api/pipeline-log") {
+    // Return recent pipeline log entries filtered to stages relevant for the network debugger:
+    // API calls, LLM calls, and key agent decision events.
+    const DEBUGGER_STAGES = new Set([
+      "e3d_api_response", "e3d_api_error", "e3d_api_budget_exceeded",
+      "llm_request", "llm_response", "llm_error",
+      "scout", "harvest",
+      "executor_buy", "executor_exit",
+      "sell_trades", "buy_trades",
+      "quant_context", "scout_flow_enrichment",
+      "scout_candidate_dropped",
+    ]);
+    const all = readJsonLines(PIPELINE_LOG, 2000);
+    const filtered = all.filter(e => DEBUGGER_STAGES.has(e.stage)).slice(-400);
+    sendJson(res, 200, { entries: filtered });
+    return;
+  }
+
   if (url.pathname === "/api/cycles") {
     const pipeline = readJsonLines(PIPELINE_LOG, 600);
     const cycles = groupPipelineIntoCycles(pipeline);
@@ -899,14 +972,25 @@ async function handleRequest(req, res) {
     const [portfolio, activity] = await Promise.all([loadPortfolioState(), loadActivity()]);
     const positions = Object.values(portfolio.positions || {});
     const historyTrades = Array.isArray(portfolio.closed_trades) ? [...portfolio.closed_trades].reverse() : [];
-    const enrichedPositions = await Promise.all(positions.map((pos) => enrichPortfolioPosition(pos)));
-    const enrichedHistory = await Promise.all(historyTrades.map((trade) => enrichSoldTrade(trade)));
+    // Sequential enrichment — concurrent Promise.all causes a request burst that
+    // exhausts the API rate limit and causes 429s in the pipeline stories call.
+    const enrichedPositions = [];
+    for (const pos of positions) enrichedPositions.push(await enrichPortfolioPosition(pos));
+    const enrichedHistory = [];
+    for (const trade of historyTrades.slice(0, 20)) enrichedHistory.push(await enrichSoldTrade(trade));
+    const unrealizedPnlUsd = enrichedPositions.reduce((sum, pos) => {
+      const currentValueUsd = asNumber(pos?.current_value_usd, asNumber(pos?.market_value_usd, 0));
+      const costUsd = asNumber(pos?.cost_usd, 0);
+      return sum + (currentValueUsd - costUsd);
+    }, 0);
+    const currentMarketValueUsd = enrichedPositions.reduce((sum, pos) => sum + asNumber(pos?.current_value_usd, asNumber(pos?.market_value_usd, 0)), 0);
+    const equityUsd = asNumber(portfolio.cash_usd, 0) + currentMarketValueUsd;
     sendJson(res, 200, {
       portfolio: {
         cash_usd: portfolio.cash_usd || 0,
-        equity_usd: portfolio.stats?.equity_usd || portfolio.cash_usd || 0,
+        equity_usd: equityUsd,
         realized_pnl_usd: portfolio.stats?.realized_pnl_usd || 0,
-        unrealized_pnl_usd: portfolio.stats?.unrealized_pnl_usd || 0,
+        unrealized_pnl_usd: unrealizedPnlUsd,
         market_regime: portfolio.stats?.market_regime || "unknown",
         open_positions: positions.length,
         positions: enrichedPositions,

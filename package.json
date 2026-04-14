@@ -13,7 +13,7 @@
     "db:down": "sh -lc 'if command -v docker-compose >/dev/null 2>&1; then docker-compose down; else docker compose down; fi'",
     "db:logs": "sh -lc 'if command -v docker-compose >/dev/null 2>&1; then docker-compose logs -f mongo clickhouse; else docker compose logs -f mongo clickhouse; fi'",
     "db:ps": "sh -lc 'if command -v docker-compose >/dev/null 2>&1; then docker-compose ps; else docker compose ps; fi'",
-    "check": "node --check pipeline.js",
+    "check": "node --check pipeline.js && node --check server.js && node --check e3dAuthClient.js",
     "test": "npm run check"
   },
   "keywords": [],
