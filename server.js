@@ -16,11 +16,30 @@ import {
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+// Load .env file from project root if present — simple key=value parser, no npm package needed.
+try {
+  const envFile = path.join(__dirname, ".env");
+  const lines = fs.readFileSync(envFile, "utf8").split("\n");
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const eq = trimmed.indexOf("=");
+    if (eq === -1) continue;
+    const key = trimmed.slice(0, eq).trim();
+    let val = trimmed.slice(eq + 1).trim();
+    if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+      val = val.slice(1, -1);
+    }
+    if (key && !(key in process.env)) process.env[key] = val;
+  }
+} catch (_) {}
+
 const PORT = Number(process.env.PORT || 3000);
 const HOST = process.env.HOST || "0.0.0.0";
 const ROOT = __dirname;
 const DASHBOARD_DIR = path.join(ROOT, "dashboard");
 const LOG_DIR = path.join(ROOT, "logs");
+const REPORTS_DIR = path.join(ROOT, "reports");
 const PORTFOLIO_FILE = path.join(ROOT, "portfolio.json");
 const PIPELINE_LOG = path.join(LOG_DIR, "pipeline.jsonl");
 const TRAINING_EVENT_LOG = path.join(LOG_DIR, "training-events.jsonl");
@@ -144,6 +163,46 @@ function readJsonFile(filePath, fallback = null) {
   }
 }
 
+function readReportFile(filePath) {
+  try {
+    if (!fs.existsSync(filePath)) return null;
+    return JSON.parse(fs.readFileSync(filePath, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function listReportFiles() {
+  try {
+    if (!fs.existsSync(REPORTS_DIR)) return [];
+    return fs.readdirSync(REPORTS_DIR)
+      .filter((name) => name.endsWith(".json"))
+      .map((name) => path.join(REPORTS_DIR, name))
+      .map((filePath) => ({ filePath, report: readReportFile(filePath) }))
+      .filter(({ report }) => report && report.report_id)
+      .sort((a, b) => String(b.report.generated_at || "").localeCompare(String(a.report.generated_at || "")));
+  } catch {
+    return [];
+  }
+}
+
+function summarizeReport(report, filePath) {
+  const criticalFlags = Number(report?.critical_flags ?? (Array.isArray(report?.flags) ? report.flags.filter((flag) => flag.severity === "critical").length : 0));
+  const warningFlags = Number(report?.warning_flags ?? (Array.isArray(report?.flags) ? report.flags.filter((flag) => flag.severity === "warning").length : 0));
+  return {
+    report_id: report?.report_id || null,
+    generated_at: report?.generated_at || null,
+    cycle_index: report?.cycle_index ?? null,
+    overall_grade: report?.overall_grade || "F",
+    overall_score: report?.overall_score ?? 0,
+    critical_flags: criticalFlags,
+    warning_flags: warningFlags,
+    market_regime: report?.market_regime || "unknown",
+    cycle_duration_seconds: report?.cycle_duration_seconds ?? null,
+    report_file: report?.report_file || path.relative(ROOT, filePath)
+  };
+}
+
 function nowLocalIso() {
   const date = new Date();
   const offsetMinutes = -date.getTimezoneOffset();
@@ -175,7 +234,9 @@ function removeFileIfExists(filePath) {
 }
 
 function ensureDir(filePath) {
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.mkdirSync(LOG_DIR, { recursive: true });
+  fs.mkdirSync(REPORTS_DIR, { recursive: true });
+  fs.mkdirSync(DASHBOARD_DIR, { recursive: true });
 }
 
 function readJsonLines(filePath, limit = 250) {
@@ -940,6 +1001,23 @@ async function handleRequest(req, res) {
   if (url.pathname === "/api/activity") {
     const activity = await loadActivity();
     sendJson(res, 200, activity);
+    return;
+  }
+
+  if (url.pathname === "/api/reports" && req.method === "GET") {
+    const reports = listReportFiles().slice(0, 50).map(({ filePath, report }) => summarizeReport(report, filePath));
+    sendJson(res, 200, reports);
+    return;
+  }
+
+  if (url.pathname.startsWith("/api/reports/") && req.method === "GET") {
+    const reportId = decodeURIComponent(url.pathname.slice("/api/reports/".length)).trim();
+    const match = listReportFiles().find(({ report }) => report?.report_id === reportId);
+    if (!match) {
+      sendJson(res, 404, { ok: false, error: "REPORT_NOT_FOUND" });
+      return;
+    }
+    sendJson(res, 200, match.report);
     return;
   }
 

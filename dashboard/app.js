@@ -33,6 +33,15 @@ function badgeForPipelineStatus(status) {
   return "badge badge-amber";
 }
 
+function badgeForGrade(grade) {
+  if (grade === "A") return "badge badge-green";
+  if (grade === "B") return "badge badge-blue";
+  if (grade === "C") return "badge badge-amber";
+  if (grade === "D") return "badge badge-orange";
+  if (grade === "F") return "badge badge-red";
+  return "badge";
+}
+
 function formatPipelineStatus(status) {
   if (!status) return "Unknown";
   if (status.running) {
@@ -982,6 +991,7 @@ function getPageFromHash() {
   if (hash === "opportunities" || hash === "opportunity") return "opportunities";
   if (hash === "history") return "history";
   if (hash === "settings" || hash === "auth") return "settings";
+  if (hash === "reports") return "reports";
   if (hash === "orbit") return "orbit";
   if (hash === "activity") return "activity";
   return "portfolio";
@@ -1453,6 +1463,13 @@ function App() {
   const [authClearLoading, setAuthClearLoading] = useState(false);
   const [authMessage, setAuthMessage] = useState(null);
   const [authError, setAuthError] = useState(null);
+  const [reports, setReports] = useState([]);
+  const [reportsLoading, setReportsLoading] = useState(false);
+  const [reportsError, setReportsError] = useState(null);
+  const [expandedReportId, setExpandedReportId] = useState(null);
+  const [reportDetails, setReportDetails] = useState({});
+  const [reportDetailLoading, setReportDetailLoading] = useState(null);
+  const [reportDetailError, setReportDetailError] = useState(null);
 
   async function loadAuthStatus() {
     try {
@@ -1519,6 +1536,38 @@ function App() {
       setAuthClearLoading(false);
     }
   }
+
+  async function loadReports() {
+    try {
+      setReportsLoading(true);
+      setReportsError(null);
+      const res = await fetch("/api/reports");
+      const data = await res.json().catch(() => []);
+      if (!res.ok) throw new Error(data?.error || data?.message || `HTTP ${res.status}`);
+      setReports(Array.isArray(data) ? data : []);
+    } catch (err) {
+      setReportsError(err.message);
+    } finally {
+      setReportsLoading(false);
+    }
+  }
+
+  async function loadReportDetail(reportId) {
+    if (!reportId || reportDetails[reportId]) return;
+    try {
+      setReportDetailLoading(reportId);
+      setReportDetailError(null);
+      const res = await fetch(`/api/reports/${encodeURIComponent(reportId)}`);
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data?.error || data?.message || `HTTP ${res.status}`);
+      setReportDetails((prev) => ({ ...prev, [reportId]: data }));
+    } catch (err) {
+      setReportDetailError(err.message);
+    } finally {
+      setReportDetailLoading(null);
+    }
+  }
+
   async function load() {
     try {
       setError(null);
@@ -1602,6 +1651,12 @@ function App() {
     const id = setInterval(load, 10000);
     return () => clearInterval(id);
   }, []);
+
+  useEffect(() => {
+    if (page === "reports") {
+      loadReports();
+    }
+  }, [page]);
 
   useEffect(() => {
     loadPipelineStatus();
@@ -1826,6 +1881,136 @@ function App() {
     activityTrailPanel
   );
 
+  const renderReportFlag = (flag, index) => React.createElement(
+    "div",
+    { className: cls("report-flag", flag.severity), key: `${flag.code}-${index}` },
+    React.createElement("span", { className: "report-flag-severity" }, flag.severity === "critical" ? "!" : flag.severity === "warning" ? "⚠" : "i"),
+    React.createElement("div", null,
+      React.createElement("div", { className: "report-flag-code" }, flag.code),
+      React.createElement("div", { className: "report-flag-message" }, flag.message)
+    )
+  );
+
+  const reportsPage = React.createElement(
+    "div",
+    { className: "card panel reports-panel" },
+    React.createElement(
+      "div",
+      { className: "panel-head" },
+      React.createElement("h2", null, "Reports"),
+      React.createElement("span", { className: "panel-note" }, "Deterministic manager reports for completed cycles")
+    ),
+    reportsError ? React.createElement("div", { className: "card error" }, reportsError) : null,
+    reportsLoading && reports.length === 0 ? React.createElement("div", { className: "empty-state" }, "Loading reports…") : null,
+    !reportsLoading && reports.length === 0 ? React.createElement("div", { className: "empty-state" }, "No reports have been written yet.") : null,
+    React.createElement(
+      "div",
+      { className: "reports-list" },
+      reports.map((report) => {
+        const isExpanded = expandedReportId === report.report_id;
+        const detail = reportDetails[report.report_id] || null;
+        const toggle = async () => {
+          const nextExpanded = isExpanded ? null : report.report_id;
+          setExpandedReportId(nextExpanded);
+          if (nextExpanded) await loadReportDetail(report.report_id);
+        };
+        return React.createElement(
+          "div",
+          { className: cls("report-row", isExpanded && "is-expanded"), key: report.report_id },
+          React.createElement(
+            "button",
+            { type: "button", className: "report-row-head", onClick: toggle },
+            React.createElement("div", { className: "report-row-main" },
+              React.createElement("span", { className: badgeForGrade(report.overall_grade) }, report.overall_grade || "F"),
+              React.createElement("strong", null, `Cycle #${report.cycle_index ?? "—"}`),
+              React.createElement("span", null, prettyDateTime(report.generated_at)),
+              React.createElement("span", { className: badgeForRegime(report.market_regime) }, String(report.market_regime || "unknown").replace(/_/g, " ")),
+              React.createElement("span", null, `${report.warning_flags || 0} warnings`),
+              React.createElement("span", null, `${report.cycle_duration_seconds ?? "—"}s`)
+            ),
+            React.createElement("span", { className: "report-row-action" }, isExpanded ? "▼" : "▶")
+          ),
+          isExpanded ? React.createElement(
+            "div",
+            { className: "report-row-body" },
+            reportDetailLoading === report.report_id ? React.createElement("div", { className: "empty-state" }, "Loading report details…") : null,
+            reportDetailError ? React.createElement("div", { className: "card error" }, reportDetailError) : null,
+            detail ? React.createElement(
+              React.Fragment,
+              null,
+              React.createElement(
+                "div",
+                { className: "report-detail-head" },
+                React.createElement("div", null,
+                  React.createElement("div", { className: "report-detail-title" }, `Cycle #${detail.cycle_index ?? report.cycle_index ?? "—"} — ${prettyDateTime(detail.generated_at || report.generated_at)}`),
+                  React.createElement("div", { className: "report-detail-summary" }, detail.summary || report.summary || ""),
+                  React.createElement("div", { className: "report-detail-meta" }, `${detail.overall_grade || report.overall_grade} (${detail.overall_score ?? report.overall_score})`)
+                )
+              ),
+              React.createElement(
+                "div",
+                { className: "report-detail-section" },
+                React.createElement("div", { className: "report-detail-section-title" }, "Flags"),
+                Array.isArray(detail.flags) && detail.flags.length
+                  ? React.createElement("div", { className: "report-flag-list" }, detail.flags.map(renderReportFlag))
+                  : React.createElement("div", { className: "intelligence-empty" }, "No flags recorded.")
+              ),
+              React.createElement(
+                "div",
+                { className: "report-detail-section" },
+                React.createElement("div", { className: "report-detail-section-title" }, "Agents"),
+                React.createElement("div", { className: "report-agent-grid" },
+                  ["scout", "harvest", "risk", "executor", "pipeline"].map((agent) => {
+                    const item = detail.agents?.[agent] || {};
+                    const notes = agent === "scout"
+                      ? `${item.coverage_pct != null ? `${Math.round(Number(item.coverage_pct) * 100)}% coverage` : ""}${item.candidates_proposed != null ? ` · ${item.candidates_proposed} candidates` : ""}`
+                      : agent === "harvest"
+                        ? `${item.positions_reviewed ?? 0}/${item.positions_held ?? 0} positions reviewed`
+                        : agent === "risk"
+                          ? `${item.approved ?? 0} approved / ${item.rejected ?? 0} rejected`
+                          : agent === "executor"
+                            ? `${item.paper_trades_recorded ?? 0} paper trades recorded`
+                            : `${item.cycle_duration_seconds ?? detail.cycle_duration_seconds ?? 0}s cycle`;
+                    return React.createElement(
+                      "div",
+                      { className: "report-agent-row", key: agent },
+                      React.createElement("span", { className: "report-agent-name" }, agent.charAt(0).toUpperCase() + agent.slice(1)),
+                      React.createElement("span", { className: badgeForGrade(item.grade) }, item.grade || "—"),
+                      React.createElement("strong", null, item.score != null ? String(item.score) : "—"),
+                      React.createElement("span", { className: "report-agent-notes" }, notes || "")
+                    );
+                  })
+                )
+              ),
+              React.createElement(
+                "div",
+                { className: "report-detail-section report-detail-grid" },
+                React.createElement(
+                  "div",
+                  null,
+                  React.createElement("div", { className: "report-detail-section-title" }, "Portfolio Snapshot"),
+                  React.createElement("div", { className: "report-kv" }, `Equity ${fmtUsd.format(Number(detail.portfolio_snapshot?.equity_usd || 0))}`),
+                  React.createElement("div", { className: "report-kv" }, `Cash ${fmtUsd.format(Number(detail.portfolio_snapshot?.cash_usd || 0))}`),
+                  React.createElement("div", { className: "report-kv" }, `${detail.portfolio_snapshot?.position_count ?? 0} positions`),
+                  React.createElement("div", { className: "report-kv" }, `Unrealized PnL ${fmtUsd.format(Number(detail.portfolio_snapshot?.unrealized_pnl_usd || 0))}`),
+                  React.createElement("div", { className: "report-kv" }, `Max Drawdown ${fmtNum.format(Number(detail.portfolio_snapshot?.max_drawdown_pct || 0) * 100)}%`)
+                ),
+                React.createElement(
+                  "div",
+                  null,
+                  React.createElement("div", { className: "report-detail-section-title" }, "Cycle Actions"),
+                  React.createElement("div", { className: "report-kv" }, `Buys: ${Array.isArray(detail.cycle_actions?.buys) && detail.cycle_actions.buys.length ? detail.cycle_actions.buys.map((item) => item.symbol).filter(Boolean).join(", ") : "none"}`),
+                  React.createElement("div", { className: "report-kv" }, `Sells: ${Array.isArray(detail.cycle_actions?.sells) && detail.cycle_actions.sells.length ? detail.cycle_actions.sells.map((item) => item.symbol).filter(Boolean).join(", ") : "none"}`),
+                  React.createElement("div", { className: "report-kv" }, `Rotations: ${Array.isArray(detail.cycle_actions?.rotations) && detail.cycle_actions.rotations.length ? detail.cycle_actions.rotations.map((item) => item.from_symbol || item.to_symbol).filter(Boolean).join(", ") : "none"}`)
+                )
+              )
+            ) : null
+          ) : null
+        );
+      })
+    )
+  );
+
   const settingsPage = React.createElement(
     "div",
     { className: "content-column-main" },
@@ -1905,6 +2090,7 @@ function App() {
     portfolio: "Portfolio",
     opportunities: "Best Opportunities + Weakest Positions",
     history: "History",
+    reports: "Reports",
     settings: "Settings",
     orbit: "Orbit + wallet",
     activity: "Agent Activity"
@@ -1913,6 +2099,7 @@ function App() {
     portfolio: "Open positions with entry, current value, and delta",
     opportunities: "High-conviction opportunities and the weakest current positions",
     history: "Sold positions with entry, exit, and realized PnL",
+    reports: "Cycle-by-cycle manager reports with flags and agent grades",
     settings: "Manage e3d.ai login, API key access, and pipeline controls",
     orbit: "Agent orbit and wallet view",
     activity: "Per-cycle story signals, tokens considered, and risk decisions"
@@ -1928,6 +2115,8 @@ function App() {
     ? opportunitiesPage
     : page === "history"
       ? historyPage
+      : page === "reports"
+        ? reportsPage
       : page === "settings"
         ? settingsPage
         : page === "orbit"
@@ -1956,9 +2145,10 @@ function App() {
           React.createElement("button", { className: cls("button", page === "portfolio" && "button-active"), onClick: () => goToPage("portfolio") }, "Portfolio"),
           React.createElement("button", { className: cls("button", page === "opportunities" && "button-active"), onClick: () => goToPage("opportunities") }, "Opportunities"),
           React.createElement("button", { className: cls("button", page === "history" && "button-active"), onClick: () => goToPage("history") }, "History"),
-          React.createElement("button", { className: cls("button", page === "settings" && "button-active"), onClick: () => goToPage("settings") }, "Settings"),
           React.createElement("button", { className: cls("button", page === "orbit" && "button-active"), onClick: () => goToPage("orbit") }, "Orbit"),
           React.createElement("button", { className: cls("button", page === "activity" && "button-active"), onClick: () => goToPage("activity") }, "Activity"),
+          React.createElement("button", { className: cls("button", page === "reports" && "button-active"), onClick: () => goToPage("reports") }, "Reports"),
+          React.createElement("button", { className: cls("button", page === "settings" && "button-active"), onClick: () => goToPage("settings") }, "Settings"),
           React.createElement("button", { className: "button button-primary", onClick: load }, "Refresh now"),
           React.createElement("a", { className: "button button-secondary", href: "/api/activity", target: "_blank", rel: "noreferrer" }, "Raw activity API")
         )
