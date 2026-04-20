@@ -10,6 +10,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const LOG_DIR = path.join(__dirname, "logs");
+const REPORTS_DIR = path.join(__dirname, "reports");
 const PORTFOLIO_FILE = path.join(__dirname, "portfolio.json");
 const PIPELINE_LOG = path.join(LOG_DIR, "pipeline.jsonl");
 const AGENT_RAW_LOG = path.join(LOG_DIR, "agent-raw.jsonl");
@@ -40,9 +41,11 @@ let _e3dLastRequestAt = 0;
 const E3D_DOSSIER_CACHE = new Map();
 const E3D_API_DEBUG = process.env.E3D_API_DEBUG === "1" || process.env.E3D_DEBUG === "1";
 let ACTIVE_TRAINING_CONTEXT = null;
+const LAST_LLM_META = new Map();
 let DATABASE_SCHEMA_READY = false;
 
 fs.mkdirSync(LOG_DIR, { recursive: true });
+fs.mkdirSync(REPORTS_DIR, { recursive: true });
 
 const SETTINGS_DEFAULTS = {
   paper_mode: true,
@@ -73,6 +76,15 @@ function nowIso() {
   return `${local.toISOString().slice(0, 19)}${sign}${hours}:${minutes}`;
 }
 
+function formatReportTimestamp(date = new Date()) {
+  const pad = (value) => String(value).padStart(2, "0");
+  return [
+    date.getFullYear(),
+    pad(date.getMonth() + 1),
+    pad(date.getDate())
+  ].join("") + "-" + [pad(date.getHours()), pad(date.getMinutes()), pad(date.getSeconds())].join("");
+}
+
 function nowMs() {
   return Date.now();
 }
@@ -82,6 +94,15 @@ function log(stage, data) {
     PIPELINE_LOG,
     JSON.stringify({ ts: nowIso(), stage, data }) + "\n"
   );
+}
+
+function setLastLLMMeta(agent, meta) {
+  if (!agent) return;
+  LAST_LLM_META.set(agent, { ...(meta || {}) });
+}
+
+function getLastLLMMeta(agent) {
+  return LAST_LLM_META.get(agent) ? { ...LAST_LLM_META.get(agent) } : null;
 }
 
 function runShell(command, args, options = {}) {
@@ -537,6 +558,23 @@ function getTrainingContext() {
 function appendTrainingEvent(record) {
   fs.appendFileSync(TRAINING_EVENT_LOG, JSON.stringify(record) + "\n");
   syncTrainingEventToClickHouse(record);
+}
+
+function readJsonLines(filePath, maxLines = 1000) {
+  try {
+    const content = fs.readFileSync(filePath, "utf8");
+    const lines = content.split("\n");
+    const tail = maxLines > 0 ? lines.slice(-maxLines) : lines;
+    const records = [];
+    for (const line of tail) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      try { records.push(JSON.parse(trimmed)); } catch { /* skip malformed lines */ }
+    }
+    return records;
+  } catch {
+    return [];
+  }
 }
 
 function buildTrainingEventRecord(eventType, actor, portfolio, context = {}, details = {}) {
@@ -1504,6 +1542,9 @@ function setCachedDossier(cacheKey, value) {
 let _cycleMarketContext = null;
 // Quant context: DexScreener order flow, macro regime, Binance funding rates — reset each cycle.
 let _cycleQuantContext = null;
+// Story types actually returned by the E3D API this cycle — used to make coverage scoring fair.
+// Coverage only grades against types that were present in the data, not the full expected list.
+let _cycleAvailableStoryTypes = null;
 
 function getOrFetchCycleMarketContext() {
   if (_cycleMarketContext) return _cycleMarketContext;
@@ -1790,20 +1831,41 @@ function sleepSync(ms) {
 }
 
 const EXPECTED_STORY_TYPES = {
+  // v1 names (still appear when conditions exist) + v2 names (dominate current API responses).
+  // Coverage is measured as: how many of these types appear in either stories_checked[] or
+  // evidence[] of the agent's output, intersected with types that were actually in the cycle data.
   scout: [
+    // v1 disqualifiers
     "WASH_TRADE", "LOOP", "LIQUIDITY_DRAIN", "SPREAD_WIDENING", "MOMENTUM_DIVERGENCE", "EXCHANGE_FLOW",
+    // v1 buy signals
     "ACCUMULATION", "SMART_MONEY", "STEALTH_ACCUMULATION", "BREAKOUT_CONFIRMED", "MOVER", "SURGE",
+    // v1 secondary
     "CONCENTRATION_SHIFT", "INSIDER_TIMING", "TOKEN_QUALITY_SCORE", "SANDWICH",
+    // v2 signals (current API)
+    "CLUSTER", "THESIS", "STAGING", "FLOW", "HOTLINKS", "FUNNEL", "WHALE",
+    "DELEGATE_SURGE", "NEW_WALLETS", "MIRROR", "VOLUME_PROFILE_ANOMALY", "ECOSYSTEM_SHIFT",
   ],
   harvest: [
+    // v1 exit risk
     "LIQUIDITY_DRAIN", "RUG_LIQUIDITY_PULL", "SPREAD_WIDENING", "EXCHANGE_FLOW",
-    "MOMENTUM_DIVERGENCE", "WASH_TRADE", "LOOP", "CONCENTRATION_SHIFT", "WHALE",
-    "VOLUME_PROFILE_ANOMALY", "MIRROR", "ACCUMULATION", "SMART_MONEY",
+    "MOMENTUM_DIVERGENCE", "WASH_TRADE", "LOOP",
+    // v1 positioning
+    "CONCENTRATION_SHIFT", "WHALE", "VOLUME_PROFILE_ANOMALY", "MIRROR",
+    // v1 hold confirm
+    "ACCUMULATION", "SMART_MONEY",
+    // v2 equivalents (current API)
+    "CLUSTER", "THESIS", "FLOW", "STAGING", "FUNNEL",
   ],
 };
 
 function buildAgentCoverageLog(agentId, payload) {
-  const expected = EXPECTED_STORY_TYPES[agentId] || [];
+  const allExpected = EXPECTED_STORY_TYPES[agentId] || [];
+  // Only grade against story types that the E3D API actually returned this cycle.
+  // This prevents unfair penalisation when a type simply doesn't exist in today's data.
+  // Fall back to the full list when cycle data isn't available (e.g. unit tests, ad-hoc calls).
+  const expected = _cycleAvailableStoryTypes
+    ? allExpected.filter((t) => _cycleAvailableStoryTypes.has(t))
+    : allExpected;
 
   // Self-reported: agent may include stories_checked[] in its output
   const selfReported = Array.isArray(payload?.stories_checked)
@@ -1849,7 +1911,62 @@ function buildAgentCoverageLog(agentId, payload) {
 const LLM_BASE_URL = process.env.LLM_BASE_URL || "http://127.0.0.1:5050";
 const LLM_MODEL = process.env.LLM_MODEL || "mlx-community/Qwen2.5-14B-Instruct-4bit";
 
-function callLLMDirect(systemPrompt, userMessage, { maxRetries = 2, agent = "unknown" } = {}) {
+const COINGECKO_API_KEY = process.env.COINGECKO_API_KEY || "";
+const COINGECKO_BASE = "https://pro-api.coingecko.com/api/v3";
+
+// Batch price lookup — one call for up to 30 contract addresses.
+// Returns { address: { usd, usd_market_cap, usd_24h_vol, usd_24h_change, usd_7d_change } }
+function fetchCoinGeckoBatch(addresses) {
+  if (!COINGECKO_API_KEY || !addresses.length) return {};
+  try {
+    const params = `contract_addresses=${addresses.slice(0, 30).join(",")}&vs_currencies=usd&include_market_cap=true&include_24hr_vol=true&include_24hr_change=true&include_7d_change=true`;
+    const stdout = execFileSync("curl", [
+      "-s", `${COINGECKO_BASE}/simple/token_price/ethereum?${params}`,
+      "-H", `x-cg-pro-api-key: ${COINGECKO_API_KEY}`,
+      "--max-time", "15",
+    ], { encoding: "utf8", timeout: 20000 });
+    const result = JSON.parse(stdout);
+    if (result?.error_code) { log("coingecko_error", { error: result.error_code }); return {}; }
+    return result;
+  } catch { return {}; }
+}
+
+// Full detail for a single contract — ATH, sentiment, categories, developer scores, description.
+function fetchCoinGeckoDetail(address) {
+  if (!COINGECKO_API_KEY || !address) return null;
+  try {
+    const stdout = execFileSync("curl", [
+      "-s", `${COINGECKO_BASE}/coins/ethereum/contract/${address}`,
+      "-H", `x-cg-pro-api-key: ${COINGECKO_API_KEY}`,
+      "--max-time", "15",
+    ], { encoding: "utf8", timeout: 20000 });
+    const d = JSON.parse(stdout);
+    if (d?.error || !d?.id) return null;
+    return {
+      id: d.id,
+      symbol: (d.symbol || "").toUpperCase(),
+      name: d.name,
+      market_cap_rank: d.market_cap_rank ?? null,
+      price_usd: d.market_data?.current_price?.usd ?? null,
+      market_cap_usd: d.market_data?.market_cap?.usd ?? null,
+      volume_24h_usd: d.market_data?.total_volume?.usd ?? null,
+      change_24h_pct: d.market_data?.price_change_percentage_24h ?? null,
+      change_7d_pct: d.market_data?.price_change_percentage_7d ?? null,
+      change_30d_pct: d.market_data?.price_change_percentage_30d ?? null,
+      ath_usd: d.market_data?.ath?.usd ?? null,
+      ath_change_pct: d.market_data?.ath_change_percentage?.usd ?? null,
+      sentiment_up_pct: d.sentiment_votes_up_percentage ?? null,
+      categories: (d.categories || []).slice(0, 5),
+      description: (d.description?.en || "").slice(0, 300),
+      coingecko_score: d.coingecko_score ?? null,
+      developer_score: d.developer_score ?? null,
+      community_score: d.community_score ?? null,
+      liquidity_score: d.liquidity_score ?? null,
+    };
+  } catch { return null; }
+}
+
+function callLLMDirect(systemPrompt, userMessage, { maxRetries = 1, agent = "unknown" } = {}) {
   const bodyObj = {
     model: LLM_MODEL,
     messages: [
@@ -1887,9 +2004,9 @@ function callLLMDirect(systemPrompt, userMessage, { maxRetries = 2, agent = "unk
           `${LLM_BASE_URL}/v1/chat/completions`,
           "-H", "Content-Type: application/json",
           "-H", `X-Request-Id: ${reqId}`,
-          "--max-time", "600",
+          "--max-time", "1200",
           "-d", `@${tmpFile}`
-        ], { encoding: "utf8", maxBuffer: 10 * 1024 * 1024, timeout: 620000 });
+        ], { encoding: "utf8", maxBuffer: 10 * 1024 * 1024, timeout: 1220000 });
       } finally {
         try { fs.unlinkSync(tmpFile); } catch (_) {}
       }
@@ -1907,7 +2024,7 @@ function callLLMDirect(systemPrompt, userMessage, { maxRetries = 2, agent = "unk
         throw new Error(`LLM_EMPTY_RESPONSE\n${stdout.slice(0, 500)}`);
       }
       const durationMs = nowMs() - startMs;
-      log("llm_response", {
+      const meta = {
         req_id: reqId,
         agent,
         duration_ms: durationMs,
@@ -1916,14 +2033,18 @@ function callLLMDirect(systemPrompt, userMessage, { maxRetries = 2, agent = "unk
         completion_tokens: parsed?.usage?.completion_tokens ?? null,
         total_tokens: parsed?.usage?.total_tokens ?? null,
         finish_reason: parsed?.choices?.[0]?.finish_reason ?? null,
-      });
+      };
+      log("llm_response", meta);
+      setLastLLMMeta(agent, meta);
       return text.trim();
     } catch (err) {
       lastErr = err;
       if (attempt < maxRetries) sleepSync(5000);
     }
   }
-  log("llm_error", { req_id: reqId, agent, duration_ms: nowMs() - startMs, error: lastErr?.message?.slice(0, 200) });
+  const errorMeta = { req_id: reqId, agent, duration_ms: nowMs() - startMs, error: lastErr?.message?.slice(0, 200) };
+  log("llm_error", errorMeta);
+  setLastLLMMeta(agent, errorMeta);
   throw lastErr;
 }
 
@@ -1947,11 +2068,14 @@ function fetchScoutData() {
   // Story type categorisation — used to label whatever the API returns
   const disqualifierTypes = new Set(["WASH_TRADE", "LOOP", "LIQUIDITY_DRAIN", "SPREAD_WIDENING",
     "MOMENTUM_DIVERGENCE", "EXCHANGE_FLOW", "SECURITY_RISK", "RUG_LIQUIDITY_PULL", "AIRDROP"]);
-  const buySignalTypes = new Set(["ACCUMULATION", "SMART_MONEY", "STEALTH_ACCUMULATION",
-    "BREAKOUT_CONFIRMED", "MOVER", "SURGE", "DISCOVERY", "FLOW", "CLUSTER", "THESIS",
-    "DELEGATE_SURGE", "NEW_WALLETS", "HOTLINKS", "STAGING", "DEEP_DIVE"]);
+  // PRE-PUMP early signals — fire before price moves, this is the alpha window
+  const buySignalTypes = new Set(["STAGING", "CLUSTER", "FUNNEL", "NEW_WALLETS", "WHALE",
+    "ACCUMULATION", "SMART_MONEY", "STEALTH_ACCUMULATION", "DEEP_DIVE", "THESIS",
+    "BREAKOUT_CONFIRMED", "FLOW", "HOTLINKS", "DISCOVERY", "DELEGATE_SURGE"]);
+  // POST-PUMP late signals — move already happened, NOT a buy trigger on its own
+  const lateSignalTypes = new Set(["MOVER", "SURGE"]);
   const secondaryTypes = new Set(["CONCENTRATION_SHIFT", "INSIDER_TIMING", "TOKEN_QUALITY_SCORE",
-    "SANDWICH", "MIRROR", "VOLUME_PROFILE_ANOMALY", "FUNNEL", "WHALE"]);
+    "SANDWICH", "MIRROR", "VOLUME_PROFILE_ANOMALY"]);
 
   // Use the cycle-level cached global stories — already fetched by getOrFetchCycleMarketContext().
   // This is the single stories API call for the entire cycle; no per-position calls are made.
@@ -2079,7 +2203,70 @@ function fetchScoutData() {
   const e3dTheses = endpointArray(fetchJson("/theses", { status: "active", limit: 25 }));
   log("scout_e3d_theses", { count: e3dTheses.length });
 
-  return { stories, thesisSignalStories, tokenUniverse, disqualifierTypes, buySignalTypes, secondaryTypes, sortLabel: `${sortParams.sortBy} ${sortParams.sortDir}`, e3dCandidates, e3dTheses };
+  // Enrich universe with thesis tokens not already present. Theses cover tokens that have
+  // high-conviction signals but may not surface in the standard volume/liquidity rankings.
+  let thesisEnrichAdded = 0;
+  for (const thesis of e3dTheses.slice(0, 8)) {
+    const addr = cleanAddress(thesis?.token_address || thesis?.address || thesis?.contract_address || "");
+    if (!addr || seen.has(addr)) continue;
+    try {
+      const rows = endpointArray(fetchJson("/fetchTokenPricesWithHistoryAllRanges", {
+        dataSource: 1, search: addr, limit: 1
+      }));
+      const row = rows.find((r) => cleanAddress(r.address || r.contract_address || "") === addr) || rows[0];
+      if (!row) continue;
+      const enriched = mapToken(row);
+      if (enriched.address && (enriched.price_usd ?? 0) > 0 && !seen.has(enriched.address) &&
+          !nonTradeablePattern.test(enriched.symbol || "")) {
+        seen.add(enriched.address);
+        tokenUniverse.push(enriched);
+        thesisEnrichAdded++;
+      }
+    } catch (_) {}
+  }
+  log("scout_thesis_enrichment", { checked: Math.min(e3dTheses.length, 8), added: thesisEnrichAdded });
+
+  // CoinGecko enrichment — batch price lookup for thesis tokens + top flow accumulation tokens,
+  // then detailed lookup for any thesis token that passes the quality gate.
+  const cgDetailMap = new Map(); // address -> full CoinGecko detail
+  if (COINGECKO_API_KEY) {
+    const thesisAddrs = e3dTheses
+      .map(t => cleanAddress(t?.token_address || t?.address || t?.contract_address || ""))
+      .filter(a => a);
+    const flowAccumAddrs = tokenUniverse
+      .filter(t => (t.flow_signal === "strong_accumulation" || t.flow_signal === "accumulation") && t.address)
+      .slice(0, 15).map(t => t.address);
+    const batchAddrs = [...new Set([...thesisAddrs, ...flowAccumAddrs])].slice(0, 30);
+    const batchPrices = fetchCoinGeckoBatch(batchAddrs);
+    log("scout_coingecko_batch", { queried: batchAddrs.length, found: Object.keys(batchPrices).length });
+
+    // Resolve thesis tokens not yet in the universe using CoinGecko as authoritative source
+    for (const addr of thesisAddrs) {
+      if (seen.has(addr)) continue;
+      const cg = batchPrices[addr];
+      if (!cg?.usd || (cg.usd_market_cap || 0) < 2000000) continue;
+      const detail = fetchCoinGeckoDetail(addr);
+      if (!detail || nonTradeablePattern.test(detail.symbol || "")) continue;
+      cgDetailMap.set(addr, detail);
+      seen.add(addr);
+      tokenUniverse.push({
+        address: addr, symbol: detail.symbol, name: detail.name,
+        price_usd: detail.price_usd, market_cap_usd: detail.market_cap_usd,
+        volume_24h_usd: detail.volume_24h_usd, liquidity_usd: null,
+        change_24h: detail.change_24h_pct, change_30m: null, _cg_source: true,
+      });
+    }
+
+    // Overlay 7d price change from batch onto existing universe tokens (free, no extra calls)
+    for (const t of tokenUniverse) {
+      const cg = t.address ? batchPrices[t.address] : null;
+      if (!cg) continue;
+      t._cg_change_7d_pct = cg.usd_7d_change ?? null;
+      if (!(t.market_cap_usd > 0) && cg.usd_market_cap > 0) t.market_cap_usd = cg.usd_market_cap;
+    }
+  }
+
+  return { stories, thesisSignalStories, tokenUniverse, disqualifierTypes, buySignalTypes, lateSignalTypes, secondaryTypes, sortLabel: `${sortParams.sortBy} ${sortParams.sortDir}`, e3dCandidates, e3dTheses, cgDetailMap };
 }
 
 function runScoutDirect(portfolio, portfolioIntelligence = null) {
@@ -2098,6 +2285,9 @@ function runScoutDirect(portfolio, portfolioIntelligence = null) {
 
   // Pre-fetch all E3D data
   const data = fetchScoutData();
+  // Capture which story types the E3D API actually returned so coverage grading
+  // only penalises the agent for types that existed in the data this cycle.
+  _cycleAvailableStoryTypes = new Set(Object.keys(data.stories));
 
   // Expand token_flow to cover top-60 liquid tokens in the universe (not just held positions).
   // This lets Scout rank candidates by live order flow even when e3d.ai has no candidates/theses.
@@ -2159,7 +2349,8 @@ function runScoutDirect(portfolio, portfolioIntelligence = null) {
   // Bucket stories into signal categories
   const disqualifierStories = Object.entries(data.stories).filter(([t]) => data.disqualifierTypes.has(t));
   const buySignalStories = Object.entries(data.stories).filter(([t]) => data.buySignalTypes.has(t));
-  const secondaryStories = Object.entries(data.stories).filter(([t]) => data.secondaryTypes.has(t) || (!data.disqualifierTypes.has(t) && !data.buySignalTypes.has(t)));
+  const lateSignalStories = Object.entries(data.stories).filter(([t]) => data.lateSignalTypes.has(t));
+  const secondaryStories = Object.entries(data.stories).filter(([t]) => data.secondaryTypes.has(t) || (!data.disqualifierTypes.has(t) && !data.buySignalTypes.has(t) && !data.lateSignalTypes.has(t)));
 
   // Build a fast address → token lookup from the universe so we can match story
   // subjects to tokens that actually have market data.
@@ -2192,42 +2383,48 @@ function runScoutDirect(portfolio, portfolioIntelligence = null) {
   };
 
   const systemPrompt = [
-    "You are Scout, a crypto trading research agent.",
+    "You are Scout, an elite crypto trading research agent for a quantitative hedge fund.",
     "You have been given pre-fetched E3D market intelligence data. Return STRICT JSON only — one object, no markdown, no commentary.",
     "",
-    "SIGNAL PRIORITY (highest to lowest):",
-    "1. E3D AGENT CANDIDATES — pre-computed multi-signal convergence analysis. These are the strongest signals: the E3D agent has already correlated multiple story types across time. Use these as your primary candidates when available.",
-    "2. E3D THESES — structured investment theses with direction, conviction, and price targets. Treat a LONG thesis with conviction >= 60 as a strong buy signal.",
-    "3. THESIS STORIES — THESIS-type on-chain stories. Use when no structured thesis exists for a token.",
-    "4. BUY SIGNAL STORIES — single-story signals (ACCUMULATION, SMART_MONEY, etc.).",
-    "5. TOKEN UNIVERSE MOMENTUM — fallback: use momentum (change_30m, change_24h) if no signal-backed token qualifies.",
+    "SIGNAL PRIORITY — work down this list and stop when you find qualified candidates:",
+    "1. E3D AGENT CANDIDATES — pre-computed multi-story convergence. The E3D system has already correlated signals across time. These are the highest-quality setups; always prioritize them.",
+    "2. E3D THESES — structured investment theses with direction, conviction, and price targets. A LONG thesis with conviction >= 65 is a strong buy signal. If in_token_universe=false but conviction >= 65, STILL propose it — use the thesis price data and note 'thesis-driven entry' in why_now. Set price_source to 'thesis'.",
+    "3. THESIS STORIES — THESIS-type on-chain stories with in_token_universe=true.",
+    "4. BUY SIGNAL STORIES — ACCUMULATION, SMART_MONEY, BREAKOUT_CONFIRMED stories with in_token_universe=true.",
+    "5. FLOW-ONLY — absolute last resort only when ALL above are empty. See FLOW-ONLY ENTRY rules. Prefer 0 candidates over a weak flow pick.",
     "",
-    "WHERE ALPHA COMES FROM — what a crypto hedge fund looks for:",
-    "- EARLY ACCUMULATION: ACCUMULATION or SMART_MONEY story on a token where change_24h is still modest (< 20%). Smart money accumulates BEFORE price moves — this is the window.",
-    "- FRESH THESIS: A THESIS story or E3D structured thesis that just appeared (new conviction signal). New theses represent a fresh catalyst being discovered.",
-    "- MULTI-SIGNAL CONVERGENCE: A token appearing in 2+ story types simultaneously (e.g. ACCUMULATION + SURGE, or THESIS + BREAKOUT_CONFIRMED). Convergence is the strongest signal.",
-    "- BREAKOUT CONFIRMATION: BREAKOUT_CONFIRMED story with volume_24h_usd > 0 and positive change_30m. Momentum with on-chain confirmation.",
-    "- Do NOT just pick the highest-volume token. Volume-chasing is late entry. Find the signal BEFORE the crowd arrives.",
+    "SIGNAL TIMING — this is how you catch moves early instead of late:",
+    "- PRE-PUMP (your alpha window — buy here): STAGING, CLUSTER, FUNNEL, NEW_WALLETS, ACCUMULATION, SMART_MONEY, STEALTH_ACCUMULATION, DEEP_DIVE, THESIS. These fire BEFORE price moves. A STAGING or CLUSTER story with flat price is your best entry.",
+    "- BREAKOUT (early-mid entry, still valid): BREAKOUT_CONFIRMED, FLOW, HOTLINKS — price is moving but momentum is fresh.",
+    "- POST-PUMP (already happened — do NOT buy as a new entry): MOVER, SURGE — the move is over. These appear in LATE SIGNALS section. Buying a MOVER story is buying after the crowd arrived. The CoinGecko change_7d_pct confirms this: if > 100%, you are late.",
+    "- PUMP EXHAUSTION (exit signal when you already hold): If you held a token and now see MOVER + declining price, that is the dump phase. Harvest should exit, not hold.",
     "",
-    "QUANT SIGNAL TIERS — use these to rank and filter candidates:",
-    "TIER 1 (open aggressively, full size): E3D candidate/thesis + flow_signal=accumulation or strong_accumulation + funding=neutral or squeeze_potential",
-    "TIER 2 (open, standard size): story signal (ACCUMULATION/SMART_MONEY/THESIS) + flow_signal=neutral or better",
-    "TIER 3 (open small, watch closely): story signal only OR flow_signal=strong_accumulation with no story — live buying pressure is a valid entry trigger",
-    "FLOW-ONLY ENTRY (when E3D candidates/theses are empty): propose tokens with flow_signal=strong_accumulation (buy_sell_ratio_1h >= 2.0) and liquidity_usd > 20000 as TIER 3 entries. This is valid alpha — order flow leads price.",
-    "SKIP: flow_signal=distribution or strong_distribution without overwhelming story evidence. funding_signal=overcrowded_long (crowded trade — late entry risk).",
-    "MACRO GATE: If new_positions_ok=false (macro regime=fear/extreme_fear), only propose TIER 1 setups with conviction >= 0.75.",
+    "WHERE ALPHA COMES FROM:",
+    "- THESIS-BACKED ENTRY: An E3D thesis with conviction >= 65 has already done multi-source research — trust it, build an entry plan.",
+    "- EARLY ACCUMULATION: STAGING/CLUSTER/FUNNEL/NEW_WALLETS on a token where change_24h < 10% and price is flat. This is the setup before the move.",
+    "- MULTI-SIGNAL CONVERGENCE: Token in 2+ early story types simultaneously (e.g. STAGING + ACCUMULATION, or CLUSTER + FUNNEL). Strongest possible entry.",
+    "- DISQUALIFY post-pump entries: change_7d_pct > 300% = already pumped. Do NOT propose. change_7d_pct > 100% on a MOVER story = late entry, skip.",
+    "- WARNING: A MOVER or SURGE story alone is NEVER a buy signal. It may be useful to confirm a thesis-backed position you already hold is working, but it is not an entry trigger.",
+    "",
+    "QUANT SIGNAL TIERS:",
+    "TIER 1 (full size, highest conviction): E3D candidate or thesis (conviction >= 65) + flow_signal=accumulation or strong_accumulation + funding=neutral or squeeze_potential.",
+    "TIER 2 (standard size): Story signal (ACCUMULATION/SMART_MONEY/THESIS/BREAKOUT_CONFIRMED) with in_token_universe=true + liquidity_usd > 200000 + volume_24h_usd > 50000.",
+    "TIER 3 (small size, max 1 per cycle): Signal-backed setup (story or thesis) with good conviction but below TIER 2 liquidity/volume thresholds. NEVER use TIER 3 for pure flow-only entries.",
+    "FLOW-ONLY ENTRY (only when E3D AGENT CANDIDATES shows 'none currently' AND E3D THESES shows 'none currently' AND zero buy-signal stories have in_token_universe=true): require ALL of — buy_sell_ratio_1h >= 3.5, liquidity_usd > 150000, volume_24h_usd > 75000, market_cap_usd > 5000000. Maximum 1 candidate. If any threshold is not met, return 0 candidates — do NOT force an entry.",
+    "SKIP: flow_signal=distribution or strong_distribution. funding_signal=overcrowded_long. market_cap_usd < 2000000 (cannot size or exit safely). price_usd = 0 or volume_24h_usd = 0.",
+    "MACRO GATE: If new_positions_ok=false, only propose TIER 1 setups with conviction >= 80.",
     "",
     "CRITICAL RULES:",
-    "1. Only propose tokens in the TOKEN UNIVERSE with price_usd > 0 and liquidity_usd > 5000. Story-enriched tokens (added from THESIS/ACCUMULATION/SMART_MONEY stories) appear in the TOKEN UNIVERSE list with in_token_universe=true — treat them as first-class candidates.",
-    "2. NEVER propose stablecoins (USDT, USDC, DAI, USDS, FRAX, LUSD, GHO, USDE, etc.), gold/commodity tokens (XAUt, PAXG), or wrapped/base assets (WETH, WBTC, wstETH, cbETH, rETH, stETH). Already filtered from TOKEN UNIVERSE.",
-    "3. Stories show ON-CHAIN SIGNALS. A story's subject may be a wallet, LP, or contract — only use it as a candidate if in_token_universe=true.",
-    "4. Do NOT use story type names (MOVER, SURGE, THESIS, etc.) as token symbols. Use the symbol from TOKEN UNIVERSE.",
-    "5. Return up to 3 candidates. If no strong signal exists, return fewer rather than proposing weak setups.",
+    "1. Quality gate — required for ALL proposals: price_usd > 0, liquidity_usd > 100000, market_cap_usd > 2000000, volume_24h_usd > 10000. No exceptions. Low-liquidity micro-caps cannot be sized or exited safely.",
+    "2. NEVER propose stablecoins, gold tokens, or wrapped/base assets (already filtered from TOKEN UNIVERSE).",
+    "3. Stories show ON-CHAIN SIGNALS. A story's subject may be a wallet, LP, or contract — only use as a candidate if in_token_universe=true AND quality gate is met.",
+    "4. THESIS EXCEPTION: If a thesis has direction=LONG and conviction >= 65, propose it even when in_token_universe=false, provided the thesis includes a price. Quality gate still applies to whatever market data is available.",
+    "5. Return up to 3 candidates. 1 strong candidate is better than 3 weak ones. Returning 0 candidates is correct when nothing genuinely meets the bar — the pipeline will survive a skipped cycle; a bad entry will not.",
     "6. Exclude addresses in DISQUALIFIERS and already-held: " + `symbols=${JSON.stringify([...heldSymbols])} addresses=${JSON.stringify([...heldAddresses])}`,
     "",
     `Output shape: {scan_timestamp, candidates[], holdings_updates[], stories_checked[]}`,
     `Each candidate: {source_agent:"scout", created_at:"${createdAt}", expires_at:"${expiresAt}", token:{symbol,name,chain:"ethereum",contract_address,category}, setup_type, action:"buy", confidence, conviction_score, opportunity_score, why_now, evidence[], risks[], entry_zone:{low,high}, invalidation_price, targets:{target_1,target_2,target_3}, market_data:{current_price,change_24h_pct,change_30m_pct,price_source:"e3d",market_cap_usd}, liquidity_data:{liquidity_usd,liquidity_source:"e3d"}, execution_data:{estimated_slippage_bps,quote_source:"e3d"}, portfolio_data:{current_token_exposure_pct:0,current_category_exposure_pct:0,current_total_exposure_pct:0}}`,
-    `stories_checked[]: one entry per EVERY story type present in the ON-CHAIN SIGNALS section — {type, found, tokens[]}. List ALL types, even ones with in_token_universe=false (set found=false, tokens=[]). Do NOT invent story types that are not in the data.`
+    `stories_checked[]: one entry per EVERY story type present in the ON-CHAIN SIGNALS section — {type, found, tokens[]}. List ALL types, even ones with in_token_universe=false (set found=false, tokens=[]). Do NOT invent story types not in the data.`
   ].join("\n");
 
   const allStoryTypes = Object.keys(data.stories);
@@ -2256,9 +2453,10 @@ function runScoutDirect(portfolio, portfolioIntelligence = null) {
   const formatThesis = (t) => {
     const addr = cleanAddress(t?.token_address || t?.address || t?.contract_address || "");
     const tokenMatch = addr ? tokenByAddr.get(addr) : null;
+    const cg = addr ? data.cgDetailMap?.get(addr) : null;
     return JSON.stringify({
       address: addr,
-      symbol: tokenMatch?.symbol || t?.symbol || null,
+      symbol: tokenMatch?.symbol || cg?.symbol || t?.symbol || null,
       direction: t?.direction || null,
       conviction: t?.conviction ?? null,
       thesis_text: (t?.thesis || t?.thesis_text || t?.summary || "").slice(0, 200),
@@ -2267,8 +2465,16 @@ function runScoutDirect(portfolio, portfolioIntelligence = null) {
       invalidation_price: t?.invalidation_price ?? null,
       fraud_risk: t?.fraud_risk ?? null,
       liquidity_quality: t?.liquidity_quality ?? null,
-      in_token_universe: !!tokenMatch,
-      price_usd: tokenMatch?.price_usd ?? null,
+      in_token_universe: !!tokenMatch || (cg != null),
+      price_usd: tokenMatch?.price_usd ?? cg?.price_usd ?? null,
+      // CoinGecko enrichment
+      cg_rank: cg?.market_cap_rank ?? null,
+      cg_change_7d_pct: cg?.change_7d_pct ?? null,
+      cg_ath_change_pct: cg?.ath_change_pct ?? null,
+      cg_sentiment_up_pct: cg?.sentiment_up_pct ?? null,
+      cg_categories: cg?.categories ?? null,
+      cg_description: cg?.description?.slice(0, 200) ?? null,
+      cg_scores: cg ? { overall: cg.coingecko_score, developer: cg.developer_score, liquidity: cg.liquidity_score } : null,
     });
   };
 
@@ -2297,14 +2503,25 @@ function runScoutDirect(portfolio, portfolioIntelligence = null) {
     `Portfolio: cash=$${portfolio?.cash_usd ?? 100000} positions=${Object.keys(portfolio?.positions || {}).length}`,
     ...macroLines,
     ...fundingLines,
-    `Token universe: ${data.tokenUniverse.length} tradeable tokens (stablecoins/wrapped assets excluded), ${data.tokenUniverse.filter(t => (t.liquidity_usd||0) > 5000).length} with liq>$5k`,
+    `Token universe: ${data.tokenUniverse.length} tradeable tokens (stablecoins/wrapped assets excluded), ${data.tokenUniverse.filter(t => (t.liquidity_usd||0) > 100000).length} with liq>$100k, ${data.tokenUniverse.filter(t => (t.market_cap_usd||0) > 2000000).length} with mcap>$2M`,
     `Story types in data (you must report all of these in stories_checked): ${allStoryTypes.join(", ")}`,
     `\n--- E3D AGENT CANDIDATES (primary signal — multi-story convergence, use these first) ---`,
     data.e3dCandidates.length ? data.e3dCandidates.map(formatCandidate).join("\n") : "none currently",
     `\n--- E3D THESES (structured investment theses — direction + conviction + price targets) ---`,
-    data.e3dTheses.filter(t => t?.direction === "LONG" || t?.direction === "long").length
-      ? data.e3dTheses.filter(t => t?.direction === "LONG" || t?.direction === "long").slice(0, 8).map(formatThesis).join("\n")
+    data.e3dTheses.filter(t => /^long$/i.test(t?.direction || "")).length
+      ? data.e3dTheses.filter(t => /^long$/i.test(t?.direction || "")).slice(0, 8).map(formatThesis).join("\n")
       : "none currently",
+    // CoinGecko deep context — shown for any thesis or flow token that has CG detail
+    ...(data.cgDetailMap?.size ? [
+      `\n--- COINGECKO RESEARCH (independent market data for thesis + top flow tokens) ---`,
+      ...[...data.cgDetailMap.entries()].map(([addr, cg]) => JSON.stringify({
+        address: addr, symbol: cg.symbol, rank: cg.market_cap_rank,
+        change_7d_pct: cg.change_7d_pct, change_30d_pct: cg.change_30d_pct,
+        ath_change_pct: cg.ath_change_pct, sentiment_up_pct: cg.sentiment_up_pct,
+        categories: cg.categories, description: cg.description?.slice(0, 200),
+        scores: { overall: cg.coingecko_score, developer: cg.developer_score, community: cg.community_score, liquidity: cg.liquidity_score },
+      })),
+    ] : []),
     `\n--- DISQUALIFIERS (exclude these addresses) ---`,
     ...disqualifierStories.map(([type, items]) => {
       const addrs = items.map((s) => cleanAddress(s?.meta?.token?.address || s?.primary_token || "")).filter(Boolean);
@@ -2321,14 +2538,21 @@ function runScoutDirect(portfolio, portfolioIntelligence = null) {
       return `${type} (${items.length}):\n${items.slice(0, 3).map(formatStory).join("\n")}`;
     }),
     buySignalStories.length + secondaryStories.length === 0 ? "none currently" : "",
+    `\n--- LATE SIGNALS — POST-PUMP (move already happened — DO NOT use as new entry trigger) ---`,
+    `These tokens have already moved. A MOVER/SURGE story means the crowd has arrived. Only relevant if you already hold the token (then it confirms momentum) or if combined with a fresh PRE-PUMP signal on the same token.`,
+    ...lateSignalStories.map(([type, items]) => {
+      return `${type} (${items.length}):\n${items.slice(0, 5).map(formatStory).join("\n")}`;
+    }),
+    lateSignalStories.length === 0 ? "none currently" : "",
     `\n--- TOKEN UNIVERSE (${data.tokenUniverse.length} tradeable tokens after filtering stablecoins/wrapped assets, sorted by ${data.sortLabel}) ---`,
     (() => {
       const withFlow = data.tokenUniverse.filter(t => t.flow_signal);
       const accum = withFlow.filter(t => t.flow_signal === "strong_accumulation" || t.flow_signal === "accumulation");
       const distrib = withFlow.filter(t => t.flow_signal === "strong_distribution" || t.flow_signal === "distribution");
+      const qualifiedFlow = accum.filter(t => (t.buy_sell_ratio_1h||0) >= 3.5 && (t.liquidity_usd||0) > 150000 && (t.volume_24h_usd||0) > 75000 && (t.market_cap_usd||0) > 5000000);
       return `Flow coverage: ${withFlow.length}/${data.tokenUniverse.length} tokens have DexScreener data. Accumulation signals: ${accum.length} tokens. Distribution signals: ${distrib.length} tokens.` +
-        (accum.length ? `\nFlow-based candidates (buy_sell_ratio_1h): ${accum.slice(0, 8).map(t => `${t.symbol}(${t.flow_signal},ratio=${t.buy_sell_ratio_1h},liq=$${(t.liquidity_usd||0).toFixed(0)})`).join(", ")}` : "") +
-        `\nPick tokens with story signal first; if E3D candidates/theses are empty, use strong_accumulation flow as TIER 3 entry (min liq $20k).`;
+        (accum.length ? `\nAccumulation tokens (buy_sell_ratio_1h): ${accum.slice(0, 8).map(t => `${t.symbol}(${t.flow_signal},ratio=${t.buy_sell_ratio_1h},liq=$${(t.liquidity_usd||0).toFixed(0)},mcap=$${((t.market_cap_usd||0)/1e6).toFixed(1)}M,vol24=$${((t.volume_24h_usd||0)/1e3).toFixed(0)}k)`).join(", ")}` : "") +
+        `\nFLOW-ONLY eligible (ratio>=3.5, liq>$150k, vol24>$75k, mcap>$5M): ${qualifiedFlow.length} tokens${qualifiedFlow.length ? " — " + qualifiedFlow.map(t => t.symbol).join(", ") : ""}. Use ONLY when E3D candidates AND theses are both empty. Max 1 pick.`;
     })(),
     JSON.stringify(data.tokenUniverse.slice(0, 100))
   ].join("\n");
@@ -2451,7 +2675,49 @@ function runScoutDirect(portfolio, portfolioIntelligence = null) {
         };
       }
     }
+
+    // CoinGecko deep research — fetch full detail for this candidate (use cached detail if available).
+    if (COINGECKO_API_KEY) {
+      const cgDetail = data.cgDetailMap?.get(addr) || fetchCoinGeckoDetail(addr);
+      if (cgDetail) {
+        data.cgDetailMap?.set(addr, cgDetail);
+        candidate._coingecko = {
+          market_cap_rank: cgDetail.market_cap_rank,
+          ath_change_pct: cgDetail.ath_change_pct,
+          change_7d_pct: cgDetail.change_7d_pct,
+          change_30d_pct: cgDetail.change_30d_pct,
+          sentiment_up_pct: cgDetail.sentiment_up_pct,
+          categories: cgDetail.categories,
+          description: cgDetail.description,
+          scores: {
+            overall: cgDetail.coingecko_score,
+            developer: cgDetail.developer_score,
+            community: cgDetail.community_score,
+            liquidity: cgDetail.liquidity_score,
+          },
+        };
+        log("scout_coingecko_detail", {
+          symbol: candidate?.token?.symbol,
+          rank: cgDetail.market_cap_rank,
+          ath_change_pct: cgDetail.ath_change_pct,
+          change_7d_pct: cgDetail.change_7d_pct,
+          sentiment_up_pct: cgDetail.sentiment_up_pct,
+        });
+      }
+    }
   }
+
+  // Hard pump filter: discard any candidate whose 7d gain exceeds 300% — it already pumped.
+  // This is a code-level safety net; the prompt instruction alone is not reliable enough.
+  const prePumpFilter = result.candidates || [];
+  result.candidates = prePumpFilter.filter(c => {
+    const change7d = c._coingecko?.change_7d_pct;
+    if (change7d != null && change7d > 300) {
+      log("scout_pump_filter", { symbol: c.token?.symbol, change_7d_pct: change7d });
+      return false;
+    }
+    return true;
+  });
 
   // Refresh held position prices from the universe fetched this cycle so Harvest
   // sees real unrealized P&L instead of $0 entry-price deltas.
@@ -2504,7 +2770,8 @@ function runHarvestDirect(portfolio, portfolioIntelligence = null) {
   const heldAddresses = positions.map((p) => cleanAddress(p?.contract_address || "")).filter(Boolean);
   const exitRiskTypes = ["LIQUIDITY_DRAIN", "WASH_TRADE", "SPREAD_WIDENING", "MOMENTUM_DIVERGENCE", "EXCHANGE_FLOW", "LOOP",
     "SECURITY_RISK", "RUG_LIQUIDITY_PULL"];
-  const holdConfirmTypes = ["ACCUMULATION", "SMART_MONEY", "MOVER", "SURGE", "FLOW", "CLUSTER"];
+  const holdConfirmTypes = ["ACCUMULATION", "SMART_MONEY", "FLOW", "CLUSTER", "STAGING", "FUNNEL"];
+  const pumpExhaustionTypes = ["MOVER", "SURGE"];
 
   const { allStories: cycleHarvestStories } = getOrFetchCycleMarketContext();
   const allHarvestStories = cycleHarvestStories || [];
@@ -2580,6 +2847,11 @@ function runHarvestDirect(portfolio, portfolioIntelligence = null) {
     "Classify every held position as hold, monitor, trim, or exit based on ALL available evidence.",
     "Only add a position to exit_candidates if action is trim or exit.",
     "",
+    "SIGNAL TIMING — know whether you're in the setup, the move, or the dump:",
+    "- PRE-PUMP HOLD CONFIRMS (bullish for holding): STAGING, CLUSTER, FUNNEL, ACCUMULATION, SMART_MONEY, FLOW — fresh accumulation means the thesis is intact.",
+    "- PUMP EXHAUSTION (exit signal): MOVER or SURGE story on a position that is declining = the pump narrative is over, you are now in the dump phase. EXIT unless a fresh ACCUMULATION/SMART_MONEY story ALSO exists for this token.",
+    "- If a position has _coingecko.change_7d_pct > 200% AND is now down from entry: the pump happened before entry. Exit — there is no thesis, only a late buy into a pump.",
+    "",
     "QUANT EXIT SIGNALS — apply these to every position:",
     "- flow_signal=strong_distribution or distribution: bearish order flow — lean toward trim or exit unless strong hold-confirm story exists",
     "- flow_signal=strong_accumulation or accumulation: bullish order flow — lean toward hold; only exit if story evidence is strong",
@@ -2615,8 +2887,13 @@ function runHarvestDirect(portfolio, portfolioIntelligence = null) {
       const matches = storyMatches[type] || [];
       return `${type}: ${matches.length} matches — ${JSON.stringify(matches.slice(0, 3))}`;
     }),
-    `\n--- HOLD CONFIRM SIGNALS ---`,
+    `\n--- HOLD CONFIRM SIGNALS (fresh accumulation = thesis intact) ---`,
     ...holdConfirmTypes.map((type) => {
+      const matches = storyMatches[type] || [];
+      return `${type}: ${matches.length} matches — ${JSON.stringify(matches.slice(0, 3))}`;
+    }),
+    `\n--- PUMP EXHAUSTION SIGNALS (MOVER/SURGE on a declining position = dump phase, consider exit) ---`,
+    ...pumpExhaustionTypes.map((type) => {
       const matches = storyMatches[type] || [];
       return `${type}: ${matches.length} matches — ${JSON.stringify(matches.slice(0, 3))}`;
     })
@@ -2785,6 +3062,8 @@ POSITION REVIEW RULES:
 Current held positions (use these for position fields in your output):
 ${JSON.stringify(positions)}
 
+CRITICAL: You MUST produce exactly ${positions.length} entries in position_reviews — one for every position listed above. Do not stop or close the JSON until all ${positions.length} positions have been reviewed.
+
 Return EXACTLY this shape — one JSON object, no markdown:
 {
   "scan_timestamp": "${createdAt}",
@@ -2821,12 +3100,14 @@ Return EXACTLY this shape — one JSON object, no markdown:
       "narrative_data": { "story_strength": number(0-100), "thesis_health": number(0-100), "flow_direction": string },
       "portfolio_data": { "current_token_exposure_pct": number, "current_category_exposure_pct": number, "current_total_exposure_pct": number, "portfolio_timestamp": string, "portfolio_source": "system" }
     }
+  ],
+  "stories_checked": [
+    { "type": string, "found": number, "flagged_addresses": string[] }
   ]
 }
 
 RULES: position_reviews covers every held position — exit_candidates only for trim/exit — valid lowercase addresses — one object only.
-Include a top-level "stories_checked" array listing every story type you fetched, with "found" count and any "flagged_addresses" that influenced your decision. This is required for audit.
-Example: [{"type":"LIQUIDITY_DRAIN","found":2,"flagged_addresses":["0x..."]},{"type":"ACCUMULATION","found":0,"flagged_addresses":[]}]
+stories_checked must include one entry per story type endpoint you fetched (all of them), with "found" = count of stories returned and "flagged_addresses" = addresses that matched a held position.
 `.trim();
 
   return taskPrompt.trim();
@@ -3526,6 +3807,409 @@ function buildSummary(portfolio, approvedCount, rejectedCount) {
   };
 }
 
+function normalizeCoveragePct(value) {
+  const num = toNum(value, NaN);
+  if (!Number.isFinite(num)) return null;
+  return num > 1 ? num / 100 : num;
+}
+
+function gradeFromScore(score) {
+  if (score >= 90) return "A";
+  if (score >= 75) return "B";
+  if (score >= 60) return "C";
+  if (score >= 45) return "D";
+  return "F";
+}
+
+function scoreFromFlags(flags) {
+  return Math.max(0, 100 - (flags || []).reduce((total, flag) => {
+    if (flag.severity === "critical") return total + 20;
+    if (flag.severity === "warning") return total + 8;
+    if (flag.severity === "info") return total + 2;
+    return total;
+  }, 0));
+}
+
+function pushManagerFlag(flags, severity, agent, code, message) {
+  flags.push({ severity, agent, code, message });
+}
+
+function summarizeManagerSummary(report) {
+  const criticalFlags = report.flags.filter((flag) => flag.severity === "critical").length;
+  const warningFlags = report.flags.filter((flag) => flag.severity === "warning").length;
+  if (criticalFlags > 0) {
+    return `Cycle finished with ${criticalFlags} critical flag${criticalFlags === 1 ? "" : "s"} and ${warningFlags} warning${warningFlags === 1 ? "" : "s"}.`;
+  }
+  if (warningFlags > 0) {
+    return `Cycle was mostly healthy with ${warningFlags} warning${warningFlags === 1 ? "" : "s"} and no critical issues.`;
+  }
+  return "Clean cycle with no critical issues detected.";
+}
+
+function writeManagerReportFile(report) {
+  const cycleIdShort = String(report.cycle_id || report.report_id || "cycle").slice(0, 4);
+  const reportFileName = `cycle-${formatReportTimestamp(new Date(report.generated_at || Date.now()))}-${cycleIdShort}.json`;
+  const reportFilePath = path.join(REPORTS_DIR, reportFileName);
+  fs.writeFileSync(reportFilePath, `${JSON.stringify({ ...report, report_file: path.join("reports", reportFileName) }, null, 2)}\n`, "utf8");
+  return path.join("reports", reportFileName);
+}
+
+function recordManagerReportEvent(report, context, portfolio) {
+  const record = buildTrainingEventRecord("manager_report", "manager", portfolio, context, {
+    report_id: report.report_id,
+    overall_grade: report.overall_grade,
+    overall_score: report.overall_score,
+    critical_flags: report.critical_flags,
+    warning_flags: report.warning_flags,
+    report_file: report.report_file
+  });
+  appendTrainingEvent(record);
+  return record;
+}
+
+function buildManagerReport(cycleState, portfolio) {
+  const reportId = crypto.randomUUID();
+  const generatedAt = nowIso();
+  const cycleStart = new Date(cycleState.cycle_start_ts || generatedAt).getTime();
+  const cycleEnd = new Date(cycleState.cycle_end_ts || generatedAt).getTime();
+  const cycleDurationSeconds = Math.max(0, Math.round((cycleEnd - cycleStart) / 1000));
+
+  const scout = cycleState.scout_result || {};
+  const harvest = cycleState.harvest_result || {};
+  const scoutCoverage = normalizeCoveragePct(cycleState.scout_coverage?.coverage_pct);
+  const harvestCoverage = normalizeCoveragePct(cycleState.harvest_coverage?.coverage_pct);
+  const scoutMeta = cycleState.scout_llm_meta || getLastLLMMeta("scout") || {};
+  const harvestMeta = cycleState.harvest_llm_meta || getLastLLMMeta("harvest") || {};
+  const riskDecisions = Array.isArray(cycleState.risk_decisions) ? cycleState.risk_decisions : [];
+  const executorDecisions = Array.isArray(cycleState.executor_decisions) ? cycleState.executor_decisions : [];
+  const buys = Array.isArray(cycleState.cycle_actions?.buys) ? cycleState.cycle_actions.buys : [];
+  const sells = Array.isArray(cycleState.cycle_actions?.sells) ? cycleState.cycle_actions.sells : [];
+  const rotations = Array.isArray(cycleState.cycle_actions?.rotations) ? cycleState.cycle_actions.rotations : [];
+  const portfolioSnapshot = cycleState.portfolio_snapshot || {};
+  const pipelineLogEntries = Array.isArray(cycleState.pipeline_log_entries) ? cycleState.pipeline_log_entries : [];
+  const cycleTrainingEvents = Array.isArray(cycleState.cycle_training_events) ? cycleState.cycle_training_events : [];
+
+  const scoutFlags = [];
+  const scoutCandidates = Array.isArray(scout.candidates) ? scout.candidates : [];
+  const scoutCoverageField = scoutCoverage;
+  const scoutCoveragePct = scoutCoverageField ?? 0;
+  const scoutStoriesChecked = Array.isArray(scout.stories_checked) ? scout.stories_checked : [];
+  const scoutStoryTypes = new Set(scoutStoriesChecked.map((story) => String(story?.type || story?.story_type || story || "").toUpperCase()).filter(Boolean));
+  const scoutCandidatesWithFullEvidence = scoutCandidates.filter((candidate) => Array.isArray(candidate?.evidence) && candidate.evidence.length >= 3).length;
+
+  if (!Array.isArray(scout.candidates)) {
+    pushManagerFlag(scoutFlags, "critical", "scout", "SCOUT_OUTPUT_INVALID", "Scout output is missing a candidates array.");
+  }
+  if (scoutCoverageField == null || scoutCoverageField < 0.85) {
+    pushManagerFlag(scoutFlags, "warning", "scout", "SCOUT_LOW_COVERAGE", `Scout story coverage is ${Math.round((scoutCoverageField || 0) * 100)}%.`);
+  }
+  if (["WASH_TRADE", "LOOP", "LIQUIDITY_DRAIN"].some((type) => !scoutStoryTypes.has(type))) {
+    pushManagerFlag(scoutFlags, "critical", "scout", "SCOUT_MISSING_DISQUALIFIERS", "Scout did not sweep all required disqualifier story types.");
+  }
+  if (scoutCandidates.some((candidate) => toNum(candidate?.fraud_risk, 0) >= 35)) {
+    pushManagerFlag(scoutFlags, "warning", "scout", "SCOUT_HIGH_FRAUD_CANDIDATE", "Scout surfaced at least one candidate with fraud risk at or above the risk gate.");
+  }
+  if (scoutCandidates.some((candidate) => (Array.isArray(candidate?.evidence) ? candidate.evidence.length : 0) < 3)) {
+    pushManagerFlag(scoutFlags, "warning", "scout", "SCOUT_THIN_EVIDENCE", "At least one Scout candidate had fewer than three evidence items.");
+  }
+  if (String(scoutMeta.finish_reason || "").toLowerCase() === "length") {
+    pushManagerFlag(scoutFlags, "critical", "scout", "SCOUT_LLM_TRUNCATED", "Scout LLM response was truncated.");
+  }
+  if (scoutMeta.error) {
+    pushManagerFlag(scoutFlags, "critical", "scout", "SCOUT_LLM_ERROR", "Scout LLM call failed.");
+  }
+  if (toNum(scoutMeta.total_tokens, 0) >= 5800) {
+    pushManagerFlag(scoutFlags, "warning", "scout", "SCOUT_LLM_TOKENS_HIGH", "Scout used an unusually large token budget.");
+  }
+
+  const harvestFlags = [];
+  const harvestPositions = Array.isArray(harvest.position_reviews) ? harvest.position_reviews : [];
+  const harvestCandidates = Array.isArray(harvest.exit_candidates) ? harvest.exit_candidates : [];
+  const harvestStoriesChecked = Array.isArray(harvest.stories_checked) ? harvest.stories_checked : [];
+  const harvestStoryTypes = new Set(harvestStoriesChecked.map((story) => String(story?.type || story?.story_type || story || "").toUpperCase()).filter(Boolean));
+  const positionsHeld = toNum(portfolioSnapshot.position_count, Object.keys(portfolio?.positions || {}).length);
+  const positionsReviewed = harvestPositions.length || toNum(harvest?.portfolio_summary?.position_count, 0);
+  const exitsWithEvidence = harvestCandidates.filter((candidate) => Array.isArray(candidate?.evidence) && candidate.evidence.length >= 2).length;
+
+  if (!Array.isArray(harvest.position_reviews)) {
+    pushManagerFlag(harvestFlags, "critical", "harvest", "HARVEST_OUTPUT_INVALID", "Harvest output is missing position reviews.");
+  }
+  if (harvestCoverage == null || harvestCoverage < 0.85) {
+    pushManagerFlag(harvestFlags, "warning", "harvest", "HARVEST_LOW_COVERAGE", `Harvest story coverage is ${Math.round((harvestCoverage || 0) * 100)}%.`);
+  }
+  if (positionsReviewed < positionsHeld) {
+    pushManagerFlag(harvestFlags, "critical", "harvest", "HARVEST_INCOMPLETE_REVIEWS", "Not every held position was reviewed by Harvest.");
+  }
+  if (["LIQUIDITY_DRAIN", "RUG_LIQUIDITY_PULL", "SPREAD_WIDENING", "CONCENTRATION_SHIFT"].some((type) => !harvestStoryTypes.has(type))) {
+    pushManagerFlag(harvestFlags, "warning", "harvest", "HARVEST_MISSING_EXIT_SWEEPS", "Harvest did not sweep all required exit-risk story types.");
+  }
+  if (harvestCandidates.some((candidate) => (Array.isArray(candidate?.evidence) ? candidate.evidence.length : 0) < 2)) {
+    pushManagerFlag(harvestFlags, "warning", "harvest", "HARVEST_THIN_EVIDENCE", "At least one Harvest exit candidate had fewer than two evidence items.");
+  }
+  if (harvestCandidates.some((candidate) => {
+    const frac = toNum(candidate?.suggested_exit_fraction, 0);
+    return frac <= 0 || frac > 1;
+  })) {
+    pushManagerFlag(harvestFlags, "critical", "harvest", "HARVEST_INVALID_EXIT_FRACTION", "Harvest proposed an invalid exit fraction.");
+  }
+  if (harvestCandidates.some((candidate) => {
+    const frac = toNum(candidate?.suggested_exit_fraction, 0);
+    return frac > 0 && frac < 0.1;
+  })) {
+    pushManagerFlag(harvestFlags, "warning", "harvest", "HARVEST_WEAK_EXIT_FRACTION", "At least one Harvest exit fraction was below the preferred threshold.");
+  }
+  if (positionsHeld > 0 && (harvestCandidates.length / positionsHeld) > 0.5) {
+    pushManagerFlag(harvestFlags, "warning", "harvest", "HARVEST_MASS_EXIT_SIGNAL", "Harvest proposed exits on more than half of the held book.");
+  }
+  if (String(harvestMeta.finish_reason || "").toLowerCase() === "length") {
+    pushManagerFlag(harvestFlags, "critical", "harvest", "HARVEST_LLM_TRUNCATED", "Harvest LLM response was truncated.");
+  }
+  if (harvestMeta.error) {
+    pushManagerFlag(harvestFlags, "critical", "harvest", "HARVEST_LLM_ERROR", "Harvest LLM call failed.");
+  }
+  if (toNum(harvestMeta.total_tokens, 0) >= 5800) {
+    pushManagerFlag(harvestFlags, "warning", "harvest", "HARVEST_LLM_TOKENS_HIGH", "Harvest used an unusually large token budget.");
+  }
+
+  const riskFlags = [];
+  const riskApproved = riskDecisions.filter((record) => {
+    const review = record?.payload?.risk_review || record?.payload?.risk || {};
+    const decision = String(review?.decision || record?.payload?.decision || "").toLowerCase();
+    return decision === "approve_for_executor" || record?.payload?.handoff_to_executor === true;
+  });
+  const riskRejected = riskDecisions.filter((record) => !riskApproved.includes(record));
+  const riskApprovalRate = riskDecisions.length ? riskApproved.length / riskDecisions.length : 0;
+  const paperMode = Boolean(portfolio?.settings?.paper_mode);
+
+  if (riskDecisions.length < scoutCandidates.length) {
+    pushManagerFlag(riskFlags, "critical", "risk", "RISK_INCOMPLETE_DECISIONS", "Risk did not evaluate every Scout candidate.");
+  }
+  if (riskDecisions.some((record) => {
+    const review = record?.payload?.risk_review || record?.payload?.risk || {};
+    const reasonCodes = Array.isArray(review?.reason_codes) ? review.reason_codes : [];
+    return reasonCodes.length === 0;
+  })) {
+    pushManagerFlag(riskFlags, "warning", "risk", "RISK_ZERO_REASON_CODES", "At least one Risk decision had no reason codes.");
+  }
+  if (riskDecisions.some((record) => {
+    const review = record?.payload?.risk_review || record?.payload?.risk || {};
+    const decision = String(review?.decision || "").toLowerCase();
+    return paperMode && decision === "approve_for_executor";
+  })) {
+    pushManagerFlag(riskFlags, "critical", "risk", "RISK_LIVE_APPROVAL_IN_PAPER", "Risk approved a live execution path while paper mode is enabled.");
+  }
+  if (riskDecisions.some((record) => {
+    const review = record?.payload?.risk_review || record?.payload?.risk || {};
+    const proposal = record?.payload?.proposal || {};
+    const approved = String(review?.decision || "").toLowerCase() === "approve_for_executor" || record?.payload?.handoff_to_executor === true;
+    return approved && (toNum(review?.fraud_risk, toNum(proposal?.fraud_risk, 0)) >= 35 || toNum(review?.confidence, toNum(proposal?.confidence, 0)) <= 55);
+  })) {
+    pushManagerFlag(riskFlags, "critical", "risk", "RISK_HARD_LIMIT_MISS", "Risk approved a candidate that breached a hard limit.");
+  }
+  if (riskApprovalRate > 0.6) {
+    pushManagerFlag(riskFlags, "warning", "risk", "RISK_APPROVAL_RATE_HIGH", "Risk approval rate is above the preferred ceiling.");
+  }
+  if (riskApprovalRate === 0 && riskDecisions.length >= 3) {
+    pushManagerFlag(riskFlags, "info", "risk", "RISK_APPROVAL_RATE_LOW", "Risk approvals were zero for this cycle.");
+  }
+
+  const executorFlags = [];
+  const executorApprovedCount = executorDecisions.filter((record) => {
+    const review = record?.payload?.review || {};
+    const decision = String(review?.executor_decision || review?.decision || record?.payload?.decision || "").toLowerCase();
+    return ["paper_trade", "approve_live", "reduce_size"].includes(decision);
+  }).length;
+  const executorRejected = executorDecisions.filter((record) => {
+    const review = record?.payload?.review || {};
+    const decision = String(review?.executor_decision || review?.decision || record?.payload?.decision || "").toLowerCase();
+    return !["paper_trade", "approve_live", "reduce_size"].includes(decision);
+  });
+
+  if (executorDecisions.length < riskApproved.length) {
+    pushManagerFlag(executorFlags, "critical", "executor", "EXECUTOR_INCOMPLETE_DECISIONS", "Executor did not review every Risk-approved candidate.");
+  }
+  if (executorRejected.some((record) => Array.isArray(record?.payload?.review?.blocker_list) && record.payload.review.blocker_list.length === 0)) {
+    pushManagerFlag(executorFlags, "warning", "executor", "EXECUTOR_MISSING_BLOCKERS", "At least one Executor reject lacked blocker details.");
+  }
+  if (executorDecisions.some((record) => {
+    const review = record?.payload?.review || {};
+    return Array.isArray(review?.paper_trade_ticket)
+      ? false
+      : String(review?.executor_decision || review?.decision || record?.payload?.decision || "").toLowerCase() === "paper_trade" && (!review?.paper_trade_ticket && !record?.payload?.paper_trade_ticket);
+  })) {
+    pushManagerFlag(executorFlags, "critical", "executor", "EXECUTOR_INVALID_TICKET", "At least one Executor paper trade was missing ticket details.");
+  }
+  if (paperMode && executorDecisions.some((record) => String(record?.payload?.review?.live_execution_allowed ?? record?.payload?.live_execution_allowed ?? false) === "true")) {
+    pushManagerFlag(executorFlags, "critical", "executor", "EXECUTOR_LIVE_TRADE_IN_PAPER", "Executor allowed live execution while paper mode is enabled.");
+  }
+
+  const pipelineFlags = [];
+  const currentEquity = toNum(portfolioSnapshot.equity_usd, toNum(cycleState.stats?.equity_usd, 0));
+  const previousCycleEnd = [...cycleTrainingEvents].reverse().find((record) => record.event_type === "cycle_end" && record.cycle_id !== cycleState.cycle_id);
+  const previousEquity = toNum(previousCycleEnd?.payload?.stats?.equity_usd, toNum(previousCycleEnd?.payload?.portfolio_snapshot?.equity_usd, currentEquity));
+  const equityDropPct = previousEquity > 0 ? (previousEquity - currentEquity) / previousEquity : 0;
+  const apiResponses = pipelineLogEntries.filter((entry) => String(entry.stage || "").startsWith("e3d_api_")).length;
+  const apiErrors = pipelineLogEntries.filter((entry) => entry.stage === "e3d_api_error").length;
+  const apiErrorRate = apiResponses > 0 ? apiErrors / apiResponses : 0;
+  const llmMetaValues = [scoutMeta, harvestMeta].filter(Boolean);
+
+  if (cycleDurationSeconds > 300) {
+    pushManagerFlag(pipelineFlags, "warning", "pipeline", "PIPELINE_SLOW_CYCLE", "The cycle exceeded the target duration.");
+  }
+  if (llmMetaValues.some((meta) => String(meta.finish_reason || "").toLowerCase() === "length")) {
+    pushManagerFlag(pipelineFlags, "critical", "pipeline", "PIPELINE_LLM_ERROR", "At least one pipeline LLM call was truncated.");
+  }
+  if (llmMetaValues.some((meta) => meta.error)) {
+    pushManagerFlag(pipelineFlags, "critical", "pipeline", "PIPELINE_LLM_ERROR", "At least one pipeline LLM call failed.");
+  }
+  if (apiErrorRate > 0.05) {
+    pushManagerFlag(pipelineFlags, "warning", "pipeline", "PIPELINE_API_ERROR_RATE", "Pipeline API error rate is above the target ceiling.");
+  }
+  if (equityDropPct > 0.05) {
+    pushManagerFlag(pipelineFlags, "critical", "pipeline", "PIPELINE_EQUITY_DROP", "Portfolio equity dropped by more than 5% in one cycle.");
+  }
+  if (cycleState.market_regime && cycleState.fear_greed_value != null) {
+    const fearGreed = toNum(cycleState.fear_greed_value, null);
+    if (Number.isFinite(fearGreed) && fearGreed <= 25 && cycleState.market_regime !== "risk_off") {
+      pushManagerFlag(pipelineFlags, "info", "pipeline", "PIPELINE_REGIME_MISMATCH", "Fear and greed was extreme fear, but the market regime did not shift to risk_off.");
+    }
+  }
+
+  const scoutScore = scoreFromFlags(scoutFlags);
+  const harvestScore = scoreFromFlags(harvestFlags);
+  const riskScore = scoreFromFlags(riskFlags);
+  const executorScore = scoreFromFlags(executorFlags);
+  const pipelineScore = scoreFromFlags(pipelineFlags);
+  const overallScore = Math.round(
+    (scoutScore * 0.25)
+    + (harvestScore * 0.25)
+    + (riskScore * 0.25)
+    + (executorScore * 0.15)
+    + (pipelineScore * 0.10)
+  );
+
+  const report = {
+    report_id: reportId,
+    generated_at: generatedAt,
+    cycle_id: cycleState.cycle_id || null,
+    pipeline_run_id: cycleState.pipeline_run_id || null,
+    cycle_index: cycleState.cycle_index ?? null,
+    cycle_duration_seconds: cycleDurationSeconds,
+    market_regime: cycleState.market_regime || portfolio?.stats?.market_regime || "unknown",
+    fear_greed_value: cycleState.fear_greed_value ?? null,
+    overall_grade: gradeFromScore(overallScore),
+    overall_score: overallScore,
+    summary: "",
+    flags: [...scoutFlags, ...harvestFlags, ...riskFlags, ...executorFlags, ...pipelineFlags],
+    agents: {
+      scout: {
+        grade: gradeFromScore(scoutScore),
+        score: scoutScore,
+        coverage_pct: scoutCoveragePct,
+        candidates_proposed: scoutCandidates.length,
+        candidates_with_full_evidence: scoutCandidatesWithFullEvidence,
+        llm_finish_reason: scoutMeta.finish_reason || null,
+        llm_tokens: scoutMeta.total_tokens ?? null,
+        llm_duration_ms: scoutMeta.duration_ms ?? null,
+        flags: scoutFlags
+      },
+      harvest: {
+        grade: gradeFromScore(harvestScore),
+        score: harvestScore,
+        coverage_pct: harvestCoverage,
+        positions_reviewed: positionsReviewed,
+        positions_held: positionsHeld,
+        exit_candidates: harvestCandidates.length,
+        exits_with_evidence: exitsWithEvidence,
+        llm_finish_reason: harvestMeta.finish_reason || null,
+        llm_tokens: harvestMeta.total_tokens ?? null,
+        llm_duration_ms: harvestMeta.duration_ms ?? null,
+        flags: harvestFlags
+      },
+      risk: {
+        grade: gradeFromScore(riskScore),
+        score: riskScore,
+        decisions_made: riskDecisions.length,
+        approved: riskApproved.length,
+        rejected: riskRejected.length,
+        approval_rate: Number(riskApprovalRate.toFixed(2)),
+        hard_limit_breaches_caught: riskFlags.filter((flag) => flag.code === "RISK_HARD_LIMIT_MISS").length,
+        quant_gates_fired: riskDecisions.flatMap((record) => Array.isArray(record?.payload?.risk_review?.reason_codes) ? record.payload.risk_review.reason_codes : []).filter(Boolean),
+        flags: riskFlags
+      },
+      executor: {
+        grade: gradeFromScore(executorScore),
+        score: executorScore,
+        decisions_made: executorDecisions.length,
+        paper_trades_recorded: buys.length + sells.length + rotations.length,
+        live_execution_allowed: false,
+        flags: executorFlags
+      },
+      pipeline: {
+        grade: gradeFromScore(pipelineScore),
+        score: pipelineScore,
+        cycle_duration_seconds: cycleDurationSeconds,
+        llm_errors: llmMetaValues.filter((meta) => meta.error || String(meta.finish_reason || "").toLowerCase() === "length").length,
+        api_error_rate: Number(apiErrorRate.toFixed(2)),
+        equity_delta_pct: Number((equityDropPct * 100).toFixed(2)),
+        rotation_executed: rotations.length > 0,
+        flags: pipelineFlags
+      }
+    },
+    portfolio_snapshot: {
+      cash_usd: portfolioSnapshot.cash_usd ?? null,
+      equity_usd: portfolioSnapshot.equity_usd ?? null,
+      position_count: portfolioSnapshot.position_count ?? null,
+      realized_pnl_usd: portfolioSnapshot.realized_pnl_usd ?? null,
+      unrealized_pnl_usd: portfolioSnapshot.unrealized_pnl_usd ?? null,
+      max_drawdown_pct: portfolioSnapshot.max_drawdown_pct ?? null
+    },
+    cycle_actions: {
+      buys: buys.map((trade) => ({
+        symbol: trade?.token?.symbol || trade?.symbol || trade?.candidate?.token?.symbol || null,
+        size_usd: toNum(trade?.paper_trade_ticket?.allocation_usd, toNum(trade?.allocation_usd, 0)),
+        decision: trade?.paper_trade_ticket?.executor_decision || trade?.executor_decision || "paper_trade",
+        conviction: toNum(trade?.candidate?.conviction_score, toNum(trade?.conviction_score, null))
+      })),
+      sells: sells.map((trade) => ({
+        symbol: trade?.symbol || trade?.token?.symbol || null,
+        size_usd: toNum(trade?.paper_trade_ticket?.allocation_usd, toNum(trade?.proceeds_usd, 0)),
+        decision: trade?.paper_trade_ticket?.executor_decision || trade?.side || "paper_trade"
+      })),
+      rotations: rotations.map((item) => ({
+        from_symbol: item?.from_symbol || item?.action?.from_symbol || null,
+        to_symbol: item?.to_symbol || item?.action?.to_candidate?.token?.symbol || null,
+        decision: item?.executor_decision || item?.action?.decision || null
+      }))
+    }
+  };
+
+  report.summary = summarizeManagerSummary(report);
+  report.critical_flags = report.flags.filter((flag) => flag.severity === "critical").length;
+  report.warning_flags = report.flags.filter((flag) => flag.severity === "warning").length;
+  report.report_file = writeManagerReportFile(report);
+  return report;
+}
+
+function runManagerDirect(cycleState, portfolio) {
+  const report = buildManagerReport(cycleState, portfolio);
+  recordManagerReportEvent(report, {
+    pipeline_run_id: cycleState.pipeline_run_id || null,
+    cycle_id: cycleState.cycle_id || null,
+    cycle_index: cycleState.cycle_index ?? null,
+    market_regime: cycleState.market_regime || portfolio?.stats?.market_regime || "unknown"
+  }, portfolio);
+  log("manager_report", {
+    report_id: report.report_id,
+    overall_grade: report.overall_grade,
+    overall_score: report.overall_score,
+    critical_flags: report.critical_flags,
+    warning_flags: report.warning_flags,
+    report_file: report.report_file
+  });
+  return report;
+}
+
 function buildDebugHandoffSnapshot(portfolio, portfolioIntelligence, runContext = {}) {
   const scoutIntel = fetchScoutIntelDebug(portfolioIntelligence);
   const scoutCandidateDebug = buildScoutCandidateDebug(portfolio, scoutIntel);
@@ -3556,10 +4240,12 @@ function buildDebugHandoffSnapshot(portfolio, portfolioIntelligence, runContext 
 
 async function runCycle(runContext = {}) {
   console.log(`\n🚀 Starting pipeline at ${nowIso()}\n`);
+  const cycleStartTs = nowIso();
 
   // Reset per-cycle state
   _cycleMarketContext = null;
   _cycleQuantContext = null;
+  _cycleAvailableStoryTypes = null;
 
   const portfolio = loadPortfolio();
   pruneCooldowns(portfolio);
@@ -3804,6 +4490,65 @@ async function runCycle(runContext = {}) {
       approved_count: approved.length,
       rejected_count: rejected.length,
       portfolio_intelligence: portfolioIntelligence.prompt_snapshot
+    });
+
+    const cycleEndTs = nowIso();
+    const cycleTrainingEvents = readJsonLines(TRAINING_EVENT_LOG, 1000).filter((record) => record.cycle_id === trainingContext.cycle_id);
+    const cyclePipelineLogEntries = [
+      { stage: "quant_context", data: { macro_regime: _cycleQuantContext?.macro?.regime, new_positions_ok: _cycleQuantContext?.macro?.new_positions_ok, tighten_stops: _cycleQuantContext?.macro?.tighten_stops } },
+      { stage: "scout", data: scoutPayload },
+      { stage: "agent_coverage", data: buildAgentCoverageLog("scout", scoutPayload) },
+      { stage: "sell_trades", data: sellTrades },
+      { stage: "harvest", data: harvestPayload },
+      { stage: "agent_coverage", data: buildAgentCoverageLog("harvest", harvestPayload) },
+      { stage: "harvest_approved", data: harvestApproved },
+      { stage: "harvest_rejected", data: harvestRejected },
+      { stage: "executor_exit", data: harvestReviews },
+      { stage: "harvest_trades", data: harvestTrades },
+      { stage: "risk_approved", data: approved },
+      { stage: "risk_rejected", data: rejected },
+      { stage: "market_regime", data: marketRegime },
+      { stage: "executor_rotation", data: rotationReviews },
+      { stage: "rotations", data: rotationResults },
+      { stage: "executor_buy", data: buyReviews },
+      { stage: "buy_trades", data: buyTrades },
+      { stage: "stats", data: stats }
+    ];
+    const managerReport = runManagerDirect({
+      ...trainingContext,
+      cycle_start_ts: cycleStartTs,
+      cycle_end_ts: cycleEndTs,
+      scout_result: scoutPayload,
+      scout_coverage: buildAgentCoverageLog("scout", scoutPayload),
+      scout_llm_meta: getLastLLMMeta("scout"),
+      harvest_result: harvestPayload,
+      harvest_coverage: buildAgentCoverageLog("harvest", harvestPayload),
+      harvest_llm_meta: getLastLLMMeta("harvest"),
+      risk_decisions: cycleTrainingEvents.filter((record) => record.event_type === "risk_decision"),
+      executor_decisions: cycleTrainingEvents.filter((record) => record.event_type === "executor_decision"),
+      cycle_actions: {
+        buys: buyTrades,
+        sells: [...sellTrades, ...harvestTrades],
+        rotations: rotationResults
+      },
+      portfolio_snapshot: {
+        cash_usd: portfolio.cash_usd,
+        equity_usd: stats.equity_usd,
+        position_count: Object.keys(portfolio.positions || {}).length,
+        realized_pnl_usd: stats.realized_pnl_usd,
+        unrealized_pnl_usd: stats.unrealized_pnl_usd,
+        max_drawdown_pct: stats.max_drawdown_pct
+      },
+      pipeline_log_entries: cyclePipelineLogEntries,
+      cycle_training_events: cycleTrainingEvents,
+      market_regime: trainingContext.market_regime,
+      fear_greed_value: _cycleQuantContext?.macro?.fear_greed?.value ?? null
+    }, portfolio);
+    log("manager", {
+      report_id: managerReport.report_id,
+      overall_grade: managerReport.overall_grade,
+      overall_score: managerReport.overall_score,
+      report_file: managerReport.report_file
     });
   } finally {
     setTrainingContext(null);
