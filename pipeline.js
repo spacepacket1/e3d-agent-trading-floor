@@ -2178,21 +2178,13 @@ function fetchScoutData() {
   }
   log("scout_story_enrichment", { queued: enrichQueue.length, added: tokenUniverse.length - tokenUniverseAll.length + tokenUniverseAll.filter(t => nonTradeablePattern.test(t.symbol || "")).length });
 
-  // Filter universe to only tokens that appear in at least one story.
-  // Tokens with no story backing are noise — Scout should only consider tokens
-  // where there is on-chain evidence, not just volume ranking.
-  const allStoryAddresses = new Set();
-  for (const items of Object.values(stories)) {
-    for (const s of (items || [])) {
-      const addr = cleanAddress(s?.meta?.token_address || s?.primary_token || s?.address || "");
-      if (addr) allStoryAddresses.add(addr);
-    }
-  }
-  const tokenUniverseWithStories = tokenUniverse.filter(t => t.address && allStoryAddresses.has(t.address));
+  // Filter universe to only tokens with at least one story in the last hour.
+  // story_count_1h comes from the storyCount field on the price fetch — it is
+  // authoritative and avoids address-space mismatches with the stories API feed.
+  const tokenUniverseWithStories = tokenUniverse.filter(t => t.address && (t.story_count_1h || 0) > 0);
   log("scout_universe_filter", {
     before: tokenUniverse.length,
     after: tokenUniverseWithStories.length,
-    story_addresses: allStoryAddresses.size,
   });
   // Replace the working universe with the filtered set.
   tokenUniverse.length = 0;
