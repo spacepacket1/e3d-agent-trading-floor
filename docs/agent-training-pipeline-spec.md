@@ -52,16 +52,25 @@ Training data comes from three sources, blended together.
 
 **What it teaches**: The core scout rules in isolation.
 
+**Token universe behavior** (as of April 2026):
+- Universe is fetched with `sortBy=storyCount&trendInterval=1H&sortDir=desc` — freshest story activity first.
+- Universe is filtered to story-backed tokens only. Tokens with no story in the last cycle are excluded.
+- Each token carries `story_count_1h` — the number of stories fired on it in the last hour.
+- Pre-pump story types that enrich the universe: STAGING, CLUSTER, FUNNEL, DISCOVERY, HOTLINKS, NEW_WALLETS, DEEP_DIVE, SMART_STAGING, WHALE, ACCUMULATION, SMART_MONEY, STEALTH_ACCUMULATION, BREAKOUT_CONFIRMED, THESIS.
+- Post-pump types (MOVER, SURGE) are shown as LATE SIGNALS only — never buy triggers.
+
 **Examples**:
 - MOVER story + 581k% 7d gain → `candidates: []`, reason: post-pump disqualified
-- STAGING story + price flat + liq $500k + mcap $8M → TIER 2 candidate
-- CLUSTER + ACCUMULATION on same token + change_24h < 5% → TIER 1 multi-signal convergence
+- STAGING story + price flat + liq $500k + mcap $8M + story_count_1h=3 → TIER 2 candidate
+- CLUSTER + ACCUMULATION on same token + change_24h < 5% + story_count_1h=5 → TIER 1 multi-signal convergence
+- Token has story_count_1h=0, not in story address set → excluded from universe, cannot be proposed
 - Thesis conviction 72, LONG, in universe → propose despite no flow signal
 - FLOW-ONLY trigger with ratio 2.1 (below 3.5 threshold) → skip, threshold not met
 - liquidity $45k, mcap $800k → quality gate failure, skip
 - WASH_TRADE disqualifier on candidate → skip regardless of other signals
+- DISCOVERY story on new token + story_count_1h=2 + in_token_universe=true → valid pre-pump candidate
 
-**Volume**: ~300–500 examples. Regenerated only when prompt rules change.
+**Volume**: ~300–500 examples. Regenerated when prompt rules change or token universe logic changes.
 
 **Script**: `generate_synthetic_training_data.py --agent scout`
 
@@ -88,7 +97,7 @@ position outcome   → P&L when position closed (win/loss/neutral)
 - `risk_approved` + `realized_pnl_pct <= -8%` at close → negative: scout proposed, it lost
 - `risk_approved` + position still open or flat → neutral, excluded
 
-**Compression**: Full scout user message is ~11K tokens. Extract compresses to decision-relevant features: story signals found, flow data for candidate, theses present, CoinGecko data, what scout decided and why. Target: 600–800 tokens per example.
+**Compression**: Full scout user message is ~11K tokens. Extract compresses to decision-relevant features: story signals found (including `story_count_1h` per candidate), flow data for candidate, theses present, CoinGecko data, what scout decided and why. Target: 600–800 tokens per example.
 
 ---
 

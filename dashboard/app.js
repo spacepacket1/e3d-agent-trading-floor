@@ -4,6 +4,33 @@ import { createRoot } from "https://esm.sh/react-dom@18.3.1/client";
 const fmtUsd = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 2 });
 const fmtNum = new Intl.NumberFormat("en-US", { maximumFractionDigits: 2 });
 
+function fmtCompact(n) {
+  if (n == null) return "—";
+  if (n >= 1e9) return `$${(n / 1e9).toFixed(1)}B`;
+  if (n >= 1e6) return `$${(n / 1e6).toFixed(1)}M`;
+  if (n >= 1e3) return `$${(n / 1e3).toFixed(0)}K`;
+  return `$${Number(n).toFixed(0)}`;
+}
+
+const SUBSCRIPT_MAP = { "0":"₀","1":"₁","2":"₂","3":"₃","4":"₄","5":"₅","6":"₆","7":"₇","8":"₈","9":"₉" };
+function toSubscript(n) { return String(n).split("").map(c => SUBSCRIPT_MAP[c] || c).join(""); }
+
+function formatPrice(price) {
+  const n = Number(price);
+  if (!Number.isFinite(n) || n <= 0) return fmtUsd.format(0);
+  if (n >= 0.01) return fmtUsd.format(n);
+  const fixed = n.toFixed(18).replace(/0+$/, "").replace(/\.$/, "");
+  const dec = fixed.indexOf(".");
+  const frac = dec >= 0 ? fixed.slice(dec + 1) : "";
+  const leadMatch = frac.match(/^0+/);
+  const zeros = leadMatch ? leadMatch[0].length : 0;
+  if (zeros > 2) {
+    const sig = frac.slice(zeros, zeros + 4);
+    return `$0.0${toSubscript(zeros)}${sig}`;
+  }
+  return `$0.${frac.slice(0, zeros + 4)}`;
+}
+
 function cls(...parts) {
   return parts.filter(Boolean).join(" ");
 }
@@ -523,6 +550,7 @@ function SignalPill({ type, found }) {
 }
 
 function CycleCard({ cycle }) {
+  const [universeOpen, setUniverseOpen] = useState(false);
   const scout = cycle.scout || {};
   const harvest = cycle.harvest || {};
   const approved = Array.isArray(cycle.risk_approved) ? cycle.risk_approved : [];
@@ -698,6 +726,61 @@ function CycleCard({ cycle }) {
       "div",
       { className: "cycle-empty" },
       "No buy signals in this cycle — all story types returned empty."
+    ) : null,
+    // Token universe — what Scout was shown
+    Array.isArray(scout.token_universe) && scout.token_universe.length > 0 ? React.createElement(
+      "div",
+      { className: "cycle-section" },
+      React.createElement(
+        "div",
+        { className: "cycle-section-title universe-toggle", onClick: () => setUniverseOpen(o => !o), style: { cursor: "pointer", userSelect: "none" } },
+        `Token universe (${scout.token_universe.length}) `,
+        React.createElement("span", { className: "universe-chevron" }, universeOpen ? "▲" : "▼")
+      ),
+      universeOpen ? React.createElement(
+        "div",
+        { className: "universe-table-wrap" },
+        React.createElement(
+          "table",
+          { className: "universe-table" },
+          React.createElement(
+            "thead",
+            null,
+            React.createElement(
+              "tr",
+              null,
+              React.createElement("th", null, "Token"),
+              React.createElement("th", null, "Price"),
+              React.createElement("th", null, "24h %"),
+              React.createElement("th", null, "Vol 24h"),
+              React.createElement("th", null, "Liq"),
+              React.createElement("th", null, "Flow")
+            )
+          ),
+          React.createElement(
+            "tbody",
+            null,
+            scout.token_universe.map((t, i) => {
+              const flowCls = t.flow_signal
+                ? (t.flow_signal.includes("accumulation") ? "flow-accum" : t.flow_signal.includes("distribution") ? "flow-dist" : "")
+                : "";
+              const chg = t.change_24h;
+              return React.createElement(
+                "tr",
+                { key: t.address || i },
+                React.createElement("td", null, tokenLink(t.address, t.symbol, "universe-symbol")),
+                React.createElement("td", null, t.price_usd != null ? formatPrice(t.price_usd) : "—"),
+                React.createElement("td", { className: chg > 0 ? "chg-pos" : chg < 0 ? "chg-neg" : "" },
+                  chg != null ? `${chg > 0 ? "+" : ""}${Number(chg).toFixed(1)}%` : "—"
+                ),
+                React.createElement("td", null, t.volume_24h_usd != null ? fmtCompact(t.volume_24h_usd) : "—"),
+                React.createElement("td", null, t.liquidity_usd != null ? fmtCompact(t.liquidity_usd) : "—"),
+                React.createElement("td", { className: flowCls }, t.flow_signal ? t.flow_signal.replace(/_/g, " ") : "—")
+              );
+            })
+          )
+        )
+      ) : null
     ) : null
   );
 }
@@ -1085,14 +1168,20 @@ function PortfolioRow({ position }) {
       React.createElement(
         "div",
         { className: "portfolio-stat" },
+        React.createElement("span", { className: "portfolio-stat-label" }, "Quantity"),
+        React.createElement("strong", null, fmtNum.format(position.quantity || 0))
+      ),
+      React.createElement(
+        "div",
+        { className: "portfolio-stat" },
         React.createElement("span", { className: "portfolio-stat-label" }, "Purchased price"),
-        React.createElement("strong", null, fmtUsd.format(purchasedPrice))
+        React.createElement("strong", null, formatPrice(purchasedPrice))
       ),
       React.createElement(
         "div",
         { className: "portfolio-stat" },
         React.createElement("span", { className: "portfolio-stat-label" }, "Current price"),
-        React.createElement("strong", null, fmtUsd.format(currentPrice))
+        React.createElement("strong", null, formatPrice(currentPrice))
       ),
       React.createElement(
         "div",
@@ -1231,7 +1320,7 @@ function PositionRow({ position }) {
       { className: "position-stats" },
       React.createElement("span", null, fmtUsd.format(value)),
       React.createElement("span", null, `${fmtNum.format(position.quantity || 0)} units`),
-      React.createElement("span", null, `entry ${fmtUsd.format(position.avg_entry_price || 0)}`)
+      React.createElement("span", null, `entry ${formatPrice(position.avg_entry_price || 0)}`)
     )
   );
 }

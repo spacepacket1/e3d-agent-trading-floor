@@ -4,38 +4,36 @@ This plan upgrades Scout and Harvest from price-led heuristics into a story-, th
 It assumes the E3D.ai capability extension spec will provide richer upstream APIs for opportunity stories, thesis lifecycle tracking, wallet cohorts, evidence bundles, alerts, and manager briefs.
 
 ## Analysis summary
-- **Scout is underpowered today.** It already has some E3D references, but the active prompt is still mostly momentum-driven.
-- **Harvest is partially thesis-aware.** It looks at price extension and liquidity, but it does not yet consume a rich narrative decay model.
-- **E3D has useful intelligence surfaces already.** The most relevant routes we found today are:
-  - `/api/stories`
-  - `/api/stories/derived`
-  - `/api/stories/watchlist`
+
+> **Status as of April 2026** — Phase 1 and Phase 2 are substantially complete. Phase 3 (Harvest decay) is partially implemented. Phases 4–5 are in progress.
+
+- **Scout is story-driven.** The token universe is now filtered to story-backed tokens only — tokens with no story activity are excluded entirely. The primary universe fetch sorts by `storyCount` descending over the last 1 hour (`trendInterval=1H`), so the freshest on-chain signal tokens surface first.
+- **Story enrichment is uncapped.** All tokens mentioned in any pre-pump or buy-signal story type are enriched into the universe regardless of their volume ranking. Story types covered: THESIS, ACCUMULATION, SMART_MONEY, STEALTH_ACCUMULATION, BREAKOUT_CONFIRMED, STAGING, CLUSTER, FUNNEL, DISCOVERY, HOTLINKS, NEW_WALLETS, DEEP_DIVE, SMART_STAGING, WHALE.
+- **Thesis and candidate endpoints are live.** `/candidates` and `/theses` are both consumed by Scout each cycle. Thesis tokens are enriched into the universe even when absent from the volume feed, and a conviction ≥ 65 LONG thesis can override the `in_token_universe` gate.
+- **E3D intelligence surfaces consumed today:**
+  - `/api/stories` — cycle-level story feed (all types, limit 200)
+  - `/api/candidates` — pre-computed multi-signal convergence candidates
+  - `/api/theses` — structured investment theses with direction, conviction, price targets
   - `/api/addressMeta`
   - `/api/tokenCounterparties`
   - `/api/addressCounterparties`
-  - `/api/categoryTokensLastHour`
   - `/fetchTokensDB`
+  - `/fetchTokenPricesWithHistoryAllRanges` — with `sortBy=storyCount&trendInterval=1H`
   - `/token-info/:name`
-- **The capability extension spec should add new upstream intelligence APIs.** The roadmap should expect surfaces such as opportunity stories, risk stories, theses, evidence bundles, wallet cohorts, opportunity ranking, briefs, alerts, and simulations.
-- **There is no dedicated thesis endpoint in `spacepacket.js` today.** Until the extension lands, the thesis layer must be derived from story metadata and linked evidence.
-- **Story records already carry AI fields.** `meta_json` can include `ai_narrative`, `ai_takeaways`, `ai_risks`, `source_story_id`, and derived-story counts, so the roadmap should treat these as the bridge into the new capability layer.
+- **Story records already carry AI fields.** `meta_json` can include `ai_narrative`, `ai_takeaways`, `ai_risks`, `source_story_id`, and derived-story counts.
 
 ## What is missing for effective trading
-- **A unified token dossier.** Scout and Harvest need one normalized evidence object that merges:
-  - token identity and metadata
-  - price and liquidity context
-  - story and thesis freshness
-  - derived-story relationships
-  - wallet flow / counterparty evidence
-  - concentration and integrity risk
-- **A direct opportunity/risk story layer.** The app should not have to infer bullish setups only from price and generic stories; it should consume explicit opportunity stories and explicit risk stories from E3D.ai.
-- **Thesis freshness and decay scoring.** The system needs a repeatable way to answer:
-  - is the original story still alive?
-  - is the story getting broader or fading?
-  - are wallets confirming or contradicting the narrative?
-- **Opportunity-cost ranking.** Managers need to know whether a candidate is good in isolation or merely the least-bad option compared with current holdings and better alternatives.
-- **Decision explainability.** The current UI shows positions and activity, but not the chain of evidence behind buy/hold/trim/exit decisions.
-- **Training labels tied to story outcomes.** The logs should capture which story/thesis signals were present at the time of the decision and whether they worked out.
+
+> Items marked ✓ are implemented. Items marked ○ remain open.
+
+- ✓ **Story-driven token universe.** Universe is now filtered to story-backed tokens only, sorted by 1H story count.
+- ✓ **Pre-pump signal enrichment.** STAGING, CLUSTER, FUNNEL, DISCOVERY, HOTLINKS, NEW_WALLETS, DEEP_DIVE, SMART_STAGING, WHALE all enrich the universe.
+- ✓ **Thesis and candidate endpoints.** `/candidates` and `/theses` consumed each cycle; thesis tokens enriched into universe.
+- ✓ **A unified token dossier.** `buildPortfolioIntelligenceDossier()` merges token metadata, price context, story feeds, counterparty flow, and position history into a single object per held position.
+- ✓ **Decision explainability.** Manager Agent runs post-cycle and scores each agent's output with flag codes, grades, and a plain-English summary. Dashboard Reports page surfaces these.
+- ○ **Thesis freshness and decay scoring.** The system detects story presence/absence but does not yet score thesis decay rate across cycles. Harvest uses story presence as a hold-confirm signal but has no explicit decay metric.
+- ○ **Opportunity-cost ranking.** Scout compares candidates against each other and current holdings but has no formal cross-portfolio opportunity score.
+- ○ **Training labels tied to story outcomes.** Training pipeline infrastructure exists (`extract_agent_training_data.py` spec). Story types at decision time are logged. Automated labeling from pipeline outcomes is not yet running.
 
 ## Proposed implementation plan
 
@@ -65,22 +63,15 @@ It assumes the E3D.ai capability extension spec will provide richer upstream API
   - what confirms it
   - whether the token is better framed as a buy, hold, trim, exit, or watch
 
-### Phase 2: Upgrade Scout into a thesis-aware opportunity engine
-- Keep Scout responsible for **discovering** new names, not trading them.
-- Change the Scout prompt so it must:
-  - rank candidates by evidence, not raw momentum
-  - cite opportunity stories, story-derived support, and thesis lifecycle evidence
-  - include counterparty / flow confirmation
-  - explain invalidation clearly
-  - compare each candidate against current portfolio opportunities
-- Add Scout output requirements for managers:
-  - `thesis_summary`
-  - `evidence`
-  - `what_changed`
-  - `why_now`
-  - `next_best_alternative`
-  - `action` and `confidence`
-- Make Scout return a smaller set of higher-conviction names, not a larger list of generic momentum tokens.
+### Phase 2: Upgrade Scout into a thesis-aware opportunity engine ✓ Complete
+
+- Scout is responsible for **discovering** new names, not trading them.
+- The token universe is filtered to story-backed tokens only, sorted by 1H story count. Tokens with no story activity are excluded.
+- Signal priority (hardcoded in prompt): E3D candidates → E3D theses → thesis stories → buy-signal stories → flow-only (last resort).
+- Pre-pump story types (STAGING, CLUSTER, FUNNEL, DISCOVERY, HOTLINKS, NEW_WALLETS, DEEP_DIVE, SMART_STAGING, WHALE, ACCUMULATION, SMART_MONEY, STEALTH_ACCUMULATION) enrich the universe and are `in_token_universe=true`.
+- Post-pump types (MOVER, SURGE) are shown as LATE SIGNALS — Scout is instructed not to buy these as new entries.
+- Scout output includes `evidence[]`, `why_now`, `risks[]`, `conviction_score`, `confidence`, entry zone, invalidation price, and targets.
+- Returns 0–3 candidates. Returning 0 is correct when nothing meets the bar.
 
 ### Phase 3: Upgrade Harvest into a thesis-decay and trim engine
 - Keep Harvest responsible for **protecting capital** and **harvesting gains**.

@@ -1909,6 +1909,8 @@ function buildAgentCoverageLog(agentId, payload) {
 }
 
 const LLM_BASE_URL = process.env.LLM_BASE_URL || "http://127.0.0.1:5050";
+const SCOUT_ADAPTER_PATH = process.env.SCOUT_ADAPTER_PATH || "./adapters_scout_v1";
+const HARVEST_ADAPTER_PATH = process.env.HARVEST_ADAPTER_PATH || "./adapters_harvest_v1";
 const LLM_MODEL = process.env.LLM_MODEL || "mlx-community/Qwen2.5-14B-Instruct-4bit";
 
 const COINGECKO_API_KEY = process.env.COINGECKO_API_KEY || "";
@@ -1999,11 +2001,16 @@ function callLLMDirect(systemPrompt, userMessage, { maxRetries = 1, agent = "unk
       fs.writeFileSync(tmpFile, bodyJson);
       let stdout;
       try {
-        stdout = execFileSync("curl", [
+        const adapterPath = agent === "scout" ? SCOUT_ADAPTER_PATH : agent === "harvest" ? HARVEST_ADAPTER_PATH : null;
+        const curlArgs = [
           "-s", "-X", "POST",
           `${LLM_BASE_URL}/v1/chat/completions`,
           "-H", "Content-Type: application/json",
           "-H", `X-Request-Id: ${reqId}`,
+        ];
+        if (adapterPath) curlArgs.push("-H", `X-Adapter-Path: ${adapterPath}`);
+        stdout = execFileSync("curl", [
+          ...curlArgs,
           "--max-time", "1200",
           "-d", `@${tmpFile}`
         ], { encoding: "utf8", maxBuffer: 10 * 1024 * 1024, timeout: 1220000 });
@@ -2048,20 +2055,6 @@ function callLLMDirect(systemPrompt, userMessage, { maxRetries = 1, agent = "unk
   throw lastErr;
 }
 
-// Rotate token universe fetch criteria across cycles to avoid always seeing the same tokens.
-// Sort rotation. Only three fields have reliable non-zero data across the DB:
-//   volume24hUSD       — ~54 tokens with real on-chain DEX volume (highest signal)
-//   effectiveLiquidityUSD — ~50+ tokens with measured pool depth
-//   change_24h_pct     — price change available for most tokens
-// change_30m_pct and volume are 0 for the majority of the 7,500-token DB.
-const SCOUT_SORT_ROTATION = [
-  { sortBy: "volume24hUSD",          sortDir: "desc" },  // on-chain activity
-  { sortBy: "effectiveLiquidityUSD", sortDir: "desc" },  // deepest pools
-  { sortBy: "change_24h_pct",        sortDir: "desc" },  // daily winners
-  { sortBy: "volume24hUSD",          sortDir: "desc" },
-  { sortBy: "change_24h_pct",        sortDir: "asc"  },  // oversold / reversal
-  { sortBy: "effectiveLiquidityUSD", sortDir: "desc" },
-];
 let _scoutCycleIndex = 0;
 
 function fetchScoutData() {
@@ -2096,8 +2089,6 @@ function fetchScoutData() {
   }
   for (const s of allStories) addStory(s);
 
-  // Rotate sort criteria each cycle
-  const sortParams = SCOUT_SORT_ROTATION[_scoutCycleIndex % SCOUT_SORT_ROTATION.length];
   _scoutCycleIndex++;
 
   const mapToken = (t) => ({
@@ -2112,37 +2103,35 @@ function fetchScoutData() {
     // even when effectiveLiquidityUSD is non-zero — use || not ?? to prefer non-zero
     liquidity_usd: t.effectiveLiquidityUSD || t.liquidityUSD || t.liquidity_usd || null,
     volume_24h_usd: t.volume24hUSD || t.volume_24h_usd || null,
-    fragility_score: t.fragilityScore ?? null
+    fragility_score: t.fragilityScore ?? null,
+    story_count_1h: t.storyCount ?? null,
   });
 
-  // Primary list: rotated sort criterion, limit 50
-  const primary = endpointArray(fetchJson("/fetchTokenPricesWithHistoryAllRanges", {
-    dataSource: 1, ...sortParams, limit: 50
+  // Primary: tokens ranked by story activity in the last hour — freshest on-chain signals first.
+  const byStory = endpointArray(fetchJson("/fetchTokenPricesWithHistoryAllRanges", {
+    dataSource: 1, sortBy: "storyCount", sortDir: "desc", trendInterval: "1H", limit: 200
   })).map(mapToken);
 
-  // Secondary lens: always include the top volume tokens regardless of primary sort,
-  // since those ~54 are the ones with real on-chain activity in E3D's coverage.
+  // Secondary: top-volume tokens for flow-only fallback (tokens with strong DEX activity
+  // but no story yet — kept as a last-resort pool for the flow-only entry path).
   const byVolume = endpointArray(fetchJson("/fetchTokenPricesWithHistoryAllRanges", {
     dataSource: 1, sortBy: "volume24hUSD", sortDir: "desc", limit: 200
   })).map(mapToken);
 
-  // Merge, deduplicate, then surface tokens with real activity first
+  // Merge, deduplicate — story-sorted tokens first so they win dedup priority.
   const seen = new Set();
   const raw = [];
-  for (const t of [...primary, ...byVolume]) {
+  for (const t of [...byStory, ...byVolume]) {
     if (!t.address || seen.has(t.address)) continue;
     seen.add(t.address);
     raw.push(t);
   }
 
-  // Sort merged universe: tokens with on-chain volume first (highest signal),
-  // then by effective liquidity, then by 24h change as tiebreaker.
+  // Sort: story count descending (freshest signals first), then volume as tiebreaker.
   const tokenUniverseAll = raw.sort((a, b) => {
-    const volDiff = (b.volume_24h_usd || 0) - (a.volume_24h_usd || 0);
-    if (volDiff !== 0) return volDiff;
-    const liqDiff = (b.liquidity_usd || 0) - (a.liquidity_usd || 0);
-    if (liqDiff !== 0) return liqDiff;
-    return (b.change_24h || 0) - (a.change_24h || 0);
+    const storyDiff = (b.story_count_1h || 0) - (a.story_count_1h || 0);
+    if (storyDiff !== 0) return storyDiff;
+    return (b.volume_24h_usd || 0) - (a.volume_24h_usd || 0);
   });
 
   // Strip stablecoins, gold tokens, and base/wrapped assets — these are not momentum-trading
@@ -2154,8 +2143,15 @@ function fetchScoutData() {
   // Enrich universe with story-mentioned tokens not in the top-volume list.
   // Stories (ACCUMULATION, SMART_MONEY, THESIS, etc.) often fire on tokens accumulating
   // before they show up in volume rankings — that's the alpha window. Fetch price data
-  // for up to 5 high-signal story addresses and add them so Scout can propose them.
-  const highSignalStoryTypes = new Set(["THESIS", "ACCUMULATION", "SMART_MONEY", "STEALTH_ACCUMULATION", "BREAKOUT_CONFIRMED"]);
+  // for story-mentioned tokens and add them so Scout can propose them.
+  // Includes pre-pump early signals (STAGING, CLUSTER, FUNNEL, DISCOVERY, HOTLINKS, NEW_WALLETS)
+  // which fire before tokens reach the volume rankings — these were previously excluded,
+  // causing in_token_universe=false and silently dropping all early-signal candidates.
+  const highSignalStoryTypes = new Set([
+    "THESIS", "ACCUMULATION", "SMART_MONEY", "STEALTH_ACCUMULATION", "BREAKOUT_CONFIRMED",
+    "STAGING", "CLUSTER", "FUNNEL", "DISCOVERY", "HOTLINKS", "NEW_WALLETS", "DEEP_DIVE",
+    "SMART_STAGING", "WHALE",
+  ]);
   const enrichQueue = [];
   for (const [type, items] of Object.entries(stories)) {
     if (!highSignalStoryTypes.has(type)) continue;
@@ -2165,7 +2161,7 @@ function fetchScoutData() {
     }
   }
   enrichQueue.sort((a, b) => b.score - a.score);
-  for (const { addr } of enrichQueue.slice(0, 5)) {
+  for (const { addr } of enrichQueue) {
     try {
       const rows = endpointArray(fetchJson("/fetchTokenPricesWithHistoryAllRanges", {
         dataSource: 1, search: addr, limit: 1
@@ -2181,6 +2177,26 @@ function fetchScoutData() {
     } catch (_) {}
   }
   log("scout_story_enrichment", { queued: enrichQueue.length, added: tokenUniverse.length - tokenUniverseAll.length + tokenUniverseAll.filter(t => nonTradeablePattern.test(t.symbol || "")).length });
+
+  // Filter universe to only tokens that appear in at least one story.
+  // Tokens with no story backing are noise — Scout should only consider tokens
+  // where there is on-chain evidence, not just volume ranking.
+  const allStoryAddresses = new Set();
+  for (const items of Object.values(stories)) {
+    for (const s of (items || [])) {
+      const addr = cleanAddress(s?.meta?.token_address || s?.primary_token || s?.address || "");
+      if (addr) allStoryAddresses.add(addr);
+    }
+  }
+  const tokenUniverseWithStories = tokenUniverse.filter(t => t.address && allStoryAddresses.has(t.address));
+  log("scout_universe_filter", {
+    before: tokenUniverse.length,
+    after: tokenUniverseWithStories.length,
+    story_addresses: allStoryAddresses.size,
+  });
+  // Replace the working universe with the filtered set.
+  tokenUniverse.length = 0;
+  tokenUniverseWithStories.forEach(t => tokenUniverse.push(t));
 
   const thesisSignalStories = thesisStories.length ? thesisStories : endpointArray(stories.THESIS);
 
@@ -2266,7 +2282,7 @@ function fetchScoutData() {
     }
   }
 
-  return { stories, thesisSignalStories, tokenUniverse, disqualifierTypes, buySignalTypes, lateSignalTypes, secondaryTypes, sortLabel: `${sortParams.sortBy} ${sortParams.sortDir}`, e3dCandidates, e3dTheses, cgDetailMap };
+  return { stories, thesisSignalStories, tokenUniverse, disqualifierTypes, buySignalTypes, lateSignalTypes, secondaryTypes, sortLabel: "storyCount:1H desc", e3dCandidates, e3dTheses, cgDetailMap };
 }
 
 function runScoutDirect(portfolio, portfolioIntelligence = null) {
@@ -2707,6 +2723,18 @@ function runScoutDirect(portfolio, portfolioIntelligence = null) {
     }
   }
 
+  // Auto-populate stories_checked from the actual cycle data when the model omits it.
+  // data.stories is exactly what was shown to the model, so this reconstruction is accurate.
+  if (!Array.isArray(result.stories_checked) || result.stories_checked.length === 0) {
+    result.stories_checked = Object.entries(data.stories).map(([type, items]) => ({
+      type,
+      found: Array.isArray(items) && items.length > 0,
+      tokens: Array.isArray(items)
+        ? items.slice(0, 5).map((s) => s.token_address || s.address || "").filter(Boolean)
+        : [],
+    }));
+  }
+
   // Hard pump filter: discard any candidate whose 7d gain exceeds 300% — it already pumped.
   // This is a code-level safety net; the prompt instruction alone is not reliable enough.
   const prePumpFilter = result.candidates || [];
@@ -2734,6 +2762,18 @@ function runScoutDirect(portfolio, portfolioIntelligence = null) {
       }
     }
   }
+
+  // Attach compact token universe so the dashboard can show what Scout was shown.
+  result.token_universe = data.tokenUniverse.map(t => ({
+    symbol:         t.symbol || null,
+    address:        t.address || null,
+    price_usd:      t.price_usd ?? null,
+    volume_24h_usd: t.volume_24h_usd ?? null,
+    liquidity_usd:  t.liquidity_usd ?? null,
+    market_cap_usd: t.market_cap_usd ?? null,
+    change_24h:     t.change_24h ?? null,
+    flow_signal:    t.flow_signal ?? null,
+  }));
 
   return result;
 }
@@ -3894,7 +3934,11 @@ function buildManagerReport(cycleState, portfolio) {
   const scoutCoverageField = scoutCoverage;
   const scoutCoveragePct = scoutCoverageField ?? 0;
   const scoutStoriesChecked = Array.isArray(scout.stories_checked) ? scout.stories_checked : [];
-  const scoutStoryTypes = new Set(scoutStoriesChecked.map((story) => String(story?.type || story?.story_type || story || "").toUpperCase()).filter(Boolean));
+  const scoutStoryTypes = new Set([
+    ...scoutStoriesChecked.map((story) => String(story?.type || story?.story_type || story || "").toUpperCase()).filter(Boolean),
+    ...(cycleState.scout_coverage?.self_reported_types || []).map((t) => String(t).toUpperCase()),
+    ...(cycleState.scout_coverage?.evidence_cited_types || []).map((t) => String(t).toUpperCase()),
+  ]);
   const scoutCandidatesWithFullEvidence = scoutCandidates.filter((candidate) => Array.isArray(candidate?.evidence) && candidate.evidence.length >= 3).length;
 
   if (!Array.isArray(scout.candidates)) {
@@ -3903,7 +3947,11 @@ function buildManagerReport(cycleState, portfolio) {
   if (scoutCoverageField == null || scoutCoverageField < 0.85) {
     pushManagerFlag(scoutFlags, "warning", "scout", "SCOUT_LOW_COVERAGE", `Scout story coverage is ${Math.round((scoutCoverageField || 0) * 100)}%.`);
   }
-  if (["WASH_TRADE", "LOOP", "LIQUIDITY_DRAIN"].some((type) => !scoutStoryTypes.has(type))) {
+  const requiredDisqualifiers = ["WASH_TRADE", "LOOP", "LIQUIDITY_DRAIN"];
+  const availableDisqualifiers = cycleState.scout_coverage?.expected_types?.length
+    ? requiredDisqualifiers.filter((t) => cycleState.scout_coverage.expected_types.includes(t))
+    : requiredDisqualifiers;
+  if (availableDisqualifiers.length > 0 && availableDisqualifiers.some((type) => !scoutStoryTypes.has(type))) {
     pushManagerFlag(scoutFlags, "critical", "scout", "SCOUT_MISSING_DISQUALIFIERS", "Scout did not sweep all required disqualifier story types.");
   }
   if (scoutCandidates.some((candidate) => toNum(candidate?.fraud_risk, 0) >= 35)) {
@@ -3926,7 +3974,11 @@ function buildManagerReport(cycleState, portfolio) {
   const harvestPositions = Array.isArray(harvest.position_reviews) ? harvest.position_reviews : [];
   const harvestCandidates = Array.isArray(harvest.exit_candidates) ? harvest.exit_candidates : [];
   const harvestStoriesChecked = Array.isArray(harvest.stories_checked) ? harvest.stories_checked : [];
-  const harvestStoryTypes = new Set(harvestStoriesChecked.map((story) => String(story?.type || story?.story_type || story || "").toUpperCase()).filter(Boolean));
+  const harvestStoryTypes = new Set([
+    ...harvestStoriesChecked.map((story) => String(story?.type || story?.story_type || story || "").toUpperCase()).filter(Boolean),
+    ...(cycleState.harvest_coverage?.self_reported_types || []).map((t) => String(t).toUpperCase()),
+    ...(cycleState.harvest_coverage?.evidence_cited_types || []).map((t) => String(t).toUpperCase()),
+  ]);
   const positionsHeld = toNum(portfolioSnapshot.position_count, Object.keys(portfolio?.positions || {}).length);
   const positionsReviewed = harvestPositions.length || toNum(harvest?.portfolio_summary?.position_count, 0);
   const exitsWithEvidence = harvestCandidates.filter((candidate) => Array.isArray(candidate?.evidence) && candidate.evidence.length >= 2).length;
@@ -3947,13 +3999,17 @@ function buildManagerReport(cycleState, portfolio) {
     pushManagerFlag(harvestFlags, "warning", "harvest", "HARVEST_THIN_EVIDENCE", "At least one Harvest exit candidate had fewer than two evidence items.");
   }
   if (harvestCandidates.some((candidate) => {
-    const frac = toNum(candidate?.suggested_exit_fraction, 0);
-    return frac <= 0 || frac > 1;
+    const raw = candidate?.suggested_exit_fraction;
+    if (raw == null) return false; // missing is fine — executor defaults to 0.5
+    const frac = toNum(raw, null);
+    return frac == null || frac <= 0 || frac > 1;
   })) {
     pushManagerFlag(harvestFlags, "critical", "harvest", "HARVEST_INVALID_EXIT_FRACTION", "Harvest proposed an invalid exit fraction.");
   }
   if (harvestCandidates.some((candidate) => {
-    const frac = toNum(candidate?.suggested_exit_fraction, 0);
+    const raw = candidate?.suggested_exit_fraction;
+    if (raw == null) return false;
+    const frac = toNum(raw, 0);
     return frac > 0 && frac < 0.1;
   })) {
     pushManagerFlag(harvestFlags, "warning", "harvest", "HARVEST_WEAK_EXIT_FRACTION", "At least one Harvest exit fraction was below the preferred threshold.");

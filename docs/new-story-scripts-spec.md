@@ -819,18 +819,23 @@ For the `storySurge.js` upgrade, test by running it and verifying the `participa
 
 ## Integration with Trading Pipeline
 
-Once these story types exist, the E3D trading pipeline at `/Users/mini/e3d-agent-trading-floor/` will pick them up automatically via the `/api/stories` endpoint. Scout agent will see:
+Once these story types exist, the E3D trading pipeline at `/Users/mini/e3d-agent-trading-floor/` picks them up automatically via the `/api/stories` endpoint each cycle (global fetch, limit 200).
 
-- **ACCUMULATION** stories → buy signal (whale accumulating a token)
-- **BREAKOUT_CONFIRMED** stories → momentum buy signal (price + activity double confirmation)
-- **SMART_STAGING** stories → smart money buy signal (historically correct wallet pre-positioning)
-- **SURGE (broad participation)** → momentum signal with much higher quality bar than before
+**How story types reach Scout** (as of April 2026):
 
-The agent TOOLS.md already lists these story types to fetch:
-```
-https://e3d.ai/api/stories?type=ACCUMULATION&chain=ethereum&limit=10
-https://e3d.ai/api/stories?type=BREAKOUT_CONFIRMED&chain=ethereum&limit=5
-https://e3d.ai/api/stories?type=SMART_STAGING&chain=ethereum&limit=5
-```
+1. The pipeline fetches all stories into a cycle-level cache at the start of each run.
+2. The token universe is fetched with `sortBy=storyCount&trendInterval=1H&sortDir=desc` — tokens with the most story activity in the last hour rank first.
+3. The universe is then **filtered to story-backed tokens only** — tokens with no story activity are excluded entirely.
+4. Tokens mentioned in any of the following types are enriched into the universe even if they don't appear in the volume feed: STAGING, CLUSTER, FUNNEL, DISCOVERY, HOTLINKS, NEW_WALLETS, DEEP_DIVE, SMART_STAGING, WHALE, THESIS, ACCUMULATION, SMART_MONEY, STEALTH_ACCUMULATION, BREAKOUT_CONFIRMED. No cap on the number enriched.
+5. Scout sees the resulting universe sorted by `story_count_1h` descending, with each token's `story_count_1h` field attached.
+
+**Signal classification in Scout's prompt:**
+
+- **ACCUMULATION, SMART_MONEY, STEALTH_ACCUMULATION, DEEP_DIVE, THESIS, STAGING, CLUSTER, FUNNEL, NEW_WALLETS, SMART_STAGING, WHALE, DISCOVERY, HOTLINKS** → PRE-PUMP buy signals (fire before price moves — alpha window)
+- **BREAKOUT_CONFIRMED, FLOW** → BREAKOUT signals (early-mid entry, price moving but momentum fresh)
+- **MOVER, SURGE** → LATE SIGNALS (post-pump — shown to Scout for context only, not as buy triggers)
+- **WASH_TRADE, LOOP, LIQUIDITY_DRAIN, SPREAD_WIDENING, RUG_LIQUIDITY_PULL** → DISQUALIFIERS
+
+**SURGE note:** The tightened participation thresholds in this spec (broad ≥ 25 unique senders, ≥ 20 txns) mean most SURGE stories are classified as `thin-liquidity spike` and scored near zero. Only `broad participation` SURGE stories with score ≥ 4.5 are inserted — these appear in Scout's LATE SIGNALS section, not as entries.
 
 Add `run_step` entries to `run_stories.sh` in the order shown in each script's section above.
