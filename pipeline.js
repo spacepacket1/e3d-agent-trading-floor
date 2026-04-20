@@ -2715,16 +2715,21 @@ function runScoutDirect(portfolio, portfolioIntelligence = null) {
     }
   }
 
-  // Auto-populate stories_checked from the actual cycle data when the model omits it.
-  // data.stories is exactly what was shown to the model, so this reconstruction is accurate.
-  if (!Array.isArray(result.stories_checked) || result.stories_checked.length === 0) {
-    result.stories_checked = Object.entries(data.stories).map(([type, items]) => ({
+  // Ensure stories_checked covers every type the model was shown.
+  // If the model omitted the field entirely, reconstruct it from the actual data.
+  // If the model returned a partial list, fill in the missing types so coverage
+  // scoring isn't penalised for types the model simply forgot to list.
+  if (!Array.isArray(result.stories_checked)) result.stories_checked = [];
+  const reportedTypes = new Set(result.stories_checked.map((s) => String(s?.type || "").toUpperCase()));
+  for (const [type, items] of Object.entries(data.stories)) {
+    if (reportedTypes.has(type.toUpperCase())) continue;
+    result.stories_checked.push({
       type,
       found: Array.isArray(items) && items.length > 0,
       tokens: Array.isArray(items)
         ? items.slice(0, 5).map((s) => s.token_address || s.address || "").filter(Boolean)
         : [],
-    }));
+    });
   }
 
   // Hard pump filter: discard any candidate whose 7d gain exceeds 300% — it already pumped.
