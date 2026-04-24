@@ -715,6 +715,25 @@ function toNum(v, fallback = 0) {
   return Number.isFinite(n) ? n : fallback;
 }
 
+// Normalize a confidence/conviction value to 0-100 integer scale.
+// Handles: string labels ("high"→80, "medium"→55, "low"→30),
+// decimal 0-1 values (0.9→90), and already-correct 0-100 integers.
+function normalizeScore(v) {
+  if (v == null) return null;
+  if (typeof v === "string") {
+    const s = v.toLowerCase().trim();
+    if (s === "high") return 80;
+    if (s === "medium" || s === "moderate") return 55;
+    if (s === "low") return 30;
+    const n = Number(s);
+    if (!Number.isFinite(n)) return null;
+    return n > 0 && n <= 1 ? Math.round(n * 100) : Math.round(n);
+  }
+  const n = Number(v);
+  if (!Number.isFinite(n)) return null;
+  return n > 0 && n <= 1 ? Math.round(n * 100) : Math.round(n);
+}
+
 function equityUsd(portfolio) {
   if (!portfolio || typeof portfolio !== "object") return 0;
 
@@ -2515,7 +2534,8 @@ function runScoutDirect(portfolio, portfolioIntelligence = null) {
     "6. Exclude addresses in DISQUALIFIERS and already-held: " + `symbols=${JSON.stringify([...heldSymbols])} addresses=${JSON.stringify([...heldAddresses])}`,
     "",
     `Output shape: {scan_timestamp, candidates[], holdings_updates[], stories_checked[]}`,
-    `Each candidate: {source_agent:"scout"|"user_watchlist", created_at:"${createdAt}", expires_at:"${expiresAt}", token:{symbol,name,chain:"ethereum",contract_address,category}, setup_type, action:"buy", confidence, conviction_score, opportunity_score, why_now, evidence[], risks[], entry_zone:{low,high}, invalidation_price, targets:{target_1,target_2,target_3}, market_data:{current_price,change_24h_pct,change_30m_pct,price_source:"e3d",market_cap_usd}, liquidity_data:{liquidity_usd,liquidity_source:"e3d"}, execution_data:{estimated_slippage_bps,quote_source:"e3d"}, portfolio_data:{current_token_exposure_pct:0,current_category_exposure_pct:0,current_total_exposure_pct:0}}`,
+    `Each candidate: {source_agent:"scout"|"user_watchlist", created_at:"${createdAt}", expires_at:"${expiresAt}", token:{symbol,name,chain:"ethereum",contract_address,category}, setup_type, action:"buy", confidence:integer(0-100), conviction_score:integer(0-100), opportunity_score:integer(0-100), why_now, evidence[], risks[], entry_zone:{low,high}, invalidation_price, targets:{target_1,target_2,target_3}, market_data:{current_price,change_24h_pct,change_30m_pct,price_source:"e3d",market_cap_usd}, liquidity_data:{liquidity_usd,liquidity_source:"e3d"}, execution_data:{estimated_slippage_bps,quote_source:"e3d"}, portfolio_data:{current_token_exposure_pct:0,current_category_exposure_pct:0,current_total_exposure_pct:0}}`,
+    `confidence/conviction_score/opportunity_score MUST be integers 0-100. Do NOT use decimals (0.9) or strings ("high"). Example: confidence:72, conviction_score:65.`,
     `Use source_agent:"scout" for agent-discovered candidates (E3D candidates, theses, stories, flow). Use source_agent:"user_watchlist" only for candidates sourced from the USER WATCHLIST section.`,
     `stories_checked[]: one entry per EVERY story type present in the ON-CHAIN SIGNALS section — {type, found, tokens[]}. List ALL types, even ones with in_token_universe=false (set found=false, tokens=[]). Do NOT invent story types not in the data.`
   ].join("\n");
@@ -4268,7 +4288,11 @@ function buildManagerReport(cycleState, portfolio) {
     const review = record?.payload?.risk_review || record?.payload?.risk || {};
     const proposal = record?.payload?.proposal || {};
     const approved = String(review?.decision || "").toLowerCase() === "approve_for_executor" || record?.payload?.handoff_to_executor === true;
-    return approved && (toNum(review?.fraud_risk, toNum(proposal?.fraud_risk, 0)) >= 35 || toNum(review?.confidence, toNum(proposal?.confidence, 0)) <= 55);
+    const fraudRisk = toNum(review?.fraud_risk ?? proposal?.fraud_risk, 0);
+    const rawConf = review?.confidence ?? proposal?.confidence;
+    const confidence = normalizeScore(rawConf);
+    const confBreached = confidence !== null && confidence <= 55;
+    return approved && (fraudRisk >= 35 || confBreached);
   })) {
     pushManagerFlag(riskFlags, "critical", "risk", "RISK_HARD_LIMIT_MISS", "Risk approved a candidate that breached a hard limit.");
   }
