@@ -3464,19 +3464,22 @@ function callDirectJson(agentRole, systemPrompt, userPrompt, errorTag) {
   }
 }
 
-function runRiskDirect(proposal) {
+function runRiskDirect(proposal, paperMode = false) {
+  const approveDecision = paperMode ? "paper_trade" : "approve_for_executor";
   const systemPrompt = [
     "You are Risk, a crypto trade risk validator.",
     "Validate the proposal and return STRICT JSON only — one object, no markdown.",
-    `Response shape: {decision:"approve_for_executor"|"reject", reason_summary, reason_codes[], risk_score:number(0-100), checks_passed[], checks_failed[], blocker_list[]}`,
-    "Decision: approve_for_executor ONLY IF ALL of these pass:",
+    `Paper mode: ${paperMode ? "ENABLED — use decision \"paper_trade\" (never \"approve_for_executor\")" : "disabled — use decision \"approve_for_executor\" when approved"}.`,
+    `Response shape: {decision:"${approveDecision}"|"reject", reason_summary, reason_codes[], risk_score:number(0-100), checks_passed[], checks_failed[], blocker_list[]}`,
+    "Decision: approve ONLY IF ALL of these pass:",
     "  1. contract_address is a valid 42-char hex address",
     "  2. market_data.current_price > 0",
     "  3. liquidity_data.liquidity_usd >= 5000",
     "  4. execution_data.estimated_slippage_bps <= 300",
     "  5. _fragility_score (if present) < 70",
+    "  6. fraud_risk (if present) < 35 — high fraud risk is a hard block",
+    "  7. confidence (if present) > 55 — low confidence is a hard block",
     "If any of these fail, decision = reject.",
-    "Ignore missing optional fields like confidence, entry_zone, targets, why_now — they are informational only.",
     "reason_codes must be exact snake_case strings."
   ].join("\n");
   const userPrompt = `Validate this proposal:\n${JSON.stringify(proposal)}`;
@@ -3487,8 +3490,9 @@ function runRiskForCandidates(candidates, portfolio) {
   const approved = [];
   const rejected = [];
 
+  const paperMode = Boolean(portfolio?.settings?.paper_mode);
   for (const proposal of candidates) {
-    const risk = runRiskDirect(proposal);
+    const risk = runRiskDirect(proposal, paperMode);
     const entry = { proposal, risk };
 
     const decision = String(risk?.decision || "").toLowerCase();
