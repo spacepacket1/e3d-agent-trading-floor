@@ -99,6 +99,10 @@ function redactRecord(record) {
     lastError: null
   };
 
+  const apiKeyPreview = normalized.mode === "api_key" && normalized.apiKey
+    ? normalized.apiKey.slice(0, 8) + "…"
+    : null;
+
   return {
     ok: true,
     connected: true,
@@ -108,6 +112,7 @@ function redactRecord(record) {
     username: normalized.username || null,
     hasApiKey: normalized.mode === "api_key",
     hasSession: normalized.mode === "login",
+    apiKeyPreview,
     updatedAt: normalized.updatedAt || null,
     lastError: normalized.lastError || null
   };

@@ -647,6 +647,7 @@ function CycleCard({ cycle }) {
         const risks = Array.isArray(c?.risks) ? c.risks.slice(0, 2).map((r) => typeof r === "string" ? r : JSON.stringify(r)) : [];
         const confidence = Number(c?.confidence || 0);
         const conviction = Number(c?.conviction_score || 0);
+        const isWatchlist = c?.source_agent === "user_watchlist";
 
         // risk_rejected items are {proposal, risk} wrappers; approved items are plain candidates
         const riskEntry = [...approved, ...rejected].find((r) => {
@@ -667,7 +668,8 @@ function CycleCard({ cycle }) {
               "div",
               { className: "candidate-identity" },
               tokenLink(addr, symbol),
-              name ? React.createElement("span", { className: "candidate-name" }, name) : null
+              name ? React.createElement("span", { className: "candidate-name" }, name) : null,
+              isWatchlist ? React.createElement("span", { className: "candidate-watchlist-badge" }, "Watchlist") : null
             ),
             React.createElement(
               "div",
@@ -1514,7 +1516,7 @@ function E3DAuthPanel({
           authStatus?.mode === "login"
             ? `Login session active for ${authStatus.email || authStatus.username || "e3d.ai account"}.`
             : authStatus?.mode === "api_key"
-              ? `API key active${authStatus.updatedAt ? ` · updated ${new Date(authStatus.updatedAt).toLocaleString()}` : ""}.`
+              ? `API key active${authStatus.apiKeyPreview ? ` · ${authStatus.apiKeyPreview}` : ""}${authStatus.updatedAt ? ` · updated ${new Date(authStatus.updatedAt).toLocaleString()}` : ""}.`
               : "No e3d.ai credentials are stored yet."
         ),
         React.createElement(
