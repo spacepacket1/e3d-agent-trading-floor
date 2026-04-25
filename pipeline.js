@@ -1138,6 +1138,64 @@ function e3dFetch(url, fallback = null) {
   }
 }
 
+function postJson(pathname, body) {
+  const url = buildUrl(E3D_API_BASE_URL, pathname, {});
+  const marker = "__E3D_HTTP_STATUS__";
+  try {
+    const stdout = runShell("curl", [
+      "-s", "--max-time", "30",
+      "-X", "POST",
+      "-H", "Content-Type: application/json",
+      "-o", "-", "-w", `${marker}%{http_code}`,
+      "--data-binary", "@-",
+      ...buildCurlAuthArgs(url),
+      url
+    ], { input: JSON.stringify(body) });
+    const output = String(stdout || "");
+    const markerIndex = output.lastIndexOf(marker);
+    const statusCode = Number(markerIndex >= 0 ? output.slice(markerIndex + marker.length).trim() : "0") || 0;
+    const text = markerIndex >= 0 ? output.slice(0, markerIndex).trim() : output.trim();
+    if (statusCode < 200 || statusCode >= 300) {
+      log("e3d_api_error", { url, pathname, status: statusCode });
+      return null;
+    }
+    return text ? JSON.parse(text) : null;
+  } catch (err) {
+    log("e3d_api_error", { url, pathname, message: err.message });
+    return null;
+  }
+}
+
+function sendTradeEmail(trade) {
+  try {
+    const side = trade.side === "buy" ? "BUY" : "SELL";
+    const symbol = trade.symbol || "?";
+    const price = trade.price ? `$${toNum(trade.price, 0).toFixed(6)}` : "?";
+    const decision = trade.paper_trade_ticket?.executor_decision || null;
+    const mode = decision === "approve_live" ? "LIVE" : "PAPER";
+    const subject = `[${mode}] ${side} ${symbol} @ ${price}`;
+
+    const amountLine = trade.side === "buy"
+      ? `Amount: $${toNum(trade.cost_usd, 0).toFixed(2)}`
+      : `Proceeds: $${toNum(trade.proceeds_usd, 0).toFixed(2)} &nbsp;|&nbsp; PnL: $${toNum(trade.pnl_usd, 0).toFixed(2)}`;
+
+    const html = `<h2>${side} ${symbol}</h2><ul>`
+      + `<li><b>Mode:</b> ${mode}</li>`
+      + `<li><b>Price:</b> ${price}</li>`
+      + `<li><b>${amountLine}</b></li>`
+      + `<li><b>Reason:</b> ${trade.reason || "—"}</li>`
+      + `<li><b>Lifecycle:</b> ${trade.trade_lifecycle || "—"}</li>`
+      + `<li><b>Trade ID:</b> ${trade.trade_id || "—"}</li>`
+      + `<li><b>Time:</b> ${trade.ts}</li>`
+      + `</ul>`;
+
+    postJson("/email", { subject, html });
+    log("trade_email_sent", { side: trade.side, symbol, mode });
+  } catch (err) {
+    log("trade_email_error", { message: err.message });
+  }
+}
+
 function asArray(value) {
   if (Array.isArray(value)) return value;
   if (!value || typeof value !== "object") return [];
@@ -4607,6 +4665,7 @@ async function runCycle(runContext = {}) {
       if (trade) sellTrades.push(trade);
     }
     if (sellTrades.length) log("sell_trades", sellTrades);
+    for (const trade of sellTrades) sendTradeEmail(trade);
 
     // 4. HARVEST EXIT SCAN
     const harvestPayload = runHarvestDirect(portfolio, portfolioIntelligence);
@@ -4662,6 +4721,7 @@ async function runCycle(runContext = {}) {
       }
     }
     if (harvestTrades.length) log("harvest_trades", harvestTrades);
+    for (const trade of harvestTrades) sendTradeEmail(trade);
 
     // 5. RISK ON CANDIDATES
     const { approved, rejected } = runRiskForCandidates(scoutPayload.candidates || [], portfolio);
@@ -4714,6 +4774,10 @@ async function runCycle(runContext = {}) {
       });
     }
     if (rotationResults.length) log("rotations", rotationResults);
+    for (const r of rotationResults) {
+      if (r.result?.sellTrade) sendTradeEmail(r.result.sellTrade);
+      if (r.result?.buyTrade) sendTradeEmail(r.result.buyTrade);
+    }
 
     // 8. NORMAL BUY ENGINE
     const buyActions = policy.allow_buys
@@ -4760,6 +4824,7 @@ async function runCycle(runContext = {}) {
       }
     }
     if (buyTrades.length) log("buy_trades", buyTrades);
+    for (const trade of buyTrades) sendTradeEmail(trade);
 
     // 9. RECOMPUTE MARKET VALUE AFTER ACTIONS
     for (const pos of Object.values(portfolio.positions)) {
