@@ -3111,6 +3111,8 @@ function runHarvestDirect(portfolio, portfolioIntelligence = null) {
     "You have been given pre-fetched E3D exit-risk story data for held positions, live quant signals, and macro context. Analyze all of it and return STRICT JSON only — one object, no markdown.",
     "Classify every held position as hold, monitor, trim, or exit based on ALL available evidence.",
     "Only add a position to exit_candidates if action is trim or exit.",
+    "EVIDENCE RULE: Every exit_candidate MUST include at least 2 strings in evidence[] citing specific story types, flow signals, or price/liquidity data. Do NOT put a position in exit_candidates without at least 2 evidence items — move it to monitor instead.",
+    "MASS EXIT RULE: Do not propose trim or exit for more than half the portfolio in a single cycle unless you have direct exit-risk story matches (LIQUIDITY_DRAIN, RUG_LIQUIDITY_PULL, TREASURY_DISTRIBUTION, SECURITY_RISK) for those positions. When evidence is weak or absent, use monitor, not exit.",
     "",
     "SIGNAL TIMING — know whether you're in the setup, the move, or the dump:",
     "- PRE-PUMP HOLD CONFIRMS (bullish for holding): STAGING, CLUSTER, FUNNEL, ACCUMULATION, SMART_MONEY, SMART_MONEY_LEADER, FLOW — fresh accumulation means the thesis is intact. SMART_MONEY_LEADER with late_crowding=false is a strong hold signal.",
@@ -3129,8 +3131,9 @@ function runHarvestDirect(portfolio, portfolioIntelligence = null) {
     "- unrealized_pnl_pct < -8%: flag for stop review; exit if thesis invalid and no recovery signal",
     "",
     `Output shape: {scan_timestamp, portfolio_summary, position_reviews[], exit_candidates[], stories_checked[]}`,
-    `Each position_review: {source_agent:"harvest", created_at:"${createdAt}", expires_at:"${expiresAt}", token:{symbol,name,chain:"ethereum",contract_address,category}, position:{quantity,avg_entry_price,current_price,market_value_usd,cost_basis_usd,unrealized_pnl_usd,unrealized_pnl_pct}, action:"hold"|"monitor"|"trim"|"exit", thesis_state, thesis_summary, what_changed, why_now, confidence, conviction_score, opportunity_score, review_priority, summary, evidence[], risks[], what_would_change_my_mind[], next_best_alternative, current_regime, market_data:{current_price,change_24h_pct,price_source:"e3d"}, narrative_data:{story_strength,thesis_health,flow_direction}}`,
-    `Each exit_candidate: same as position_review plus {setup_type, edge_source, suggested_exit_fraction, target_exit_price, decision_price, exit_priority}`
+    `Each position_review: {source_agent:"harvest", created_at:"${createdAt}", expires_at:"${expiresAt}", token:{symbol,name,chain:"ethereum",contract_address,category}, position:{quantity,avg_entry_price,current_price,market_value_usd,cost_basis_usd,unrealized_pnl_usd,unrealized_pnl_pct}, action:"hold"|"monitor"|"trim"|"exit", thesis_state, thesis_summary, what_changed, why_now, confidence:integer(0-100), conviction_score:integer(0-100), opportunity_score:integer(0-100), review_priority, summary, evidence[], risks[], what_would_change_my_mind[], next_best_alternative, current_regime, market_data:{current_price,change_24h_pct,price_source:"e3d"}, narrative_data:{story_strength,thesis_health,flow_direction}}`,
+    `Each exit_candidate: same as position_review plus {setup_type, edge_source, suggested_exit_fraction, target_exit_price, decision_price, exit_priority}`,
+    `stories_checked[]: REQUIRED — one entry per story type listed in EXIT RISK STORIES and HOLD CONFIRM SIGNALS sections — {type:string, found:number, flagged_addresses:string[]}. Include ALL types even when found=0. This field must not be empty or null.`
   ].join("\n");
 
   // Build macro context block for Harvest
