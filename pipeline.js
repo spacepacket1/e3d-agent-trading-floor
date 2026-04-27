@@ -715,6 +715,37 @@ function toNum(v, fallback = 0) {
   return Number.isFinite(n) ? n : fallback;
 }
 
+function optionalNum(v) {
+  if (v == null || v === "") return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+function saneStopPrice(rawStop, entryPrice) {
+  const entry = optionalNum(entryPrice);
+  if (!(entry > 0)) return 0;
+  const stop = optionalNum(rawStop);
+  if (stop > 0 && stop < entry) return stop;
+  return entry * 0.9;
+}
+
+function sanitizeTargets(targets, entryPrice) {
+  const entry = optionalNum(entryPrice);
+  const source = targets && typeof targets === "object" ? targets : {};
+  const out = {};
+  for (const key of ["target_1", "target_2", "target_3"]) {
+    const value = optionalNum(source[key]);
+    out[key] = value > 0 && (!(entry > 0) || value > entry) ? value : null;
+  }
+  return out;
+}
+
+function targetHit(price, target) {
+  const p = optionalNum(price);
+  const t = optionalNum(target);
+  return p > 0 && t > 0 && p >= t;
+}
+
 // Normalize a confidence/conviction value to 0-100 integer scale.
 // Handles: string labels ("high"→80, "medium"→55, "low"→30),
 // decimal 0-1 values (0.9→90), and already-correct 0-100 integers.
@@ -2514,6 +2545,7 @@ function runScoutDirect(portfolio, portfolioIntelligence = null) {
   // a pre-pump story already existed, so it is not a pure late entry.
   const momentumWithSignal = data.tokenUniverse
     .filter(t => t.address && !disqualifiedAddresses.has(t.address))
+    .filter(t => signalBackedAddresses.has(t.address))
     .filter(t => (t.change_30m ?? 0) > 3)
     .sort((a, b) => (b.change_30m ?? 0) - (a.change_30m ?? 0))
     .slice(0, 15);
@@ -2911,7 +2943,7 @@ function runScoutDirect(portfolio, portfolioIntelligence = null) {
     if (!candidate.token.name && storyPrice?.symbol) candidate.token.name = storyPrice.symbol;
 
     const price = tokenRow?.priceUSD ?? tokenRow?.price_usd ?? storyPrice?.price ?? 0;
-    const liq = tokenRow?.liquidityUSD ?? tokenRow?.effectiveLiquidityUSD ?? tokenRow?.liquidity_usd ?? storyPrice?.liq ?? 0;
+    const liq = tokenRow?.effectiveLiquidityUSD || tokenRow?.liquidityUSD || tokenRow?.liquidity_usd || storyPrice?.liq || 0;
     const mcap = tokenRow?.marketCapUSD ?? tokenRow?.market_cap_usd ?? storyPrice?.mcap ?? 0;
     const vol24 = tokenRow?.volume24hUSD ?? tokenRow?.volume_24h_usd ?? 0;
     const chg30m = tokenRow?.changes?.["30M"]?.percent ?? 0;
@@ -3123,14 +3155,23 @@ function runHarvestDirect(portfolio, portfolioIntelligence = null) {
 
   // Build positionData using live portfolio prices (refreshed by runScoutDirect) rather than
   // the stale dossier prices, and augment with DexScreener flow + funding rate signals.
-  const positionData = dossier.holdings.slice(0, 8).map((item) => {
-    const sym  = item?.token?.symbol || null;
+  const dossierByAddress = new Map();
+  const dossierBySymbol = new Map();
+  for (const item of dossier.holdings || []) {
     const addr = cleanAddress(item?.token?.contract_address || "");
-    // Prefer live portfolio position price over dossier (dossier is built before price refresh)
-    const livePos    = sym && portfolio.positions[sym] ? portfolio.positions[sym] : null;
-    const livePrice  = livePos?.current_price ?? toNum(item?.market_data?.current_price, 0);
-    const costBasis  = toNum(item?.position?.cost_basis_usd, 0);
-    const qty        = livePos?.quantity ?? toNum(item?.position?.quantity, 0);
+    const sym = String(item?.token?.symbol || "").trim().toLowerCase();
+    if (addr) dossierByAddress.set(addr, item);
+    if (sym) dossierBySymbol.set(sym, item);
+  }
+
+  const positionData = positions.map((livePos) => {
+    const sym  = livePos?.symbol || null;
+    const addr = cleanAddress(livePos?.contract_address || "");
+    const item = (addr && dossierByAddress.get(addr)) || (sym && dossierBySymbol.get(String(sym).toLowerCase())) || {};
+    // Prefer live portfolio position price over dossier (dossier is built before price refresh).
+    const livePrice  = toNum(livePos?.current_price, toNum(item?.market_data?.current_price, 0));
+    const costBasis  = toNum(livePos?.cost_basis_usd, toNum(item?.position?.cost_basis_usd, 0));
+    const qty        = toNum(livePos?.quantity, toNum(item?.position?.quantity, 0));
     const marketVal  = qty * livePrice;
     const pnlUsd     = marketVal - costBasis;
     const pnlPct     = costBasis > 0 ? +(pnlUsd / costBasis * 100).toFixed(2) : 0;
@@ -3139,9 +3180,9 @@ function runHarvestDirect(portfolio, portfolioIntelligence = null) {
     return {
       symbol:              sym,
       contract_address:    addr || null,
-      category:            item?.token?.category || "unknown",
+      category:            livePos?.category || item?.token?.category || "unknown",
       quantity:            qty,
-      avg_entry_price:     toNum(item?.position?.avg_entry_price, 0),
+      avg_entry_price:     toNum(livePos?.avg_entry_price, toNum(item?.position?.avg_entry_price, 0)),
       current_price:       livePrice,
       market_value_usd:    +marketVal.toFixed(2),
       cost_basis_usd:      costBasis,
@@ -3567,13 +3608,82 @@ function runRiskDirect(proposal, paperMode = false) {
   return callDirectJson("risk", systemPrompt, userPrompt, "RISK_DIRECT");
 }
 
+function deterministicBuyGate(proposal, portfolio) {
+  const blockers = [];
+  const addr = cleanAddress(proposal?.token?.contract_address || "");
+  const price = optionalNum(proposal?.market_data?.current_price);
+  const liquidity = optionalNum(proposal?.liquidity_data?.liquidity_usd);
+  const marketCap = optionalNum(proposal?.market_data?.market_cap_usd);
+  const volume24h = optionalNum(proposal?.market_data?.volume_24h_usd);
+  const slippageBps = optionalNum(proposal?.execution_data?.estimated_slippage_bps);
+  const fragilityScore = optionalNum(proposal?._fragility_score);
+  const fraudRisk = optionalNum(proposal?.fraud_risk);
+  const confidence = normalizeScore(proposal?.confidence);
+  const flowSignal = String(proposal?._dex_flow?.flow_signal || "").toLowerCase();
+  const fundingAvoid = proposal?._funding_rate?.avoid_new_longs === true;
+  const evidenceCount = Array.isArray(proposal?.evidence) ? proposal.evidence.length : 0;
+  const category = proposal?.token?.category || "unknown";
+  const categoryPct = categoryExposurePct(portfolio, category);
+
+  if (!isEvmAddress(addr)) blockers.push("invalid_contract_address");
+  if (!(price > 0)) blockers.push("missing_or_invalid_price");
+  if (!(liquidity >= 100000)) blockers.push("liquidity_below_100k");
+  if (!(marketCap >= 2000000)) blockers.push("market_cap_below_2m");
+  if (!(volume24h >= 10000)) blockers.push("volume_24h_below_10k");
+  if (!(slippageBps != null && slippageBps <= 300)) blockers.push("slippage_above_300bps_or_missing");
+  if (fragilityScore != null && fragilityScore >= 70) blockers.push("fragility_score_high");
+  if (fraudRisk != null && fraudRisk >= toNum(portfolio?.settings?.reject_fraud_risk_gte, SETTINGS_DEFAULTS.reject_fraud_risk_gte)) blockers.push("fraud_risk_high");
+  if (confidence != null && confidence <= 55) blockers.push("confidence_too_low");
+  if (flowSignal === "distribution" || flowSignal === "strong_distribution") blockers.push("bearish_order_flow");
+  if (fundingAvoid) blockers.push("overcrowded_long_funding");
+  if (evidenceCount < 2) blockers.push("insufficient_signal_evidence");
+  if (categoryPct >= toNum(portfolio?.settings?.category_cap_pct, SETTINGS_DEFAULTS.category_cap_pct)) blockers.push("category_exposure_cap_reached");
+
+  return {
+    ok: blockers.length === 0,
+    blockers,
+    metrics: {
+      price,
+      liquidity_usd: liquidity,
+      market_cap_usd: marketCap,
+      volume_24h_usd: volume24h,
+      slippage_bps: slippageBps,
+      fragility_score: fragilityScore,
+      fraud_risk: fraudRisk,
+      confidence,
+      flow_signal: flowSignal || null,
+      funding_avoid_new_longs: fundingAvoid,
+      evidence_count: evidenceCount,
+      category_exposure_pct: categoryPct
+    }
+  };
+}
+
+function deterministicRiskReject(proposal, gate, paperMode) {
+  return {
+    decision: "reject",
+    reason_summary: `Rejected by deterministic buy gate: ${gate.blockers.join(", ")}`,
+    reason_codes: gate.blockers,
+    risk_score: 100,
+    checks_passed: [],
+    checks_failed: gate.blockers,
+    blocker_list: gate.blockers,
+    deterministic_gate: true,
+    paper_mode: Boolean(paperMode),
+    gate_metrics: gate.metrics
+  };
+}
+
 function runRiskForCandidates(candidates, portfolio) {
   const approved = [];
   const rejected = [];
 
   const paperMode = Boolean(portfolio?.settings?.paper_mode);
   for (const proposal of candidates) {
-    const risk = runRiskDirect(proposal, paperMode);
+    const gate = deterministicBuyGate(proposal, portfolio);
+    const risk = gate.ok
+      ? runRiskDirect(proposal, paperMode)
+      : deterministicRiskReject(proposal, gate, paperMode);
     const entry = { proposal, risk };
 
     const decision = String(risk?.decision || "").toLowerCase();
@@ -3587,6 +3697,87 @@ function runRiskForCandidates(candidates, portfolio) {
         ...proposal,
         _risk: risk,
         _risk_handoff_decision: decision,
+        _score: computePositionScoreLike(proposal)
+      });
+    } else {
+      rejected.push(entry);
+    }
+  }
+
+  return { approved, rejected };
+}
+
+function findHeldPositionForProposal(portfolio, proposal) {
+  const token = proposal?.token || {};
+  const addr = cleanAddress(token.contract_address || proposal?.contract_address || "");
+  const symbol = String(token.symbol || proposal?.symbol || "").trim().toLowerCase();
+  return Object.values(portfolio?.positions || {}).find((pos) => {
+    const posAddr = cleanAddress(pos?.contract_address || "");
+    const posSymbol = String(pos?.symbol || "").trim().toLowerCase();
+    return (addr && posAddr && addr === posAddr) || (symbol && posSymbol && symbol === posSymbol);
+  }) || null;
+}
+
+function validateExitProposal(proposal, portfolio) {
+  const blockers = [];
+  const token = proposal?.token || {};
+  const addr = cleanAddress(token.contract_address || proposal?.contract_address || "");
+  const held = findHeldPositionForProposal(portfolio, proposal);
+  const fraction = resolveExecutorExitFraction(proposal, {});
+
+  if (!isEvmAddress(addr)) blockers.push("invalid_contract_address");
+  if (!held) blockers.push("position_not_held");
+  if (!(fraction > 0 && fraction <= 1)) blockers.push("invalid_exit_fraction");
+  if (held && !(toNum(held.quantity, 0) > 0)) blockers.push("position_quantity_zero");
+  if (held && !(toNum(held.current_price, 0) > 0)) blockers.push("position_price_missing");
+
+  return {
+    ok: blockers.length === 0,
+    blockers,
+    held,
+    fraction
+  };
+}
+
+function runRiskForExitCandidates(candidates, portfolio) {
+  const approved = [];
+  const rejected = [];
+  const paperMode = Boolean(portfolio?.settings?.paper_mode);
+  const approveDecision = paperMode ? "paper_trade" : "approve_for_executor";
+
+  for (const proposal of candidates) {
+    const gate = validateExitProposal(proposal, portfolio);
+    const risk = gate.ok
+      ? {
+          decision: approveDecision,
+          reason_summary: "Exit reduces exposure on an existing held position.",
+          reason_codes: ["valid_exit_reduces_position_risk"],
+          risk_score: 0,
+          checks_passed: ["position_held", "valid_exit_fraction"],
+          checks_failed: [],
+          blocker_list: [],
+          deterministic_gate: true,
+          approved_exit_fraction: gate.fraction
+        }
+      : {
+          decision: "reject",
+          reason_summary: `Rejected exit: ${gate.blockers.join(", ")}`,
+          reason_codes: gate.blockers,
+          risk_score: 100,
+          checks_passed: [],
+          checks_failed: gate.blockers,
+          blocker_list: gate.blockers,
+          deterministic_gate: true
+        };
+    const entry = { proposal, risk };
+    const handoffToExecutor = gate.ok;
+    recordRiskDecisionEvent(proposal, risk, portfolio, getTrainingContext(), handoffToExecutor);
+
+    if (handoffToExecutor) {
+      approved.push({
+        ...proposal,
+        _risk: risk,
+        _risk_handoff_decision: String(risk.decision || "").toLowerCase(),
         _score: computePositionScoreLike(proposal)
       });
     } else {
@@ -3651,11 +3842,12 @@ function resolveExecutorAllocation(action, review, portfolio) {
 }
 
 function buildPaperTradeTicket(candidate, allocationUsd, review, reason) {
+  const assumedEntry = toNum(candidate?.market_data?.current_price, 0);
   return {
     created_at: nowIso(),
-    assumed_entry: toNum(candidate?.market_data?.current_price, 0),
-    stop: toNum(candidate?.invalidation_price, 0),
-    targets: deepClone(candidate?.targets || {}),
+    assumed_entry: assumedEntry,
+    stop: saneStopPrice(candidate?.invalidation_price, assumedEntry),
+    targets: deepClone(sanitizeTargets(candidate?.targets, assumedEntry)),
     thesis_summary: candidate?.summary ?? candidate?.thesis_summary ?? null,
     edge_source: candidate?.edge_source ?? null,
     reason,
@@ -3765,7 +3957,11 @@ function evaluateSellActions(portfolio) {
       continue;
     }
 
-    if (!pos.partials_taken?.target_1 && price >= toNum(pos.targets?.target_1, Infinity)) {
+    if (!pos.partials_taken || typeof pos.partials_taken !== "object") {
+      pos.partials_taken = { target_1: false, target_2: false, target_3: false };
+    }
+
+    if (!pos.partials_taken?.target_1 && targetHit(price, pos.targets?.target_1)) {
       actions.push({
         type: "sell",
         symbol: pos.symbol,
@@ -3775,7 +3971,7 @@ function evaluateSellActions(portfolio) {
       pos.partials_taken.target_1 = true;
     }
 
-    if (!pos.partials_taken?.target_2 && price >= toNum(pos.targets?.target_2, Infinity)) {
+    if (!pos.partials_taken?.target_2 && targetHit(price, pos.targets?.target_2)) {
       actions.push({
         type: "sell",
         symbol: pos.symbol,
@@ -3785,7 +3981,7 @@ function evaluateSellActions(portfolio) {
       pos.partials_taken.target_2 = true;
     }
 
-    if (!pos.partials_taken?.target_3 && price >= toNum(pos.targets?.target_3, Infinity)) {
+    if (!pos.partials_taken?.target_3 && targetHit(price, pos.targets?.target_3)) {
       actions.push({
         type: "sell",
         symbol: pos.symbol,
@@ -3965,6 +4161,8 @@ function openPosition(portfolio, candidate, allocationUsd, reason = "buy") {
   if (portfolio.cash_usd < allocationUsd) return null;
 
   const symbol = candidate.token.symbol;
+  const stopPrice = saneStopPrice(candidate.invalidation_price, price);
+  const targets = sanitizeTargets(candidate.targets, price);
 
   // Guard: don't open a new position slot when already at the limit
   if (!portfolio.positions[symbol] && Object.keys(portfolio.positions).length >= portfolio.settings.max_open_positions) {
@@ -3986,8 +4184,8 @@ function openPosition(portfolio, candidate, allocationUsd, reason = "buy") {
     existing.avg_entry_price = totalCost / totalQty;
     existing.current_price = price;
     existing.market_value_usd = totalQty * price;
-    existing.stop_price = candidate.invalidation_price;
-    existing.targets = candidate.targets;
+    existing.stop_price = stopPrice;
+    existing.targets = targets;
     existing.score = candidate._score ?? computePositionScoreLike(candidate);
     existing.category = candidate.token.category || existing.category || "unknown";
     existing.last_updated_at = nowIso();
@@ -4003,8 +4201,8 @@ function openPosition(portfolio, candidate, allocationUsd, reason = "buy") {
       cost_basis_usd: allocationUsd,
       current_price: price,
       market_value_usd: allocationUsd,
-      stop_price: toNum(candidate.invalidation_price, price * 0.9),
-      targets: deepClone(candidate.targets || {}),
+      stop_price: stopPrice,
+      targets: deepClone(targets),
       partials_taken: {
         target_1: false,
         target_2: false,
@@ -4676,7 +4874,7 @@ async function runCycle(runContext = {}) {
       recordHarvestDecisionEvent(candidate, candidate, portfolio, trainingContext, portfolioIntelligence.prompt_snapshot);
     }
 
-    const { approved: harvestApproved, rejected: harvestRejected } = runRiskForCandidates(harvestPayload.exit_candidates || [], portfolio);
+    const { approved: harvestApproved, rejected: harvestRejected } = runRiskForExitCandidates(harvestPayload.exit_candidates || [], portfolio);
     if (harvestApproved.length) {
       log("harvest_approved", harvestApproved.map((x) => ({
         symbol: x.token.symbol,
