@@ -2188,13 +2188,13 @@ function fetchScoutData() {
 
   // Primary: tokens ranked by story activity in the last hour — freshest on-chain signals first.
   const byStory = endpointArray(fetchJson("/fetchTokenPricesWithHistoryAllRanges", {
-    dataSource: 1, sortBy: "storyCount", sortDir: "desc", trendInterval: "1H", limit: 200
+    sortBy: "storyCount", sortDir: "desc", trendInterval: "1H", limit: 200
   })).map(mapToken);
 
   // Secondary: top-volume tokens for flow-only fallback (tokens with strong DEX activity
   // but no story yet — kept as a last-resort pool for the flow-only entry path).
   const byVolume = endpointArray(fetchJson("/fetchTokenPricesWithHistoryAllRanges", {
-    dataSource: 1, sortBy: "volume24hUSD", sortDir: "desc", limit: 200
+    sortBy: "volume24hUSD", sortDir: "desc", limit: 200
   })).map(mapToken);
 
   // Merge, deduplicate — story-sorted tokens first so they win dedup priority.
@@ -2257,6 +2257,34 @@ function fetchScoutData() {
   }
   log("scout_story_enrichment", { queued: enrichQueue.length, added: tokenUniverse.length - tokenUniverseAll.length + tokenUniverseAll.filter(t => nonTradeablePattern.test(t.symbol || "")).length });
 
+  // Probe stories for high-volume tokens whose storyCount field is stale (shows 0 despite
+  // having active on-chain stories when queried by address). The global /stories endpoint
+  // returns only one story per type; active tokens with real signal but no recent type-slot
+  // are invisible until probed. Without this, ASTEROID/ZBT/RIVER-class tokens pass volume
+  // ranking but are dropped at the universe filter (story_count_1h=0, not in global feed).
+  {
+    const coveredByGlobal = new Set();
+    for (const items of Object.values(stories)) {
+      for (const s of items) {
+        const addr = cleanAddress(s?.meta?.token_address || s?.primary_token || s?.address || "");
+        if (addr) coveredByGlobal.add(addr);
+      }
+    }
+    const probeTargets = tokenUniverse
+      .filter(t => t.address && !coveredByGlobal.has(t.address) && (t.volume_24h_usd ?? 0) > 1_000_000)
+      .slice(0, 25);
+    let probeAdded = 0;
+    for (const t of probeTargets) {
+      const probeStories = endpointArray(fetchJson("/stories", { q: t.address, scope: "any", limit: 10 }));
+      for (const s of probeStories) {
+        addStory(s);
+        if (_cycleMarketContext) _cycleMarketContext.allStories.push(s);
+        probeAdded++;
+      }
+    }
+    log("scout_story_probe", { probed: probeTargets.length, stories_added: probeAdded });
+  }
+
   // Build a set of token addresses that appear in any E3D story this cycle.
   // The price API's storyCount field and the stories API update at different rates,
   // causing legitimate story tokens to show story_count_1h=0 and get dropped.
@@ -2285,10 +2313,8 @@ function fetchScoutData() {
 
   const thesisSignalStories = thesisStories.length ? thesisStories : endpointArray(stories.THESIS);
 
-  // No per-token supplemental stories calls here — the global limit=200 call above is the
-  // stories budget for the cycle. The dossier phase already consumed per-position calls,
-  // and the /stories endpoint rate-limits at ~5-6 calls per window; adding more here
-  // causes 429s that knock out the global call entirely.
+  // Supplemental per-address story probing is done above in the probe block (up to 25 calls).
+  // No further per-token calls here — the dossier phase consumed per-position calls already.
 
   const storyTypeDist = Object.fromEntries(Object.entries(stories).map(([k, v]) => [k, v.length]));
   log("scout_story_types", { types: Object.keys(storyTypeDist).length, dist: storyTypeDist });
