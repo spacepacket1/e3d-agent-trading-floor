@@ -16,6 +16,7 @@ import {
   buildHarvestEvidenceDiagnostics,
   buildScoutEvidenceDiagnostics
 } from "./scripts/evidenceDiagnostics.js";
+import { evaluatePromotionActivation } from "./scripts/liveReadiness.js";
 import {
   buildHarvestEvidencePacket,
   buildScoutEvidencePacket,
@@ -6800,11 +6801,11 @@ ${JSON.stringify(proposal)}
   return taskPrompt.trim();
 }
 
-function buildExecutorPrompt(proposal, portfolio) {
+function buildExecutorPrompt(proposal, portfolio, paperMode = Boolean(portfolio?.settings?.paper_mode)) {
   const taskPrompt = `
 Validate this structured proposal and return JSON only.
 
-Paper mode is ${portfolio.settings.paper_mode ? "enabled" : "disabled"}.
+Paper mode is ${paperMode ? "enabled" : "disabled"}.
 
 Allowed decisions:
 - reject
@@ -7057,11 +7058,10 @@ function deterministicRiskReject(proposal, gate, paperMode) {
   }, proposal);
 }
 
-function runRiskForCandidates(candidates, portfolio) {
+function runRiskForCandidates(candidates, portfolio, paperMode = Boolean(portfolio?.settings?.paper_mode)) {
   const approved = [];
   const rejected = [];
 
-  const paperMode = Boolean(portfolio?.settings?.paper_mode);
   for (const candidate of candidates) {
     const proposal = deepClone(candidate);
     const marketDataQuality = buildMarketDataQuality(proposal, {
@@ -7084,7 +7084,7 @@ function runRiskForCandidates(candidates, portfolio) {
     const entry = { proposal, risk };
 
     const decision = String(risk?.decision || "").toLowerCase();
-    const paperModeHandoff = portfolio?.settings?.paper_mode && decision === "paper_trade";
+    const paperModeHandoff = paperMode && decision === "paper_trade";
     const handoffToExecutor = decision === "approve_for_executor" || paperModeHandoff;
 
     recordRiskDecisionEvent(proposal, risk, portfolio, getTrainingContext(), handoffToExecutor);
@@ -7136,10 +7136,9 @@ function validateExitProposal(proposal, portfolio) {
   };
 }
 
-function runRiskForExitCandidates(candidates, portfolio) {
+function runRiskForExitCandidates(candidates, portfolio, paperMode = Boolean(portfolio?.settings?.paper_mode)) {
   const approved = [];
   const rejected = [];
-  const paperMode = Boolean(portfolio?.settings?.paper_mode);
   const approveDecision = paperMode ? "paper_trade" : "approve_for_executor";
 
   for (const proposal of candidates) {
@@ -7185,11 +7184,11 @@ function runRiskForExitCandidates(candidates, portfolio) {
   return { approved, rejected };
 }
 
-function runExecutorDirect(proposal, portfolio) {
-  const paperMode = portfolio?.settings?.paper_mode ? "enabled" : "disabled";
+function runExecutorDirect(proposal, portfolio, paperMode = Boolean(portfolio?.settings?.paper_mode)) {
+  const paperModeLabel = paperMode ? "enabled" : "disabled";
   const systemPrompt = [
     "You are Executor, a crypto trade final-approval agent.",
-    `Paper mode is ${paperMode}.`,
+    `Paper mode is ${paperModeLabel}.`,
     "Validate the proposal and return STRICT JSON only — one object, no markdown.",
     `Allowed executor_decision values: "reject", "paper_trade", "approve_live", "reduce_size", "wait_for_entry", "monitor_only"`,
     `Response shape: {token, executor_decision, reason_summary, risk_checks[], execution_checks[], portfolio_checks[], approved_size_pct, approved_exit_fraction, max_slippage_bps, entry_status, stop_level, target_plan, paper_trade_ticket, live_execution_allowed, blocker_list[], follow_up_action}`,
@@ -7200,12 +7199,12 @@ function runExecutorDirect(proposal, portfolio) {
   return callDirectJson("executor", systemPrompt, userPrompt, "EXECUTOR_DIRECT");
 }
 
-function runExecutorForActions(actions, portfolio, tradeKind) {
+function runExecutorForActions(actions, portfolio, tradeKind, paperMode = Boolean(portfolio?.settings?.paper_mode)) {
   const reviewed = [];
 
   for (const action of actions) {
     const proposal = buildExecutorProposal(action, portfolio, tradeKind);
-    const review = runExecutorDirect(proposal, portfolio);
+    const review = runExecutorDirect(proposal, portfolio, paperMode);
     recordExecutorDecisionEvent({ action, proposal, review }, portfolio, getTrainingContext(), tradeKind);
     reviewed.push({ action, proposal, review, tradeKind });
   }
@@ -7888,7 +7887,7 @@ function evaluateRotationActions(portfolio, approved) {
   return actions.slice(0, settings.max_rotations_per_cycle);
 }
 
-function executeRotation(portfolio, action, review = null) {
+function executeRotation(portfolio, action, review = null, paperMode = Boolean(portfolio?.settings?.paper_mode)) {
   const from = portfolio.positions[action.from_symbol];
   if (!from) return null;
 
@@ -7935,7 +7934,7 @@ function executeRotation(portfolio, action, review = null) {
 
   const evaluationTs = nowIso();
   const rotationRiskDecision = evaluateRiskDecision({
-    mode: "paper",
+    mode: paperMode ? "paper" : "live",
     enforcement_mode: "enforced",
     evaluated_at: evaluationTs,
     portfolio,
@@ -7951,7 +7950,7 @@ function executeRotation(portfolio, action, review = null) {
 
   const rotationTokenRiskScan = buildCandidateTokenRiskScan(candidate, portfolio, {
     evaluated_at: evaluationTs,
-    mode: "paper",
+    mode: paperMode ? "paper" : "live",
     side: "buy",
     risk_decision_id: rotationRiskDecision.risk_decision_id,
     risk_decision_ref: buildRiskDecisionRef(rotationRiskDecision, getTrainingContext()),
@@ -8560,7 +8559,7 @@ function buildManagerReport(cycleState, portfolio) {
   });
   const riskRejected = riskDecisions.filter((record) => !riskApproved.includes(record));
   const riskApprovalRate = riskDecisions.length ? riskApproved.length / riskDecisions.length : 0;
-  const paperMode = Boolean(portfolio?.settings?.paper_mode);
+  const paperMode = cycleState.effective_paper_mode ?? Boolean(portfolio?.settings?.paper_mode);
 
   if (riskDecisions.length < scoutCandidates.length) {
     pushManagerFlag(riskFlags, "critical", "risk", "RISK_INCOMPLETE_DECISIONS", "Risk did not evaluate every Scout candidate.");
@@ -8700,6 +8699,7 @@ function buildManagerReport(cycleState, portfolio) {
   const report = {
     report_id: reportId,
     generated_at: generatedAt,
+    strategy_version: PAPER_ORDER_STRATEGY_VERSION,
     cycle_id: cycleState.cycle_id || null,
     pipeline_run_id: cycleState.pipeline_run_id || null,
     cycle_index: cycleState.cycle_index ?? null,
@@ -8928,14 +8928,28 @@ async function runCycle(runContext = {}) {
     cycle_index: runContext.cycle_index ?? null,
     market_regime: portfolio.stats.market_regime || "unknown"
   };
+  const liveActivation = portfolio?.settings?.paper_mode === false
+    ? evaluatePromotionActivation({
+        strategyVersion: PAPER_ORDER_STRATEGY_VERSION,
+        promotionReportsDir: PROMOTION_REPORTS_DIR,
+        readinessReportsDir: REPORTS_DIR
+      })
+    : null;
+  const effectivePaperMode = portfolio?.settings?.paper_mode === false
+    ? !Boolean(liveActivation?.activation_allowed)
+    : true;
+  const effectiveMode = effectivePaperMode ? "paper" : "live";
+  trainingContext.effective_paper_mode = effectivePaperMode;
+  trainingContext.effective_mode = effectiveMode;
+  trainingContext.live_activation = liveActivation;
   recordOperatorAction({
     action_type: "pipeline_cycle_start",
     actor: runContext.actor || "pipeline",
     role: "operator",
-    reason: runContext.reason || "paper pipeline cycle started",
+    reason: runContext.reason || `${effectiveMode} pipeline cycle started`,
     resource: "pipeline",
     new_state: {
-      mode: "paper",
+      mode: effectiveMode,
       pipeline_run_id: trainingContext.pipeline_run_id,
       cycle_id: trainingContext.cycle_id,
       cycle_index: trainingContext.cycle_index
@@ -8947,6 +8961,24 @@ async function runCycle(runContext = {}) {
     }
   });
   setTrainingContext(trainingContext);
+  if (liveActivation && !liveActivation.activation_allowed) {
+    const blockerCodes = liveActivation.blockers.map((blocker) => blocker.code);
+    const warning = {
+      code: "live_activation_blocked",
+      severity: "warning",
+      requested_mode: "live",
+      effective_mode: "paper",
+      strategy_version: PAPER_ORDER_STRATEGY_VERSION,
+      blocker_codes: blockerCodes,
+      activation: {
+        activation_allowed: false,
+        readiness_met: Boolean(liveActivation.readiness?.readiness_met),
+        confirmation_report_id: liveActivation.confirmation?.selected_report_id || null
+      }
+    };
+    log("pipeline_warning", warning);
+    recordAuxiliaryEvent("pipeline_warning", "pipeline", portfolio, warning);
+  }
   // Build quant context: DexScreener flow for held positions, macro regime, Binance funding rates.
   // Start best-effort Maps fetch before quant work so it overlaps this cycle's context assembly.
   const cycleMapsContextPromise = fetchMapsContext({ signalLimit: 5 }).catch((error) => {
@@ -9062,7 +9094,7 @@ async function runCycle(runContext = {}) {
       recordHarvestDecisionEvent(candidate, candidate, portfolio, trainingContext, portfolioIntelligence.prompt_snapshot);
     }
 
-    const { approved: harvestApproved, rejected: harvestRejected } = runRiskForExitCandidates(harvestPayload.exit_candidates || [], portfolio);
+      const { approved: harvestApproved, rejected: harvestRejected } = runRiskForExitCandidates(harvestPayload.exit_candidates || [], portfolio, effectivePaperMode);
     if (harvestApproved.length) {
       log("harvest_approved", harvestApproved.map((x) => ({
         symbol: x.token.symbol,
@@ -9075,7 +9107,7 @@ async function runCycle(runContext = {}) {
     const sizedHarvestApproved = harvestApproved
       .map((action) => applySizingToExitAction(action, buildPositionSizingDecision(action, portfolio, "exit")))
       .filter(Boolean);
-    const harvestReviews = runExecutorForActions(sizedHarvestApproved, portfolio, "exit");
+    const harvestReviews = runExecutorForActions(sizedHarvestApproved, portfolio, "exit", effectivePaperMode);
     if (harvestReviews.length) {
       log("executor_exit", harvestReviews.map((item) => ({
         symbol: item.action.token?.symbol || item.action.symbol,
@@ -9119,7 +9151,7 @@ async function runCycle(runContext = {}) {
     // Cross-source price validation first: reject any candidate whose e3d price can't be corroborated
     // by an independent feed (guards against the e3d mispricing that caused the SATA incident).
     scoutPayload.candidates = validateCandidatePricesAgainstSources(scoutPayload.candidates || [], portfolio);
-    const { approved, rejected } = runRiskForCandidates(scoutPayload.candidates || [], portfolio);
+    const { approved, rejected } = runRiskForCandidates(scoutPayload.candidates || [], portfolio, effectivePaperMode);
     log("risk_approved", approved.map((x) => ({
       symbol: x.token.symbol,
       score: x._score,
@@ -9150,7 +9182,7 @@ async function runCycle(runContext = {}) {
     const sizedRotationActions = rotationActions
       .map((action) => ({ ...action, position_sizing: buildPositionSizingDecision(action, portfolio, "rotation") }));
     const rotationReviews = policy.allow_rotations
-      ? runExecutorForActions(sizedRotationActions, portfolio, "rotation")
+      ? runExecutorForActions(sizedRotationActions, portfolio, "rotation", effectivePaperMode)
       : [];
     if (rotationReviews.length) {
       log("executor_rotation", rotationReviews.map((item) => ({
@@ -9165,7 +9197,7 @@ async function runCycle(runContext = {}) {
     for (const item of rotationReviews) {
       if (!executorAllowsTrade(item.review)) continue;
 
-      const result = executeRotation(portfolio, item.action, item.review);
+      const result = executeRotation(portfolio, item.action, item.review, effectivePaperMode);
       if (result) rotationResults.push({
         from_symbol: item.action.from_symbol,
         to_symbol: item.action.to_candidate.token.symbol,
@@ -9194,7 +9226,7 @@ async function runCycle(runContext = {}) {
       .map((action) => applySizingToBuyAction(action, buildPositionSizingDecision(action, portfolio, "buy")))
       .filter((action) => action && action.allocation_usd >= portfolio.settings.min_trade_usd);
     const buyReviews = policy.allow_buys
-      ? runExecutorForActions(buyActions, portfolio, "buy")
+      ? runExecutorForActions(buyActions, portfolio, "buy", effectivePaperMode)
       : [];
     if (buyReviews.length) {
       log("executor_buy", buyReviews.map((item) => ({
@@ -9213,7 +9245,7 @@ async function runCycle(runContext = {}) {
 
       const evaluationTs = nowIso();
       const riskDecision = evaluateRiskDecision({
-        mode: "paper",
+        mode: effectivePaperMode ? "paper" : "live",
         enforcement_mode: "enforced",
         evaluated_at: evaluationTs,
         portfolio,
@@ -9229,7 +9261,7 @@ async function runCycle(runContext = {}) {
 
       const tokenRiskScan = buildCandidateTokenRiskScan(item.action.candidate, portfolio, {
         evaluated_at: evaluationTs,
-        mode: "paper",
+        mode: effectivePaperMode ? "paper" : "live",
         side: "buy",
         risk_decision_id: riskDecision.risk_decision_id,
         risk_decision_ref: buildRiskDecisionRef(riskDecision, getTrainingContext()),
@@ -9405,10 +9437,10 @@ async function runCycle(runContext = {}) {
       action_type: "pipeline_cycle_stop",
       actor: runContext.actor || "pipeline",
       role: "operator",
-      reason: "paper pipeline cycle ended",
+      reason: `${effectiveMode} pipeline cycle ended`,
       resource: "pipeline",
       previous_state: {
-        mode: "paper",
+        mode: effectiveMode,
         pipeline_run_id: trainingContext.pipeline_run_id,
         cycle_id: trainingContext.cycle_id,
         cycle_index: trainingContext.cycle_index
