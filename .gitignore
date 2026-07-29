@@ -10,3 +10,4 @@ portfolio.json
 reports/
 .claude/*
 !.claude/settings.json
+.e3d-pilot/
