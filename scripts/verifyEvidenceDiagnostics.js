@@ -91,10 +91,49 @@ assert.equal(event.scout.total_tokens, 670);
 assert.equal(event.scout.address_repairs_in_cycle, 2);
 assert.equal(event.harvest.exit_candidates_with_thin_evidence, 1);
 
+// Regression: when callers re-aggregate from an already-built diagnostics object
+// (no raw llm_batches), pre-computed LLM aggregates must be preserved, not zeroed.
+const rebuiltScout = buildScoutEvidenceDiagnostics({
+  ...scout,
+  coverage: {
+    coverage_pct: 0.91,
+    expected_types: ["THESIS", "ACCUMULATION", "FLOW"],
+    self_reported_types: ["THESIS", "ACCUMULATION"],
+    evidence_cited_types: ["THESIS"]
+  },
+  stories_checked: [{ type: "THESIS" }, { type: "ACCUMULATION" }],
+  candidates: [
+    { evidence: ["THESIS conviction 78", "current_price 1.25 volume_24h 450000", "flow_signal accumulation"] },
+    { evidence: ["watchlist support", "liquidity_usd 250000"] },
+    { evidence: [] }
+  ]
+});
+assert.equal(rebuiltScout.llm_batch_count, 2, "rebuilt scout must preserve llm_batch_count");
+assert.equal(rebuiltScout.prompt_chars, 2000, "rebuilt scout must preserve prompt_chars");
+assert.equal(rebuiltScout.total_tokens, 670, "rebuilt scout must preserve total_tokens");
+assert.equal(rebuiltScout.llm_duration_ms, 1600, "rebuilt scout must preserve llm_duration_ms");
+
+const rebuiltHarvest = buildHarvestEvidenceDiagnostics({
+  ...harvest,
+  coverage: {
+    coverage_pct: 0.88,
+    expected_types: ["SECURITY_RISK", "TREASURY_DISTRIBUTION", "MOVER"],
+    self_reported_types: ["SECURITY_RISK", "MOVER"],
+    evidence_cited_types: ["SECURITY_RISK", "TREASURY_DISTRIBUTION"]
+  },
+  stories_checked: [{ type: "SECURITY_RISK" }],
+  position_reviews: [{ evidence: ["x"] }],
+  exit_candidates: [{ evidence: ["x", "y"] }]
+});
+assert.equal(rebuiltHarvest.llm_batch_count, 1, "rebuilt harvest must preserve llm_batch_count");
+assert.equal(rebuiltHarvest.total_tokens, 530, "rebuilt harvest must preserve total_tokens");
+
 console.log(JSON.stringify({
   verified: true,
   scout_batches: scout.llm_batch_count,
   scout_candidates_with_thin_evidence: scout.candidates_with_thin_evidence,
   harvest_positions_reviewed: harvest.positions_reviewed,
-  harvest_exit_candidates_with_thin_evidence: harvest.exit_candidates_with_thin_evidence
+  harvest_exit_candidates_with_thin_evidence: harvest.exit_candidates_with_thin_evidence,
+  rebuilt_scout_batches: rebuiltScout.llm_batch_count,
+  rebuilt_harvest_batches: rebuiltHarvest.llm_batch_count
 }, null, 2));

@@ -74,8 +74,28 @@ function buildEvidenceSourceDistribution(items = []) {
   return stableObjectFromEntries(counts.entries());
 }
 
-function buildLlmAggregate(batchDiagnostics = []) {
-  const batches = Array.isArray(batchDiagnostics) ? batchDiagnostics : [];
+function buildLlmAggregate(input = []) {
+  const batches = Array.isArray(input)
+    ? input
+    : Array.isArray(input?.llm_batches) ? input.llm_batches : [];
+  // Fallback path: caller passed an already-aggregated diagnostics object
+  // (no raw batches). Preserve the pre-computed counters instead of zeroing them.
+  if (batches.length === 0 && !Array.isArray(input) && input && typeof input === "object") {
+    const hasAggregate =
+      input.llm_batch_count != null || input.prompt_chars != null ||
+      input.total_tokens != null || input.llm_duration_ms != null;
+    if (hasAggregate) {
+      const numOrNull = (v) => (Number.isFinite(toNum(v, NaN)) ? toNum(v) : null);
+      return {
+        batch_count: toNum(input.llm_batch_count, 0),
+        prompt_chars: toNum(input.prompt_chars, 0),
+        prompt_tokens: numOrNull(input.prompt_tokens),
+        completion_tokens: numOrNull(input.completion_tokens),
+        total_tokens: numOrNull(input.total_tokens),
+        duration_ms: toNum(input.llm_duration_ms, 0)
+      };
+    }
+  }
   return {
     batch_count: batches.length,
     prompt_chars: batches.reduce((sum, batch) => sum + toNum(batch?.prompt_chars, 0), 0),
@@ -121,7 +141,7 @@ function buildCandidateEvidenceSummary(items = [], fullEvidenceMin = 3) {
 }
 
 export function buildScoutEvidenceDiagnostics(input = {}) {
-  const llm = buildLlmAggregate(input.llm_batches);
+  const llm = buildLlmAggregate(input);
   const candidates = buildCandidateEvidenceSummary(input.candidates, 3);
   const coverage = buildCoverageSummary(input.coverage, input.stories_checked);
   return {
@@ -144,7 +164,7 @@ export function buildScoutEvidenceDiagnostics(input = {}) {
 }
 
 export function buildHarvestEvidenceDiagnostics(input = {}) {
-  const llm = buildLlmAggregate(input.llm_batches);
+  const llm = buildLlmAggregate(input);
   const exits = buildCandidateEvidenceSummary(input.exit_candidates, 2);
   const coverage = buildCoverageSummary(input.coverage, input.stories_checked);
   const positionReviews = Array.isArray(input.position_reviews) ? input.position_reviews : [];
