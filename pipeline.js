@@ -731,10 +731,30 @@ function appendTrainingEvent(record) {
 }
 
 function readJsonLines(filePath, maxLines = 1000) {
+  // Read only a bounded tail window instead of the whole file. Log files like
+  // training-events.jsonl grow unbounded (500MB+); fs.readFileSync(..., "utf8") on a file
+  // over ~512MB throws "Cannot create a string longer than 0x1fffffe8 characters" (V8's max
+  // string length), which the old implementation's catch swallowed — silently returning []
+  // and making every caller believe the log was empty.
   try {
-    const content = fs.readFileSync(filePath, "utf8");
+    const stat = fs.statSync(filePath);
+    const bytesPerLineBudget = 100_000; // generous upper bound per JSON line
+    const requestedBytes = maxLines > 0 ? maxLines * bytesPerLineBudget : stat.size;
+    const maxBytes = Math.min(stat.size, Math.max(2_000_000, requestedBytes), 400_000_000);
+    const start = Math.max(0, stat.size - maxBytes);
+    const fd = fs.openSync(filePath, "r");
+    let content;
+    try {
+      const buf = Buffer.alloc(stat.size - start);
+      fs.readSync(fd, buf, 0, buf.length, start);
+      content = buf.toString("utf8");
+    } finally {
+      fs.closeSync(fd);
+    }
     const lines = content.split("\n");
-    const tail = maxLines > 0 ? lines.slice(-maxLines) : lines;
+    // A non-zero start means the read began mid-line; drop that partial fragment.
+    const usableLines = start > 0 ? lines.slice(1) : lines;
+    const tail = maxLines > 0 ? usableLines.slice(-maxLines) : usableLines;
     const records = [];
     for (const line of tail) {
       const trimmed = line.trim();
@@ -1043,6 +1063,14 @@ function recordOutcomeEvent(trade, positionBefore, portfolio, context = {}) {
     : null;
   const holdingHours = holdingMs != null ? Math.max(0, Math.round(holdingMs / 360000) / 10) : null;
   const realizedDirection = pnlUsd > 1 ? "up" : pnlUsd < -1 ? "down" : "flat";
+  const peakPrice = positionBefore?.peak_price ?? null;
+  const troughPrice = positionBefore?.trough_price ?? null;
+  const maxGainPct = (peakPrice != null && entryPrice != null && entryPrice !== 0)
+    ? Math.round(((peakPrice - entryPrice) / entryPrice) * 10000) / 100
+    : null;
+  const maxDrawdownPct = (troughPrice != null && entryPrice != null && entryPrice !== 0)
+    ? Math.round(((troughPrice - entryPrice) / entryPrice) * 10000) / 100
+    : null;
   const record = buildTrainingEventRecord("outcome", "pipeline", portfolio, context, {
     trade_id: trade?.trade_id || null,
     position_id: trade?.position_id || null,
@@ -1051,8 +1079,8 @@ function recordOutcomeEvent(trade, positionBefore, portfolio, context = {}) {
     pnl_usd: pnlUsd,
     return_pct: returnPct,
     holding_hours: holdingHours,
-    max_gain_pct: null,
-    max_drawdown_pct: null,
+    max_gain_pct: maxGainPct,
+    max_drawdown_pct: maxDrawdownPct,
     realized_direction: realizedDirection,
     exit_price: exitPrice,
     entry_price: entryPrice,
@@ -1582,6 +1610,13 @@ function buildRegimeSentinelPolicy(portfolio, quantContext) {
     reasonCodes.push("risk_off_blocks_speculative_buys");
   }
   if (macro?.btc && toNum(macro.btc.change_24h_pct, 0) < -3) reasonCodes.push("btc_downtrend");
+  // Cross-asset macro annotations — informational only. The actual gating already happened
+  // via `regime` (computed in buildCycleQuantContext, which folds these same readings in);
+  // these reason codes exist purely so it's visible in logs *why* a cycle got throttled.
+  if (macro?.equity_index && toNum(macro.equity_index.change_24h_pct, 0) < -2) reasonCodes.push("equity_selloff_correlated");
+  if (macro?.dxy && toNum(macro.dxy.change_24h_pct, 0) > 0.5) reasonCodes.push("dollar_strength_headwind");
+  if (macro?.regulatory?.stance === "risk_on") reasonCodes.push("regulatory_flag_risk_on");
+  if (macro?.regulatory?.stance === "risk_off") reasonCodes.push("regulatory_flag_risk_off");
   if (!reasonCodes.length) reasonCodes.push("baseline_regime_policy");
 
   return {
@@ -2836,8 +2871,8 @@ function buildAgentCoverageLog(agentId, payload) {
 }
 
 const LLM_BASE_URL = process.env.LLM_BASE_URL || "http://127.0.0.1:5050";
-const SCOUT_ADAPTER_PATH = process.env.SCOUT_ADAPTER_PATH || "./adapters_scout_v1";
-const HARVEST_ADAPTER_PATH = process.env.HARVEST_ADAPTER_PATH || "./adapters_harvest_v1";
+const SCOUT_ADAPTER_PATH = process.env.SCOUT_ADAPTER_PATH || null;
+const HARVEST_ADAPTER_PATH = process.env.HARVEST_ADAPTER_PATH || null;
 const LLM_MODEL = process.env.LLM_MODEL || "mlx-community/Qwen2.5-14B-Instruct-4bit";
 
 const COINGECKO_API_KEY = process.env.COINGECKO_API_KEY || "";
@@ -3001,7 +3036,8 @@ function callLLMDirect(systemPrompt, userMessage, { maxRetries = 1, agent = "unk
 // ─── Tool-calling infrastructure ──────────────────────────────────────────────
 // Enabled via LLM_TOOL_USE=1 env var. Agents call e3d.ai APIs themselves
 // instead of receiving pre-fetched data in the prompt.
-const TOOL_USE_ENABLED = ["1", "true", "yes"].includes(String(process.env.LLM_TOOL_USE || "").trim().toLowerCase());
+const TOOL_USE_MODE = process.env.LLM_TOOL_USE_OVERRIDE ?? process.env.LLM_TOOL_USE ?? "";
+const TOOL_USE_ENABLED = ["1", "true", "yes"].includes(String(TOOL_USE_MODE).trim().toLowerCase());
 // Keep KV cache manageable on 25GB RAM: truncate large API responses before
 // they enter the conversation history. 6000 chars ≈ 1500 tokens per result.
 const MAX_TOOL_RESULT_CHARS = 6000;
@@ -3019,7 +3055,7 @@ const E3D_AGENT_TOOLS = [
     type: "function",
     function: {
       name: "e3d_get_candidates",
-      description: "Fetch E3D pre-computed buy candidates — highest-quality signals, already multi-story correlated. Always call this first when scouting.",
+      description: "Fetch E3D pre-computed buy candidates — highest-quality signals, already multi-story correlated. Use to discover candidates not yet in your cognitive state, or to refresh stale data.",
       parameters: {
         type: "object",
         properties: {
@@ -3417,6 +3453,10 @@ function buildCognitiveState(portfolio) {
       conviction:   Math.max(Number(c?.conviction_score || c?.score || 65), storySig?.conviction || 0),
       why_now:      compactText(c?.why_now || c?.rationale || c?.description || "", 120),
       market,
+      // E3D-provided risk metadata, carried through so it can override the LLM's
+      // output (which never reports these) before buy ranking/gating runs on it.
+      fraud_risk:        optionalNum(c?.fraud_risk),
+      liquidity_quality: optionalNum(c?.liquidity_quality),
       drill_down:   ["token_info", "transactions"]
     });
   }
@@ -5021,6 +5061,7 @@ function runScoutWithTools(portfolio, portfolioIntelligence = null) {
     "   - e3d_get_token_info(address): get current price, liquidity, volume for a specific token",
     "   - e3d_get_transactions(address): check for whale moves or unusual activity",
     "   - e3d_get_stories(type=...): fetch a specific story type not yet in the state",
+    "   Do NOT call e3d_get_candidates — your cognitive state was built from it already.",
     "3. Once satisfied, return your final candidate list. Do NOT call tools if the state already contains enough evidence.",
     "",
     "SIGNAL PRIORITY:",
@@ -5038,7 +5079,11 @@ function runScoutWithTools(portfolio, portfolioIntelligence = null) {
     "QUALITY GATE — required for ALL proposals: price_usd > 0, liquidity_usd > 100000, market_cap_usd > 2000000, volume_24h_usd > 10000.",
     "SKIP: stablecoins, wrapped assets, change_7d_pct > 300% (already pumped), MOVER/SURGE alone.",
     `SKIP ALREADY HELD: symbols=${JSON.stringify([...heldSymbols])}, addresses=${JSON.stringify([...heldAddresses])}`,
-    macroContext ? `MACRO: regime=${macroContext.regime} new_positions_ok=${macroContext.new_positions_ok} tighten_stops=${macroContext.tighten_stops}` : "",
+    macroContext ? `MACRO: regime=${macroContext.regime} new_positions_ok=${macroContext.new_positions_ok} tighten_stops=${macroContext.tighten_stops}` +
+      (macroContext.dxy ? ` dxy_24h=${macroContext.dxy.change_24h_pct}%` : "") +
+      (macroContext.equity_index ? ` equity_24h=${macroContext.equity_index.change_24h_pct}%` : "") +
+      (macroContext.regulatory ? ` regulatory=${macroContext.regulatory.stance}(${macroContext.regulatory.reason || "operator flag"})` : "")
+      : "",
     _cycleMapsContext?.destinations?.length
       ? `MAPS DESTINATIONS: ${_cycleMapsContext.destinations
           .slice(0, 3)
@@ -5106,19 +5151,43 @@ function runScoutWithTools(portfolio, portfolioIntelligence = null) {
   const rawCandidates = Array.isArray(batchResult?.candidates) ? batchResult.candidates : [];
   const unhelded = filterScoutCandidatesAgainstPortfolio(rawCandidates, portfolio);
 
+  // Build a real-market lookup from cognitive state to override LLM-reported values in the
+  // quality gate. The LLM sometimes hallucitates market data (e.g. identical $925 liquidity
+  // for unrelated tokens). Cognitive state market data comes from the token universe API call
+  // made by Node.js, so it is authoritative.
+  const cogStateMarketByAddr = new Map();
+  // Deterministic fraud_risk/liquidity_quality per candidate, keyed by address — see
+  // buildCognitiveState's e3dCandidates loop. Scout's own output schema never asks the LLM
+  // for these fields, so without this override they silently stay unset (0) all the way into
+  // computePositionScoreLike's buy ranking and deterministicBuyGate's fraud_risk_high check.
+  const cogStateRiskByAddr = new Map();
+  for (const entry of (cognitiveState.candidates || [])) {
+    const addr = cleanAddress(entry?.address || "");
+    if (!addr) continue;
+    if (entry?.market) cogStateMarketByAddr.set(addr, entry.market);
+    if (entry?.fraud_risk != null || entry?.liquidity_quality != null) {
+      cogStateRiskByAddr.set(addr, { fraud_risk: entry.fraud_risk ?? null, liquidity_quality: entry.liquidity_quality ?? null });
+    }
+  }
+
   const qualifiedCandidates = unhelded.filter(c => {
     const addr = cleanAddress(c?.token?.contract_address || "");
     if (!addr) { log("scout_tool_candidate_dropped", { reason: "no_address", symbol: c?.token?.symbol }); return false; }
-    const liq   = toNum(c?.liquidity_data?.liquidity_usd, 0);
-    const mcap  = toNum(c?.market_data?.market_cap_usd, 0);
-    const vol   = toNum(c?.market_data?.volume_24h_usd, 0);
-    const price = toNum(c?.market_data?.current_price, 0);
+    const real = cogStateMarketByAddr.get(addr) || {};
+    const liq   = toNum(real.liquidity_usd, 0) || toNum(c?.liquidity_data?.liquidity_usd, 0);
+    const mcap  = toNum(real.market_cap_usd, 0) || toNum(c?.market_data?.market_cap_usd, 0);
+    const vol   = toNum(real.volume_24h_usd, 0) || toNum(c?.market_data?.volume_24h_usd, 0);
+    const price = toNum(real.price_usd, 0) || toNum(c?.market_data?.current_price, 0);
     if (price <= 0 || liq < 100000 || mcap < 2000000 || vol < 10000) {
-      log("scout_tool_candidate_dropped", { reason: "quality_gate_failed", symbol: c?.token?.symbol, addr, liq, mcap, vol, price });
+      log("scout_tool_candidate_dropped", { reason: "quality_gate_failed", symbol: c?.token?.symbol, addr, liq, mcap, vol, price, real_data_available: cogStateMarketByAddr.has(addr) });
       return false;
     }
     if (heldAddresses.has(addr)) { log("scout_tool_candidate_dropped", { reason: "already_held", addr }); return false; }
     return true;
+  }).map(c => {
+    const addr = cleanAddress(c?.token?.contract_address || "");
+    const risk = cogStateRiskByAddr.get(addr);
+    return risk ? { ...c, fraud_risk: risk.fraud_risk, liquidity_quality: risk.liquidity_quality } : c;
   });
 
   log("scout_tool_candidates", { raw: rawCandidates.length, after_held: unhelded.length, qualified: qualifiedCandidates.length });
@@ -6335,6 +6404,39 @@ function applyHarvestFastPathExits(result, reviewContext, exitSignals, createdAt
   return result;
 }
 
+// Used when the harvest LLM call/parse fails outright, so the cycle can still
+// run rotations/buys and persist whatever hard-sells already happened instead
+// of discarding the whole cycle (see HARVEST_REPLY_NOT_JSON handling in runCycle).
+function buildHarvestFailureFallback(portfolio, createdAt) {
+  const emptyResult = {
+    scan_timestamp: createdAt,
+    portfolio_summary: {
+      market_regime: portfolio?.stats?.market_regime || "unknown",
+      cash_usd: portfolio.cash_usd || 0,
+      equity_usd: portfolio.equity_usd || 0,
+      position_count: 0,
+      tracked_positions: 0,
+      average_thesis_strength: 0,
+      average_thesis_freshness: 0,
+      average_narrative_decay: 0,
+      average_opportunity_score: 0
+    },
+    position_reviews: [],
+    exit_candidates: [],
+    stories_checked: []
+  };
+  emptyResult.evidence_diagnostics = buildHarvestEvidenceDiagnostics({
+    input_candidate_count: 0,
+    llm_batches: [],
+    positions_reviewed: 0,
+    position_reviews: [],
+    exit_candidates: [],
+    stories_checked: [],
+    coverage: null
+  });
+  return emptyResult;
+}
+
 function runHarvestDirect(portfolio, portfolioIntelligence = null) {
   if (TOOL_USE_ENABLED) return runHarvestWithTools(portfolio, portfolioIntelligence);
   const createdAt = nowIso();
@@ -6468,50 +6570,59 @@ function runHarvestDirect(portfolio, portfolioIntelligence = null) {
   ].join("\n");
 
   const harvestLlmBatches = [];
-  const rawText = callLLMDirect(systemPrompt, userMessage, { agent: "harvest" });
-  const harvestMeta = getLastLLMMeta("harvest") || {};
-  harvestLlmBatches.push({
-    prompt_chars: systemPrompt.length + userMessage.length,
-    prompt_tokens: harvestMeta.prompt_tokens,
-    completion_tokens: harvestMeta.completion_tokens,
-    total_tokens: harvestMeta.total_tokens,
-    duration_ms: harvestMeta.duration_ms
-  });
+  const HARVEST_JSON_RETRY_ADDENDUM = "\n\nYour previous reply could not be parsed as JSON. Return ONLY one strict JSON object matching the schema above — no markdown fences, no commentary before or after the object.";
+  let lastRawText = "";
 
-  // Extract JSON
-  let jsonStr = rawText.trim();
-  const fenceMatch = jsonStr.match(/```(?:json)?\s*([\s\S]*?)```/);
-  if (fenceMatch) jsonStr = fenceMatch[1].trim();
-  const firstBrace = jsonStr.indexOf("{");
-  if (firstBrace !== -1) {
-    let depth = 0, end = -1;
-    for (let i = firstBrace; i < jsonStr.length; i++) {
-      if (jsonStr[i] === "{") depth++;
-      else if (jsonStr[i] === "}") { depth--; if (depth === 0) { end = i; break; } }
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const attemptSystemPrompt = attempt === 1 ? systemPrompt : systemPrompt + HARVEST_JSON_RETRY_ADDENDUM;
+    const rawText = callLLMDirect(attemptSystemPrompt, userMessage, { agent: "harvest" });
+    lastRawText = rawText;
+    const harvestMeta = getLastLLMMeta("harvest") || {};
+    harvestLlmBatches.push({
+      prompt_chars: attemptSystemPrompt.length + userMessage.length,
+      prompt_tokens: harvestMeta.prompt_tokens,
+      completion_tokens: harvestMeta.completion_tokens,
+      total_tokens: harvestMeta.total_tokens,
+      duration_ms: harvestMeta.duration_ms
+    });
+
+    // Extract JSON
+    let jsonStr = rawText.trim();
+    const fenceMatch = jsonStr.match(/```(?:json)?\s*([\s\S]*?)```/);
+    if (fenceMatch) jsonStr = fenceMatch[1].trim();
+    const firstBrace = jsonStr.indexOf("{");
+    if (firstBrace !== -1) {
+      let depth = 0, end = -1;
+      for (let i = firstBrace; i < jsonStr.length; i++) {
+        if (jsonStr[i] === "{") depth++;
+        else if (jsonStr[i] === "}") { depth--; if (depth === 0) { end = i; break; } }
+      }
+      if (end !== -1) jsonStr = jsonStr.slice(firstBrace, end + 1);
+      else jsonStr = jsonStr.slice(firstBrace);
     }
-    if (end !== -1) jsonStr = jsonStr.slice(firstBrace, end + 1);
-    else jsonStr = jsonStr.slice(firstBrace);
-  }
 
-  try {
-    const parsed = JSON.parse(jsonStr);
-    return applyHarvestFastPathExits(
-      finalizeHarvestLLMResult(parsed, portfolio, reviewContext, dossier, createdAt, expiresAt, harvestLlmBatches),
-      reviewContext, _positionExitSignals, createdAt, expiresAt
-    );
-  } catch (parseErr) {
-    // LLM may have hit max_tokens mid-response — try to repair truncated JSON
     try {
-      const repaired = JSON.parse(repairTruncatedJson(jsonStr));
-      log("harvest_json_repaired", { raw_length: rawText.length });
+      const parsed = JSON.parse(jsonStr);
       return applyHarvestFastPathExits(
-        finalizeHarvestLLMResult(repaired, portfolio, reviewContext, dossier, createdAt, expiresAt, harvestLlmBatches),
+        finalizeHarvestLLMResult(parsed, portfolio, reviewContext, dossier, createdAt, expiresAt, harvestLlmBatches),
         reviewContext, _positionExitSignals, createdAt, expiresAt
       );
-    } catch (_) {
-      throw new Error(`HARVEST_REPLY_NOT_JSON\n${rawText.slice(0, 500)}`);
+    } catch (parseErr) {
+      // LLM may have hit max_tokens mid-response — try to repair truncated JSON
+      try {
+        const repaired = JSON.parse(repairTruncatedJson(jsonStr));
+        log("harvest_json_repaired", { raw_length: rawText.length, attempt });
+        return applyHarvestFastPathExits(
+          finalizeHarvestLLMResult(repaired, portfolio, reviewContext, dossier, createdAt, expiresAt, harvestLlmBatches),
+          reviewContext, _positionExitSignals, createdAt, expiresAt
+        );
+      } catch (_) {
+        log("harvest_json_parse_failed", { attempt, raw_length: rawText.length });
+      }
     }
   }
+
+  throw new Error(`HARVEST_REPLY_NOT_JSON\n${lastRawText.slice(0, 500)}`);
 }
 
 function runHarvestWithTools(portfolio, portfolioIntelligence = null) {
@@ -6561,7 +6672,10 @@ function runHarvestWithTools(portfolio, portfolioIntelligence = null) {
 
   const macroContext = _cycleQuantContext?.macro;
   const macroLine = macroContext
-    ? `MACRO: regime=${macroContext.regime} tighten_stops=${macroContext.tighten_stops} new_positions_ok=${macroContext.new_positions_ok}`
+    ? `MACRO: regime=${macroContext.regime} tighten_stops=${macroContext.tighten_stops} new_positions_ok=${macroContext.new_positions_ok}` +
+      (macroContext.dxy ? ` dxy_24h=${macroContext.dxy.change_24h_pct}%` : "") +
+      (macroContext.equity_index ? ` equity_24h=${macroContext.equity_index.change_24h_pct}%` : "") +
+      (macroContext.regulatory ? ` regulatory=${macroContext.regulatory.stance}(${macroContext.regulatory.reason || "operator flag"})` : "")
     : "";
   const policyLine = _cycleRegimePolicy
     ? `REGIME POLICY: allow_harvest_exits=${_cycleRegimePolicy.allow_harvest_exits} reason_codes=${(_cycleRegimePolicy.reason_codes || []).join(",")}`
@@ -7488,6 +7602,8 @@ function applyPositionMark(pos, newPrice, source, maxDev = SETTINGS_DEFAULTS.max
   }
   pos.current_price = price;
   pos.market_value_usd = pos.quantity * price;
+  pos.peak_price = Math.max(pos.peak_price ?? price, price);
+  pos.trough_price = Math.min(pos.trough_price ?? price, price);
   pos.last_updated_at = nowIso();
   return true;
 }
@@ -7557,6 +7673,7 @@ function validateCandidatePricesAgainstSources(candidates, portfolio) {
   const survivors = [];
   let droppedDivergence = 0, droppedNoCorroboration = 0, allowedUnvalidated = 0;
   for (const c of candidates) {
+    const candidate = { ...c };
     const symbol = c?.token?.symbol;
     const category = c?.token?.category;
     const e3dPrice = toNum(c?.market_data?.current_price, 0);
@@ -7576,35 +7693,35 @@ function validateCandidatePricesAgainstSources(candidates, portfolio) {
     if (e3dPrice > 0 && refPrice > 0 && maxDiv > 0) {
       const ratio = e3dPrice / refPrice;
       const ok = !(ratio > maxDiv || ratio < 1 / maxDiv);
-      c._price_validation = { e3d_price: e3dPrice, ref_price: refPrice, ref_source: refSource,
-                              ratio: +ratio.toFixed(2), max_div: maxDiv, peg_sensitive: pegSensitive, ok };
+      candidate._price_validation = { e3d_price: e3dPrice, ref_price: refPrice, ref_source: refSource,
+                                      ratio: +ratio.toFixed(2), max_div: maxDiv, peg_sensitive: pegSensitive, ok };
       if (!ok) {
         droppedDivergence++;
-        log("candidate_price_divergence_rejected", { symbol, address: addr, ...c._price_validation });
+        log("candidate_price_divergence_rejected", { symbol, address: addr, ...candidate._price_validation });
         continue;
       }
-      survivors.push(c);
+      survivors.push(candidate);
       continue;
     }
 
     // Case 2: no independent corroboration. Fail closed for the mispricing-prone population.
     const thinLiquidity = liqFloor > 0 && (!(liquidity > 0) || liquidity < liqFloor);
     const requireCorroboration = pegSensitive || thinLiquidity;
-    c._price_validation = { e3d_price: e3dPrice, ref_price: refPrice || null, ref_source: refSource,
-                            ratio: null, max_div: maxDiv, peg_sensitive: pegSensitive,
-                            liquidity_usd: liquidity || null, note: "no_independent_price",
-                            ok: !requireCorroboration };
+    candidate._price_validation = { e3d_price: e3dPrice, ref_price: refPrice || null, ref_source: refSource,
+                                    ratio: null, max_div: maxDiv, peg_sensitive: pegSensitive,
+                                    liquidity_usd: liquidity || null, note: "no_independent_price",
+                                    ok: !requireCorroboration };
     if (requireCorroboration) {
       droppedNoCorroboration++;
       log("candidate_no_corroboration_rejected", {
         symbol, address: addr,
         reason: pegSensitive ? "peg_sensitive_requires_independent_price" : "thin_liquidity_requires_independent_price",
-        ...c._price_validation
+        ...candidate._price_validation
       });
       continue;
     }
     allowedUnvalidated++;
-    survivors.push(c);
+    survivors.push(candidate);
   }
   if (droppedDivergence || droppedNoCorroboration || allowedUnvalidated) {
     log("candidate_price_validation_summary", {
@@ -8033,6 +8150,8 @@ function openPosition(portfolio, candidate, allocationUsd, reason = "buy", optio
     existing.avg_entry_price = totalCost / totalQty;
     existing.current_price = price;
     existing.market_value_usd = totalQty * price;
+    existing.peak_price = Math.max(existing.peak_price ?? existing.avg_entry_price, price);
+    existing.trough_price = Math.min(existing.trough_price ?? existing.avg_entry_price, price);
     existing.stop_price = stopPrice;
     existing.targets = targets;
     existing.score = candidate._score ?? computePositionScoreLike(candidate);
@@ -8061,6 +8180,8 @@ function openPosition(portfolio, candidate, allocationUsd, reason = "buy", optio
       cost_basis_usd: totalCashDebitUsd,
       current_price: price,
       market_value_usd: quantity * price,
+      peak_price: price,
+      trough_price: price,
       stop_price: stopPrice,
       targets: deepClone(targets),
       partials_taken: {
@@ -9038,8 +9159,6 @@ async function runCycle(runContext = {}) {
       recordCandidateEvent(candidate, portfolio, trainingContext, portfolioIntelligence.prompt_snapshot);
     }
 
-    const scoutHash = sha256(scoutPayload);
-
     // 2. UPDATE HELD POSITION SNAPSHOTS
     updateHoldingsFromScout(portfolio, scoutPayload.holdings_updates || []);
 
@@ -9054,8 +9173,18 @@ async function runCycle(runContext = {}) {
     for (const trade of sellTrades) sendTradeEmail(trade);
 
     // 4. HARVEST EXIT SCAN
-    const harvestPayload = runHarvestDirect(portfolio, portfolioIntelligence);
-    validateHarvestPayload(harvestPayload);
+    // Isolated in its own try/catch: a bad LLM reply here should cost this
+    // cycle its exits, not also the hard-sells already computed above and the
+    // rotations/buys still to come below (previously any harvest failure threw
+    // out of the whole runCycle try block and the cycle never got saved at all).
+    let harvestPayload;
+    try {
+      harvestPayload = runHarvestDirect(portfolio, portfolioIntelligence);
+      validateHarvestPayload(harvestPayload);
+    } catch (harvestErr) {
+      log("harvest_cycle_skipped", { message: String(harvestErr?.message || harvestErr).slice(0, 500) });
+      harvestPayload = buildHarvestFailureFallback(portfolio, nowIso());
+    }
     log("harvest", harvestPayload);
     log("agent_coverage", buildAgentCoverageLog("harvest", harvestPayload));
     for (const candidate of harvestPayload.exit_candidates || []) {
@@ -9119,6 +9248,7 @@ async function runCycle(runContext = {}) {
     // Cross-source price validation first: reject any candidate whose e3d price can't be corroborated
     // by an independent feed (guards against the e3d mispricing that caused the SATA incident).
     scoutPayload.candidates = validateCandidatePricesAgainstSources(scoutPayload.candidates || [], portfolio);
+    const scoutHash = sha256(scoutPayload);
     const { approved, rejected } = runRiskForCandidates(scoutPayload.candidates || [], portfolio);
     log("risk_approved", approved.map((x) => ({
       symbol: x.token.symbol,
@@ -9338,7 +9468,15 @@ async function runCycle(runContext = {}) {
       recordAuxiliaryEvent("pipeline_warning", "pipeline", portfolio, warning);
     }
     const cyclePipelineLogEntries = [
-      { stage: "quant_context", data: { macro_regime: _cycleQuantContext?.macro?.regime, new_positions_ok: _cycleQuantContext?.macro?.new_positions_ok, tighten_stops: _cycleQuantContext?.macro?.tighten_stops } },
+      { stage: "quant_context", data: {
+        macro_regime: _cycleQuantContext?.macro?.regime,
+        new_positions_ok: _cycleQuantContext?.macro?.new_positions_ok,
+        tighten_stops: _cycleQuantContext?.macro?.tighten_stops,
+        dxy_change_24h_pct: _cycleQuantContext?.macro?.dxy?.change_24h_pct ?? null,
+        equity_change_24h_pct: _cycleQuantContext?.macro?.equity_index?.change_24h_pct ?? null,
+        regulatory_stance: _cycleQuantContext?.macro?.regulatory?.stance ?? null,
+        regulatory_reason: _cycleQuantContext?.macro?.regulatory?.reason ?? null
+      } },
       { stage: "maps_context", data: _cycleMapsContext || null },
       { stage: "scout", data: scoutPayload },
       { stage: "agent_coverage", data: scoutCoverageLog },
@@ -9505,7 +9643,17 @@ async function main() {
   });
 }
 
-const isDirectRun = process.argv[1] && path.resolve(process.argv[1]) === __filename;
+// path.resolve() alone doesn't dereference symlinks, but __filename (from import.meta.url) is
+// realpath-resolved — invoking this file through the /Users/mini/e3d-agent-trading-floor symlink
+// with an absolute path would otherwise fail this check silently. See portfolioSnapshotWriter.js,
+// performanceDaily.js, e3dActionOutcomeExport.js for the same fix.
+const isDirectRun = process.argv[1] && (() => {
+  try {
+    return fs.realpathSync(process.argv[1]) === __filename;
+  } catch {
+    return path.resolve(process.argv[1]) === __filename;
+  }
+})();
 
 if (isDirectRun) {
   main().catch((err) => {

@@ -1,16 +1,20 @@
 # Qwen Agent Training
 
 The scout and harvest agents are fine-tuned LoRA adapters on top of
-`mlx-community/Qwen2.5-14B-Instruct-4bit`, running locally via MLX on
-Apple Silicon. This directory contains the training pipeline. The MLX
-server, venv, adapters, and training data live in `/Users/mini/clawd/e3d`.
+`mlx-community/Qwen2.5-7B-Instruct-4bit` (downgraded from the 14B base
+model on 2026-06-11 — see `train_config_scout_v1.yaml.14b_bak` /
+`train_config_harvest_v1.yaml.14b_bak` for the prior config), running
+locally via MLX on Apple Silicon. This directory contains the training
+pipeline. The MLX server, venv, adapters, and training data live in
+`/Users/mini/clawd/e3d`.
 
 ---
 
 ## Prerequisites
 
 **Hardware:** Apple Silicon Mac with at least 24 GB unified memory.
-Training peaks at ~9.8 GB; the 14B base model loads at ~9.5 GB.
+Training peaks at ~9.8 GB; the 7B base model load size has not been
+re-measured since the 2026-06-11 downgrade from 14B (previously ~9.5 GB).
 Do not run both simultaneously unless the server's model is unloaded
 (`model_loaded: false` in `/health`).
 
@@ -24,8 +28,8 @@ pip install mlx-lm flask gunicorn
 ```
 
 The model weights download automatically on first use from Hugging Face.
-`mlx-community/Qwen2.5-14B-Instruct-4bit` is ~8 GB; ensure disk space
-before running.
+`mlx-community/Qwen2.5-7B-Instruct-4bit` is the current base model;
+ensure disk space before running.
 
 ---
 
@@ -54,7 +58,13 @@ training/                       ← This directory (in git)
   train_harvest_adapter.sh      ← Harvest fine-tuning pipeline
   train_config_scout_v1.yaml    ← Scout LoRA hyperparameters
   train_config_harvest_v1.yaml  ← Harvest LoRA hyperparameters
-  extract_agent_training_data.py  ← Pulls labelled examples from event log
+  extract_agent_training_data.py  ← ORPHANED COPY — do not edit. The
+                                     adapter shell scripts actually run
+                                     the copy in /Users/mini/clawd/e3d/,
+                                     which has diverged and is
+                                     authoritative. This copy is stale
+                                     (last touched 2026-05-13) and not
+                                     invoked by anything.
   generate_synthetic_training_data.py  ← Generates synthetic training examples
   split_data.py                 ← Train/valid/test split utility
   smart_truncate.py             ← Prompt truncation utility
@@ -70,15 +80,20 @@ on port **5052** by default (overridable via env vars — see below).
 ```bash
 cd /Users/mini/clawd/e3d
 
-# Scout agent (14B + LoRA adapter, port 5051)
+# Scout agent (7B + LoRA adapter, port 5051)
 ./start_gunicorn_scout.sh
 
-# Harvest agent (14B + LoRA adapter, port 5052)
+# Harvest agent (7B + LoRA adapter, port 5052)
 ./start_gunicorn_harvest.sh
 
 # Base model only, no adapter (port 5050) — useful for testing
 ./start_gunicorn.sh
 
+# NOTE: since the base model is now 7B (see top of this doc), the line
+# below and the "Scout agent" line above both describe a 7B server —
+# this script/port pairing has not been reconciled since the 14B→7B
+# switch and may be redundant or stale. Verify against the running
+# process before relying on it.
 # Alternative: smaller 7B base model (port 5051, no adapter)
 ./start_gunicorn_7b.sh
 
@@ -114,17 +129,24 @@ Watch progress live:
 tail -f /Users/mini/clawd/e3d/logs/cron_train.log
 ```
 
-### Scheduled (every Sunday at 3am)
+### Scheduled (twice weekly, Sunday and Wednesday at 3am)
+
+Training does **not** run via cron — it's a **launchd** job,
+`com.e3d.train` (`~/Library/LaunchAgents/com.e3d.train.plist`), which
+fires Sunday and Wednesday at 3am (more frequent than the historical
+"Sunday only" cadence `install_cron.sh` was written for). Check its
+status with:
 
 ```bash
-cd /Users/mini/clawd/e3d
-./install_cron.sh
+launchctl list | grep com.e3d.train
+launchctl print gui/$(id -u)/com.e3d.train
 ```
 
-> **Note:** `install_cron.sh` currently references the old script path
-> `/Users/mini/clawd/e3d/cron_train_agents.sh`. Update the `CRON_LINE`
-> in that file to point to
+> **Note:** `install_cron.sh` is stale — it predates the switch to
+> launchd and references the old script path
+> `/Users/mini/clawd/e3d/cron_train_agents.sh` rather than the current
 > `/Users/mini/e3d-agent-trading-floor/training/cron_train_agents.sh`.
+> Do not use it to (re)install the schedule; edit the `.plist` instead.
 
 ### What training does
 
@@ -151,7 +173,7 @@ Both agents use identical hyperparameters (`train_config_*_v1.yaml`):
 
 | Parameter | Value |
 |-----------|-------|
-| Base model | `mlx-community/Qwen2.5-14B-Instruct-4bit` |
+| Base model | `mlx-community/Qwen2.5-7B-Instruct-4bit` |
 | Fine-tune type | LoRA |
 | LoRA rank | 8 |
 | Epochs | 3 |
@@ -169,7 +191,7 @@ request. Key env vars (all optional — defaults shown):
 
 ```bash
 LLM_BASE_URL=http://127.0.0.1:5050        # Which server to call
-LLM_MODEL=mlx-community/Qwen2.5-14B-Instruct-4bit
+LLM_MODEL=mlx-community/Qwen2.5-7B-Instruct-4bit
 SCOUT_ADAPTER_PATH=./adapters_scout_v1    # Passed as X-Adapter-Path header
 HARVEST_ADAPTER_PATH=./adapters_harvest_v1
 ```
