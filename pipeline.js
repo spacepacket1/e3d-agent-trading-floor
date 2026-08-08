@@ -3357,7 +3357,7 @@ function computeCandidateScorecard(candidate, storySig) {
 }
 
 // buildCognitiveState — the Node.js perception layer.
-// Makes 3 targeted API calls, fuses the results, and returns a compact ranked
+// Makes 4 targeted API calls, fuses the results, and returns a compact ranked
 // candidate list. This is the "E3D visual cortex" — Qwen acts as the strategist
 // on top of it, with optional drill-down tool calls for deeper investigation.
 function buildCognitiveState(portfolio) {
@@ -3367,13 +3367,29 @@ function buildCognitiveState(portfolio) {
   const startMs = nowMs();
   const warningSignalTypes = new Set(["MOVER", "SURGE"]);
 
-  // Three focused API calls — candidates, stories, and tokens sorted by signal activity
+  // Focused API calls — candidates, stories, tokens sorted by signal activity, and Decision
+  // Layer actions (for deterministic e3d_action_id/e3d_action_type attachment below — mirrors
+  // the fraud_risk/liquidity_quality override, since the LLM's output schema never asks for
+  // these either, so without this they'd silently stay unset all the way into training events).
   const e3dCandidates  = endpointArray(fetchJson("/candidates", { limit: 20 }));
   const allStories     = endpointArray(fetchJson("/stories", { limit: 100, chain: "ETH" }));
   const activeTokens   = endpointArray(fetchJson("/fetchTokenPricesWithHistoryAllRanges", {
     dataSource: E3D_TOKENS_DATA_SOURCE, sortBy: "storyCount", sortDir: "desc",
     trendInterval: "1H", limit: 200
   }));
+  const e3dActionsRaw  = endpointArray(fetchJson("/actions", {
+    status: "open",
+    actionType: "accumulate_signal,paper_buy,watch",
+    sort: "action_score_desc",
+    limit: 30,
+    maxRisk: E3D_ACTIONS_MAX_RISK,
+    minConfidence: E3D_ACTIONS_MIN_CONFIDENCE
+  }));
+  const actionByAddr = new Map();
+  for (const action of e3dActionsRaw) {
+    const addr = cleanAddress(action?.token_address || "");
+    if (addr) actionByAddr.set(addr, action);
+  }
   _activeTokensCache = activeTokens; // share with tool handler for /token-info fallback
 
   // Classify story types
@@ -3496,17 +3512,23 @@ function buildCognitiveState(portfolio) {
     .slice(0, COGNITIVE_STATE_MAX_CANDIDATES)
     .map(({ _score, ...c }, i) => {
       const storySig = storySignals.get(c.address);
-      return { rank: i + 1, ...c, scorecard: computeCandidateScorecard(c, storySig) };
+      const action = actionByAddr.get(c.address) || null;
+      return {
+        rank: i + 1, ...c,
+        action_id:   action?.action_id ?? null,
+        action_type: action?.action_type ?? null,
+        scorecard: computeCandidateScorecard(c, storySig)
+      };
     });
 
   log("cognitive_state_built", {
-    api_calls: 3, e3d_candidates: e3dCandidates.length, story_signals: storySignals.size,
-    disqualified: disqualifiedAddresses.size, output_candidates: ranked.length,
-    duration_ms: nowMs() - startMs
+    api_calls: 4, e3d_candidates: e3dCandidates.length, story_signals: storySignals.size,
+    e3d_actions: actionByAddr.size, disqualified: disqualifiedAddresses.size,
+    output_candidates: ranked.length, duration_ms: nowMs() - startMs
   });
 
   const cogStateDurationMs = nowMs() - startMs;
-  _lastCognitiveState = { generated_at: nowIso(), candidates: ranked, meta: { e3d_candidates: e3dCandidates.length, story_signals: storySignals.size, api_calls: 3, disqualified: disqualifiedAddresses.size, output_candidates: ranked.length, duration_ms: cogStateDurationMs } };
+  _lastCognitiveState = { generated_at: nowIso(), candidates: ranked, meta: { e3d_candidates: e3dCandidates.length, story_signals: storySignals.size, api_calls: 4, disqualified: disqualifiedAddresses.size, output_candidates: ranked.length, duration_ms: cogStateDurationMs } };
   return _lastCognitiveState;
 }
 
@@ -5029,7 +5051,7 @@ function runScoutWithTools(portfolio, portfolioIntelligence = null) {
   const macroContext = _cycleQuantContext?.macro;
 
   // ── Step 1: Node.js perception layer builds compact cognitive state ──
-  // 3 targeted API calls → ranked candidates with evidence.
+  // 4 targeted API calls → ranked candidates with evidence.
   // Qwen sees only what matters, not a firehose of raw data.
   const cognitiveState = buildCognitiveState(portfolio);
   const stateJson = JSON.stringify(cognitiveState, null, 0);
@@ -5161,12 +5183,19 @@ function runScoutWithTools(portfolio, portfolioIntelligence = null) {
   // for these fields, so without this override they silently stay unset (0) all the way into
   // computePositionScoreLike's buy ranking and deterministicBuyGate's fraud_risk_high check.
   const cogStateRiskByAddr = new Map();
+  // Same pattern for E3D Decision Layer action linkage — needed downstream by
+  // scripts/recordOutcomes.js's outcome_enrichment path (keys off e3d_action_id) and by
+  // recordOutcomes.js's own e3d_thesis_confirmed/confirmation_score/outcome_score lookup.
+  const cogStateActionByAddr = new Map();
   for (const entry of (cognitiveState.candidates || [])) {
     const addr = cleanAddress(entry?.address || "");
     if (!addr) continue;
     if (entry?.market) cogStateMarketByAddr.set(addr, entry.market);
     if (entry?.fraud_risk != null || entry?.liquidity_quality != null) {
       cogStateRiskByAddr.set(addr, { fraud_risk: entry.fraud_risk ?? null, liquidity_quality: entry.liquidity_quality ?? null });
+    }
+    if (entry?.action_id != null) {
+      cogStateActionByAddr.set(addr, { action_id: entry.action_id, action_type: entry.action_type ?? null });
     }
   }
 
@@ -5187,7 +5216,12 @@ function runScoutWithTools(portfolio, portfolioIntelligence = null) {
   }).map(c => {
     const addr = cleanAddress(c?.token?.contract_address || "");
     const risk = cogStateRiskByAddr.get(addr);
-    return risk ? { ...c, fraud_risk: risk.fraud_risk, liquidity_quality: risk.liquidity_quality } : c;
+    const action = cogStateActionByAddr.get(addr);
+    return {
+      ...c,
+      ...(risk ? { fraud_risk: risk.fraud_risk, liquidity_quality: risk.liquidity_quality } : null),
+      ...(action ? { e3d_action_id: action.action_id, e3d_action_type: action.action_type } : null)
+    };
   });
 
   log("scout_tool_candidates", { raw: rawCandidates.length, after_held: unhelded.length, qualified: qualifiedCandidates.length });
