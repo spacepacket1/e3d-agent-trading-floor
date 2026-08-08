@@ -44,7 +44,8 @@ function fetchTokenPrice(address) {
     if (E3D_API_KEY) curlArgs.push("-H", `Authorization: Bearer ${E3D_API_KEY}`);
     const stdout = execFileSync("curl", curlArgs, { encoding: "utf8", timeout: 20000 });
     const parsed = JSON.parse(stdout);
-    return parsed?.priceUSD ?? parsed?.price_usd ?? parsed?.current_price ?? null;
+    return parsed?.priceUSD ?? parsed?.price_usd ?? parsed?.current_price
+      ?? parsed?.market_data?.current_price?.usd ?? null;
   } catch {
     return null;
   }
