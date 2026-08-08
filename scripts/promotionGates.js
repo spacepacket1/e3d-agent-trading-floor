@@ -4,6 +4,7 @@ import crypto from "crypto";
 import { fileURLToPath } from "url";
 import { evaluateLiveCapabilityStatus, LIVE_CAPABLE_MODES } from "./custodyControls.js";
 import { buildOperatorPermissionPolicy, recordOperatorAction } from "./auditTrail.js";
+import { PROMOTION_SIGNED_REPORT_MARKER, evaluateLiveReadiness } from "./liveReadiness.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -390,7 +391,7 @@ function detectOverfitting(backtest, trades, walkForward) {
   };
 }
 
-function gateChecks(targetState, backtest, trades, walkForward, overfitting, options, liveCapability) {
+function gateChecks(targetState, backtest, trades, walkForward, overfitting, options, liveCapability, readiness) {
   const policy = GATE_POLICY[targetState] || GATE_POLICY[DEFAULT_TARGET_STATE];
   const metrics = backtest?.metrics || {};
   const blockers = [];
@@ -438,6 +439,9 @@ function gateChecks(targetState, backtest, trades, walkForward, overfitting, opt
       const check = (liveCapability?.checks || []).find((item) => item.code === code);
       addBlocker(`live_capability_${code}`, check?.detail || liveCapability?.summary || "Live capability controls are incomplete or disabled.");
     }
+    if (!readiness?.readiness_met) {
+      addBlocker("live_readiness_not_met", `Need ${readiness?.required_consecutive_cycles || 50} consecutive A/B Manager cycles before live-capable promotion.`);
+    }
   }
   if (targetState === "scaled_live") {
     addBlocker("scaled_live_requires_later_phase_approval", "Scaled live mode is explicitly outside the Phase 2 scope.");
@@ -451,19 +455,51 @@ function gateChecks(targetState, backtest, trades, walkForward, overfitting, opt
 }
 
 function signReport(report) {
-  const unsigned = {
-    ...report,
-    signature: null,
-    signed: false
-  };
-  const payloadHash = sha256(stableStringify(unsigned));
+  const payload = report?.signed_payload && typeof report.signed_payload === "object"
+    ? report.signed_payload
+    : {
+        ...report,
+        signature: null,
+        signed: false,
+        signed_payload_hash: null
+      };
+  const payloadHash = sha256(stableStringify(payload));
   return {
     signed: true,
     signature_scheme: "sha256-stable-json",
     signer: "promotion_gates",
-    signed_at: report.generated_at,
+    signed_at: payload.generated_at || report.generated_at,
     signed_payload_hash: payloadHash,
     signature: sha256(`promotion_gates:${payloadHash}`)
+  };
+}
+
+function buildReadinessProof(readiness) {
+  return {
+    strategy_version: readiness?.strategy_version || null,
+    required_consecutive_cycles: readiness?.required_consecutive_cycles ?? 50,
+    qualifying_grades: Array.isArray(readiness?.qualifying_grades) ? [...readiness.qualifying_grades] : ["A", "B"],
+    readiness_met: readiness?.readiness_met === true,
+    threshold_cycle: readiness?.threshold_cycle ? {
+      report_id: readiness.threshold_cycle.report_id || null,
+      generated_at: readiness.threshold_cycle.generated_at || null
+    } : null
+  };
+}
+
+function buildPromotionSignedPayload(report, readiness) {
+  return {
+    report_id: report.report_id,
+    generated_at: report.generated_at,
+    signed_report_marker: PROMOTION_SIGNED_REPORT_MARKER,
+    strategy_version: report.strategy_version,
+    target_state: report.target_state,
+    promotion_decision: report.promotion_decision,
+    promotion_allowed: report.promotion_allowed,
+    blockers: report.blockers,
+    warnings: report.warnings,
+    readiness_summary: readiness,
+    readiness_proof: buildReadinessProof(readiness)
   };
 }
 
@@ -534,13 +570,19 @@ function parseArgs(argv) {
 }
 
 export function evaluatePromotionGates(options = {}) {
-  const generatedAt = options.generatedAt || nowIso();
+  const generatedAt = new Date(optionalMs(options.generatedAt) || Date.now()).toISOString();
   const targetState = STATES.includes(options.targetState) ? options.targetState : DEFAULT_TARGET_STATE;
   const explicitBacktest = options.backtestReport ? { filePath: path.resolve(ROOT, options.backtestReport), report: readJsonFile(path.resolve(ROOT, options.backtestReport)) } : null;
   const source = explicitBacktest?.report ? explicitBacktest : latestBacktestReport();
   const backtest = source?.report || null;
   const strategyVersion = options.strategyVersion || backtest?.strategy_version || "unknown";
   const parentStrategyVersion = options.parentStrategyVersion || null;
+  const readiness = evaluateLiveReadiness({
+    strategyVersion,
+    reports: options.readinessReports || undefined,
+    reportsDir: options.readinessReportsDir || REPORTS_DIR,
+    policy: options.readinessPolicy || undefined
+  });
   const trades = closedReplayTrades(backtest);
   const initialEquity = toNum(backtest?.metrics?.initial_equity_usd, 0);
   const aggregateTradeMetrics = metricsForTrades(trades, initialEquity, toNum(backtest?.metrics?.final_equity_usd, null));
@@ -563,7 +605,7 @@ export function evaluatePromotionGates(options = {}) {
     crypto_controls: options.cryptoControls || null,
     approvals: options.approvals || []
   });
-  const gate = gateChecks(targetState, backtest, trades, walkForward, overfitting, options, liveCapability);
+  const gate = gateChecks(targetState, backtest, trades, walkForward, overfitting, options, liveCapability, readiness);
   const priorReports = listPriorPromotionReports(strategyVersion);
   const reportTimestamp = formatReportTimestamp(new Date(optionalMs(generatedAt) || Date.now()));
   const reportFile = `reports/promotions/promotion-${reportTimestamp}.json`;
@@ -635,6 +677,7 @@ export function evaluatePromotionGates(options = {}) {
     },
     live_capability: liveCapability,
     operator_permission: operatorPermission,
+    readiness,
     blockers,
     warnings: gate.warnings,
     known_weaknesses: knownWeaknesses,
@@ -645,6 +688,7 @@ export function evaluatePromotionGates(options = {}) {
     }
   };
 
+  report.signed_payload = buildPromotionSignedPayload(report, readiness);
   Object.assign(report, signReport(report));
 
   if (options.writeReport !== false) {

@@ -1,3 +1,58 @@
+---
+head_sha: e5a4203b40d6cb831786dc74a6918e85e330f49d
+---
+
+# Findings
+
+## Local State
+
+Repo head sha: e5a4203b40d6cb831786dc74a6918e85e330f49d
+
+Research topics: paper-trading strategy/execution logic
+
+Analogy domains to consider: game progression and reward loops; social feed and notification mechanics; marketplace liquidity and two-sided matching; developer-tool CLI ergonomics; fintech trust and verification UX
+
+## Git history
+range: last 20 commits
+```text
+e5a4203 Enable Claude Code auto-permissions and prompt suggestions
+eb62296 Add Claude Code auto-permissions (allow all tools)
+fd5c975 Document product payment boundary
+cdb523b Add Maps navigation integration (Phases 1-4) with bug fixes
+461d6b7 Switch scout and harvest agents from Qwen 14B to 7B
+7f86db8 Fix ClickHouse connection: wrong env var prefix, missing auth, silent HTTP errors
+b197d6e Add one-shot backfill: AgentPortfolioSnapshots from E3DAgentActions payload_json
+de0b2ca Fix snapshot writer: load .env before reading CH env vars
+fed9455 Add AgentPortfolioSnapshots periodic writer (every 5 min cron)
+ea923b2 Auto-start pipeline on server boot + suppress mongo stderr noise
+b0ef5cd Harden cross-source price divergence guard (peg-aware, fail-closed)
+32d4aae Increase risk_on regime aggressiveness ahead of CLARITY Act catalyst
+50e5935 Lower rejection miss threshold to 9% ahead of CLARITY Act
+647242e Fix rejected_candidates missing from run ledger and add return_pct to outcomes
+12f9f08 Implement Decision Layer API integration (Phases A–D)
+6c46ba6 add e3d-action-outcome-export-feature-ticket.md spec
+4ed5d25 Add Decision Layer API integration feature ticket
+3a14adb Fix scout candidate starvation and wasted LLM cycles
+7ba756c Add installer/uninstaller and pipeline auto-restart
+4d43d05 Add Qwen setup, training, and integration docs
+```
+
+## Branches
+```text
+* main                e5a4203 Enable Claude Code auto-permissions and prompt suggestions
+  remotes/origin/HEAD -> origin/main
+  remotes/origin/main e5a4203 Enable Claude Code auto-permissions and prompt suggestions
+```
+
+## GH issues and PRs
+### gh issue list
+- none found
+### gh pr list
+- none found
+
+## Repo docs
+### README.md
+```text
 # E3D Agent Trading Floor — Whitepaper
 
 **April 2026**
@@ -40,46 +95,7 @@ Every Scout candidate must include `evidence[]`, `why_now`, `risks[]`, `convicti
 
 **Fail safely.**
 
-Paper mode is the default. All trade tickets are recorded as paper trades. Live execution is not enabled by configuration alone; it requires both readiness and a cryptographically verified promotion confirmation. Within paper mode, all portfolio state mutations are real — the P&L tracking, position sizing, cooldowns, and rotation logic all function as they would in live trading. The only thing missing is actual order submission.
-
-**Readiness and activation.**
-
-Live eligibility uses a fixed production policy: 50 consecutive Manager cycles graded `A` or `B`, tracked independently per `strategy_version`.
-
-- Duplicate Manager reports are grouped by `report_id`; equivalent duplicates count once.
-- Conflicting duplicates are excluded from the streak entirely.
-- Any `C`, `D`, or `F` report resets the streak and starts a new readiness epoch.
-- The 50th qualifying cycle becomes the immutable `threshold_cycle` proof for that epoch.
-- Additional `A`/`B` cycles keep the same proof; they do not automatically turn on live trading.
-- A later approval survives more `A`/`B` cycles in the same epoch, but it is invalidated by the next `C`, `D`, or `F` reset.
-- Confirmation identity and generation time are part of the signed payload, along with the strategy version, target state, promotion decision, and readiness proof.
-- Paper mode fails closed for missing, invalid, stale, conflicting, or tampered confirmations.
-
-Readiness, signed confirmation, and runtime activation are separate gates:
-
-- `readiness` means the 50-cycle paper validation threshold has been met.
-- `confirmation` means the signed promotion report was cryptographically verified and matched the current readiness epoch.
-- `activation_allowed` means readiness and confirmation both pass for the live-capable target.
-
-The readiness API exposes the current state without mutating anything:
-
-```json
-{
-  "strategy_version": "paper-pipeline-v1",
-  "current_qualifying_streak": 50,
-  "threshold_cycle": { "report_id": "cycle-050", "generated_at": "2026-07-29T00:49:00.000Z" },
-  "activation_allowed": true,
-  "activation_blockers": [],
-  "next_action": "live_eligible",
-  "confirmation": {
-    "signature_verified": true,
-    "envelope_match": true,
-    "readiness_epoch_match": true
-  }
-}
-```
-
-`GET /api/promotions/readiness` accepts an optional `strategy_version` query parameter. An empty or invalid value returns a client error instead of silently falling back to the default. Reaching 50 cycles only makes the strategy eligible; it does not enable live trading by itself.
+Paper mode is the default. All trade tickets are recorded as paper trades. Live execution requires an explicit configuration change. Within paper mode, all portfolio state mutations are real — the P&L tracking, position sizing, cooldowns, and rotation logic all function as they would in live trading. The only thing missing is actual order submission.
 
 ---
 
@@ -623,4 +639,43 @@ The system is running in paper mode with a portfolio of $100,000 initial capital
 - All tool results truncated to 6,000 chars before entering the conversation — keeps KV cache and RAM usage predictable on 25GB hardware
 - Stale Colima disk lock recovery: removed `/Users/mini/.colima/_lima/_disks/colima/in_use_by` symlink after VM crash
 
-**Live trading requires:** adapter training completion, a multi-cycle paper mode validation period showing consistent positive P&L, and a cryptographically verified promotion confirmation bound to the current readiness epoch and live-capable target. A configuration change alone does not enable execution.
+**Live trading requires:** adapter training completion, a multi-cycle paper mode validation period showing consistent positive P&L, and an explicit configuration change to enable execution.
+
+```
+
+## TODO/FIXME matches
+- none found
+
+## External Context
+
+## External Context
+
+- **Multi-agent LLM pipelines for finance** are maturing rapidly: FinAgent (2024), TradingGPT, and similar systems confirm the Scout→Risk→Executor separation as the emerging standard, but most published work omits the deterministic hard-limit layer this repo enforces — making the "AI suggests, code decides" split relatively differentiated.
+
+- **On-chain alpha decay is fast.** Academic and practitioner work (e.g. Nansen, Glassnode research) consistently shows wallet-clustering signals lose edge within hours of becoming legible. The story-freshness sort (`storyCount desc, trendInterval=1H`) directly addresses this, but sets a high bar on latency for the full pipeline round-trip.
+
+- **Local inference via MLX** (Apple Silicon) is production-viable for 7B–14B quantized models as of mid-2025. The recent switch from 14B to 7B for Scout/Harvest aligns with practitioner findings: 7B instruction-tuned models match 14B on structured JSON tasks when the prompt is compact and well-constrained, with ~2× throughput gain.
+
+- **LoRA fine-tuning for specialized JSON generation** is well-validated; the planned adapters follow the established pattern. Key risk: training data volume (~300–500 synthetic examples) is at the lower bound — most successful domain adapters use 2K–5K examples before generalization improves meaningfully over base model.
+
+- **Paper-to-live gating** remains an open problem in systematic trading. The regime of "paper mode as default, explicit flag to go live" is correct but insufficient alone — published failure modes cluster around regime-shift invalidation (strategy trained in one vol regime, deployed in another) rather than individual trade errors.
+
+---
+
+### Analogous Patterns
+
+**1. Game progression and reward loops → live-trading unlock gating**
+*Source domain: game design (XP/level gating)*
+*Mechanic borrowed: unlock conditions based on sustained cumulative performance, not single events*
+The Manager's A–F cycle scoring already generates a natural "XP" stream; rather than using a static elapsed-time gate for live trading, the system could require a rolling minimum grade (e.g., B or above across 50 consecutive cycles) before `live_execution_allowed` flips — making the paper→live transition a provable performance threshold rather than a config change.
+
+**2. Marketplace liquidity and two-sided matching → portfolio rotation as a matching market**
+*Source domain: two-sided marketplace design (Gale-Shapley, ride-share dispatch)*
+*Mechanic borrowed: stable matching under capacity constraints with ranked preferences on both sides*
+The current rotation logic (swap weakest position for best candidate if score gap ≥ 10) is a greedy heuristic; framing rotation as a stable-matching problem — where positions express "preference" to stay based on hold-confirm signals, and candidates express "preference" to enter based on signal tier — could prevent the greedy rule from churning a position that has a fresh ACCUMULATION story purely because a marginally higher-scored candidate appears.
+
+**3. Fintech trust and verification UX → progressive disclosure of agent autonomy**
+*Source domain: fintech KYC/tiered account access (Robinhood options tiers, Wise limits)*
+*Mechanic borrowed: capability unlocks tied to verified behavioral history rather than a single approval event*
+Instead of a binary paper/live flag, the system could gate capability tiers (e.g., FLOW-ONLY entries live → TIER 2 live → TIER 1 live → rotation-triggered live) each requiring a separate track record window — making live deployment incremental and observable rather than an all-or-nothing switch.
+

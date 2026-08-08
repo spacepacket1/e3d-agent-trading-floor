@@ -17,6 +17,7 @@ import { evaluateLiveCapabilityStatus } from "./scripts/custodyControls.js";
 import { generateOperationsMonitorReport } from "./scripts/operationsMonitor.js";
 import { resolveRiskPolicy } from "./scripts/riskEngine.js";
 import { buildOperatorPermissionPolicy, readOperatorActionRecords, recordOperatorAction } from "./scripts/auditTrail.js";
+import { buildLiveReadinessActivationSummary, inspectPromotionConfirmation } from "./scripts/liveReadiness.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -59,6 +60,8 @@ const TRADE_REVIEWS_LOG = path.join(LOG_DIR, "trade-reviews.jsonl");
 const RUN_LEDGER_LOG = path.join(LOG_DIR, "run-ledger.jsonl");
 const DASHBOARD_HEARTBEAT_FILE = path.join(LOG_DIR, "dashboard-heartbeat.json");
 const RETRAINING_READINESS_FILE = path.join(REPORTS_DIR, "retraining-readiness.json");
+const ACTIVE_PIPELINE_STRATEGY_VERSION = process.env.E3D_STRATEGY_VERSION || "paper-pipeline-v1";
+const DEFAULT_LIVE_PROMOTION_TARGET_STATE = "tiny_live";
 const MONGO_CONTAINER_NAME = process.env.E3D_MONGO_CONTAINER || "e3d-mongo";
 const MONGO_DATABASE_NAME = process.env.E3D_MONGO_DATABASE || "e3d";
 const CLICKHOUSE_HTTP_URL = process.env.AWS_E3D_CLICKHOUSE_HTTP_URL || process.env.E3D_CLICKHOUSE_HTTP_URL || "http://127.0.0.1:8123";
@@ -325,6 +328,7 @@ function summarizePerformanceReport(report) {
 }
 
 function summarizePromotionReport(report) {
+  const confirmation = inspectPromotionConfirmation(report);
   return {
     report_id: report?.report_id || null,
     generated_at: report?.generated_at || null,
@@ -340,6 +344,21 @@ function summarizePromotionReport(report) {
     max_drawdown_pct: report?.evidence?.performance?.max_drawdown_pct ?? null,
     signed: Boolean(report?.signed),
     signature: report?.signature || null,
+    readiness: confirmation.readiness || report?.readiness || null,
+    threshold_cycle: confirmation.threshold_cycle || report?.readiness?.threshold_cycle || null,
+    signed_report_identity: confirmation.signed_report_identity || {
+      report_id: report?.report_id || null,
+      generated_at: report?.generated_at || null,
+      signed_report_marker: report?.signed_report_marker || report?.signed_payload?.signed_report_marker || null,
+      strategy_version: report?.strategy_version || null
+    },
+    signed_timestamp: confirmation.signed_timestamp || report?.signed_payload?.generated_at || null,
+    envelope_match: confirmation.envelope_match,
+    signature_verification: confirmation.signature_state ? {
+      signature_verified: confirmation.signature_verified,
+      signature_state: confirmation.signature_state,
+      claim_source: confirmation.claim_source
+    } : null,
     live_capability: report?.live_capability ? {
       capability_status: report.live_capability.capability_status,
       live_submission_enabled: Boolean(report.live_capability.live_submission_enabled),
@@ -349,6 +368,45 @@ function summarizePromotionReport(report) {
     report_file: report?.report_file || null,
     markdown_file: report?.markdown_file || null
   };
+}
+
+function resolveReadinessStrategyVersion(searchParams) {
+  const values = searchParams.getAll("strategy_version");
+  if (!values.length) {
+    return { strategyVersion: ACTIVE_PIPELINE_STRATEGY_VERSION };
+  }
+  if (values.length !== 1) {
+    return {
+      error: {
+        code: "INVALID_STRATEGY_VERSION",
+        detail: "strategy_version must be supplied at most once and as a non-empty string."
+      }
+    };
+  }
+  const strategyVersion = String(values[0] || "").trim();
+  if (!strategyVersion) {
+    return {
+      error: {
+        code: "INVALID_STRATEGY_VERSION",
+        detail: "strategy_version must be a non-empty string."
+      }
+    };
+  }
+  return { strategyVersion };
+}
+
+function buildReadinessApiResponse(options = {}) {
+  return buildLiveReadinessActivationSummary({
+    strategyVersion: options.strategyVersion || ACTIVE_PIPELINE_STRATEGY_VERSION,
+    readinessReportsDir: options.readinessReportsDir || REPORTS_DIR,
+    promotionReportsDir: options.promotionReportsDir || PROMOTION_REPORTS_DIR,
+    readinessReports: options.readinessReports,
+    promotionReports: options.promotionReports,
+    readiness: options.readiness,
+    activation: options.activation,
+    targetState: options.targetState || DEFAULT_LIVE_PROMOTION_TARGET_STATE,
+    policy: options.policy
+  });
 }
 
 function summarizeBacktestReport(report) {
@@ -781,15 +839,17 @@ function summarizeIncidentSnapshot() {
   };
 }
 
-async function buildProfessionalDashboardSummary() {
-  const portfolio = await loadPortfolioState();
-  const trainingEvents = readTrainingEvents(1500);
-  const performanceReport = latestPerformanceReport();
-  const backtestReport = latestBacktestReport();
-  const promotionReport = latestPromotionReport();
-  const attributionReport = latestAttributionReport();
-  const operationsReport = latestOperationsReport() || generateOperationsMonitorReport({ writeReport: false, writeEvents: false });
-  const reconciliationReport = latestReconciliationReport();
+async function buildProfessionalDashboardSummary(options = {}) {
+  const portfolio = options.portfolio || await loadPortfolioState();
+  const trainingEvents = Array.isArray(options.trainingEvents) ? options.trainingEvents : readTrainingEvents(1500);
+  const performanceReport = Object.prototype.hasOwnProperty.call(options, "performanceReport") ? options.performanceReport : latestPerformanceReport();
+  const backtestReport = Object.prototype.hasOwnProperty.call(options, "backtestReport") ? options.backtestReport : latestBacktestReport();
+  const promotionReport = Object.prototype.hasOwnProperty.call(options, "promotionReport") ? options.promotionReport : latestPromotionReport();
+  const attributionReport = Object.prototype.hasOwnProperty.call(options, "attributionReport") ? options.attributionReport : latestAttributionReport();
+  const operationsReport = Object.prototype.hasOwnProperty.call(options, "operationsReport")
+    ? options.operationsReport
+    : latestOperationsReport() || generateOperationsMonitorReport({ writeReport: false, writeEvents: false });
+  const reconciliationReport = Object.prototype.hasOwnProperty.call(options, "reconciliationReport") ? options.reconciliationReport : latestReconciliationReport();
   const tradeRecords = collectTradeRecords(portfolio);
   const custody = evaluateLiveCapabilityStatus({ mode: "paper", portfolio });
   const auditPolicy = buildOperatorPermissionPolicy({
@@ -806,6 +866,11 @@ async function buildProfessionalDashboardSummary() {
   const performance = performanceReport ? summarizePerformanceReport(performanceReport) : null;
   const backtest = backtestReport ? summarizeBacktestReport(backtestReport) : null;
   const promotion = promotionReport ? summarizePromotionReport(promotionReport) : null;
+  const liveReadiness = options.liveReadiness || buildReadinessApiResponse({
+    strategyVersion: ACTIVE_PIPELINE_STRATEGY_VERSION,
+    readinessReportsDir: REPORTS_DIR,
+    promotionReportsDir: PROMOTION_REPORTS_DIR
+  });
   const attribution = attributionReport ? summarizeAttributionReport(attributionReport) : null;
   const operations = operationsReport ? summarizeOperationsReport(operationsReport) : null;
   const reconciliation = reconciliationReport ? summarizeReconciliationReport(reconciliationReport) : null;
@@ -873,6 +938,7 @@ async function buildProfessionalDashboardSummary() {
     strategy: {
       backtest,
       promotion,
+      live_readiness: liveReadiness,
       attribution
     },
     execution,
@@ -2614,6 +2680,25 @@ async function handleRequest(req, res) {
     return;
   }
 
+  if (url.pathname === "/api/promotions/readiness" && req.method === "GET") {
+    const resolvedStrategy = resolveReadinessStrategyVersion(url.searchParams);
+    if (resolvedStrategy.error) {
+      sendJson(res, 400, {
+        ok: false,
+        error: resolvedStrategy.error.code,
+        detail: resolvedStrategy.error.detail
+      });
+      return;
+    }
+
+    sendJson(res, 200, buildReadinessApiResponse({
+      strategyVersion: resolvedStrategy.strategyVersion,
+      readinessReportsDir: REPORTS_DIR,
+      promotionReportsDir: PROMOTION_REPORTS_DIR
+    }));
+    return;
+  }
+
   if (url.pathname === "/api/promotions/reports" && req.method === "GET") {
     const reports = listPromotionReportFiles().slice(0, 30).map(({ report }) => summarizePromotionReport(report));
     sendJson(res, 200, reports);
@@ -2887,6 +2972,13 @@ function wsHandleUpgrade(req, socket) {
   wsClients.add(socket);
   wsPushCycles(socket); // send current state immediately on connect
 }
+
+export {
+  buildProfessionalDashboardSummary,
+  buildReadinessApiResponse,
+  resolveReadinessStrategyVersion,
+  summarizePromotionReport
+};
 
 if (IS_MAIN_MODULE) {
   // Watch log dir so we catch both file creation and appends
