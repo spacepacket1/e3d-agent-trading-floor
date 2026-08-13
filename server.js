@@ -57,6 +57,14 @@ const PIPELINE_LOG = path.join(LOG_DIR, "pipeline.jsonl");
 const TRAINING_EVENT_LOG = path.join(LOG_DIR, "training-events.jsonl");
 const TRADE_REVIEWS_LOG = path.join(LOG_DIR, "trade-reviews.jsonl");
 const RUN_LEDGER_LOG = path.join(LOG_DIR, "run-ledger.jsonl");
+// Trading no longer runs as this server's own continuous --loop child (see
+// AUTO_START_PIPELINE in com.e3d.pipeline.plist) — it runs via a shared-LLM windowed
+// scheduler (ai.e3d.qwen-adapter-window-runner) that invokes `pipeline.js --once` during
+// a ~16-minute trading window once per hour, rotating with maps/story windows for the
+// single-worker LLM. A cycle can legitimately be up to ~1h + its own runtime apart from
+// the previous one, so treat anything within 90 minutes of the last completed cycle as
+// still "running" even with no locally-tracked child process.
+const PIPELINE_CYCLE_STALENESS_MS = 90 * 60 * 1000;
 const DASHBOARD_HEARTBEAT_FILE = path.join(LOG_DIR, "dashboard-heartbeat.json");
 const RETRAINING_READINESS_FILE = path.join(REPORTS_DIR, "retraining-readiness.json");
 const MONGO_CONTAINER_NAME = process.env.E3D_MONGO_CONTAINER || "e3d-mongo";
@@ -1805,6 +1813,12 @@ function runShell(command, args, options = {}) {
   });
 }
 
+function getLastCompletedCycleAt() {
+  const [lastEntry] = readJsonLines(RUN_LEDGER_LOG, 1);
+  const ts = lastEntry?.cycle_ts ? Date.parse(lastEntry.cycle_ts) : NaN;
+  return Number.isFinite(ts) ? ts : null;
+}
+
 function getPipelineStatus() {
   const pid = pipelineProcess?.pid ?? pipelineState.pid ?? null;
   const alive = isProcessAlive(pid);
@@ -1814,7 +1828,21 @@ function getPipelineStatus() {
     clearPidFile();
     setPipelineState({ running: false, pid: null, mode: "stopped" });
   }
-  return { ...pipelineState, running: pipelineState.running && alive, pid };
+  const loopRunning = pipelineState.running && alive;
+
+  // No locally-tracked --loop child doesn't mean trading is idle — it may be running via
+  // the shared-LLM windowed scheduler instead (see PIPELINE_CYCLE_STALENESS_MS above).
+  const lastCycleAt = getLastCompletedCycleAt();
+  const windowedActive = !loopRunning && lastCycleAt != null && (Date.now() - lastCycleAt) < PIPELINE_CYCLE_STALENESS_MS;
+
+  return {
+    ...pipelineState,
+    running: loopRunning || windowedActive,
+    mode: loopRunning ? pipelineState.mode : (windowedActive ? "windowed" : "stopped"),
+    pid,
+    windowed_active: windowedActive,
+    last_cycle_at: lastCycleAt != null ? new Date(lastCycleAt).toISOString() : null
+  };
 }
 
 function setPipelineState(nextState) {
