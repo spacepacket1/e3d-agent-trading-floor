@@ -104,30 +104,82 @@ const HARVEST_PUMP_EXHAUSTION_TYPES = ["MOVER", "SURGE"];
 fs.mkdirSync(LOG_DIR, { recursive: true });
 fs.mkdirSync(REPORTS_DIR, { recursive: true });
 
+const DEFAULT_PIPELINE_INTERVAL_SECONDS = 6 * 60 * 60; // 6 hours — swing desk, not a 5-minute scalper
+
 const SETTINGS_DEFAULTS = {
   paper_mode: true,
+  desk_mode: "swing_hold",
   initial_cash_usd: 100000,
-  max_open_positions: 8,
-  max_position_pct: 0.10,              // 10% of equity max per position
-  risk_per_trade_pct: 0.015,           // 1.5% default new allocation
-  min_trade_usd: 250,
-  max_buys_per_cycle: 2,
-  max_rotations_per_cycle: 1,
-  rotation_threshold: 10,              // score delta needed to rotate
-  rotation_sell_fraction: 0.50,        // rotate 50% of weakest position
-  cooldown_hours_after_exit: 12,
-  category_cap_pct: 0.30,              // 30% max category exposure
+  max_open_positions: 8,               // 6 thesis + 2 trend overlay
+  max_thesis_positions: 6,
+  max_position_pct: 0.12,              // 12% of equity max per position
+  risk_per_trade_pct: 0.08,            // fallback notional if ATR/R is unavailable
+  risk_r_pct: 0.02,                    // 2% of equity at risk per thesis trade (1R)
+  atr_stop_multiple: 2.5,
+  max_stop_distance_pct: 0.40,
+  trend_sleeve_enabled: true,
+  trend_sleeve_target_pct: 0.12,       // 12% each WETH/WBTC when BTC 20d trend is long
+  min_trade_usd: 1000,
+  stub_flatten_usd: 150,               // flatten dust remnants; do not "manage" $50 leftovers
+  min_partial_sell_usd: 150,           // below this, a partial-target leg pays fee/slippage as if full-size; take it all instead
+  max_buys_per_cycle: 1,
+  max_new_positions_per_day: 1,
+  max_rotations_per_cycle: 0,
+  rotation_threshold: 10,
+  rotation_sell_fraction: 1.0,
+  cooldown_hours_after_exit: 24,
+  category_cap_pct: 0.70,              // most names are still category=unknown; 30% silently capped the whole book
   reject_fraud_risk_gte: 35,
   target_partial_pct: 0.25,
-  age_decay_per_day: 0.75,             // score penalty per day held
+  take_only_first_target_partial: true,
+  age_decay_per_day: 0,                // age is not a reason to rotate a working thesis
   recent_performance_window_hours: 24,
-  scout_max_candidates: 6,
+  throttle_min_hold_hours: 24,         // ignore dust clips when throttling size
+  scout_max_candidates: 1,
+  min_liquidity_usd: 100000,
+  late_move_skip_24h_pct: 15,
+  late_move_min_liquidity_usd: 250000,
+  chase_skip_24h_pct: 20,
+  chase_ok_liquidity_usd: 500000,
+  min_buy_confidence: 65,
+  min_stop_distance_pct: 0.15,         // never tighter than 15% below entry
+  default_stop_distance_pct: 0.20,     // 20% structural default
+  harvest_discretionary_exits_enabled: false,
+  harvest_allow_trims: false,
+  harvest_freeze_until: "2026-08-30T23:59:59-07:00",
   fee_bps_per_side: 12.5,
   max_mark_deviation_ratio: 5,         // reject a position mark that deviates >5x from the e3d anchor
   max_source_price_divergence_ratio: 3,        // general band: drop a candidate whose e3d price diverges >3x from an independent feed
   max_source_price_divergence_ratio_pegged: 1.25, // peg-sensitive tokens (stables/FX/soft-pegs): tolerate at most ±25% across sources
   require_independent_price_below_liquidity_usd: 250000 // below this liquidity, refuse to trade without an independent price (fail closed)
 };
+
+const HARVEST_HARD_INVALIDATION_MARKERS = [
+  "treasury_distribution",
+  "security_risk",
+  "rug_liquidity",
+  "liquidity_drain",
+  "honeypot",
+  "fraud_risk",
+  "thesis_invalid",
+  "thesis_dead",
+  "thesis_invalidation"
+];
+
+const TREND_SLEEVE_VEHICLES = [
+  {
+    symbol: "WETH",
+    name: "Wrapped Ether",
+    contract_address: "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+    cg_key: "eth"
+  },
+  {
+    symbol: "WBTC",
+    name: "Wrapped Bitcoin",
+    contract_address: "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599",
+    cg_key: "btc"
+  }
+];
 
 function nowIso() {
   const date = new Date();
@@ -1119,12 +1171,151 @@ function optionalMs(value) {
   return Number.isFinite(ms) ? ms : null;
 }
 
-function saneStopPrice(rawStop, entryPrice) {
+function saneStopPrice(rawStop, entryPrice, settings = SETTINGS_DEFAULTS, stopDistancePct = null) {
   const entry = optionalNum(entryPrice);
   if (!(entry > 0)) return 0;
+  const minDistance = Math.max(0.05, toNum(settings?.min_stop_distance_pct, SETTINGS_DEFAULTS.min_stop_distance_pct));
+  const maxDistance = Math.max(minDistance, toNum(settings?.max_stop_distance_pct, SETTINGS_DEFAULTS.max_stop_distance_pct));
+  const fallbackDistance = Math.max(minDistance, toNum(settings?.default_stop_distance_pct, SETTINGS_DEFAULTS.default_stop_distance_pct));
+  const requested = optionalNum(stopDistancePct);
+  const defaultDistance = Math.max(minDistance, Math.min(maxDistance, requested != null ? requested : fallbackDistance));
+  const tightestStop = entry * (1 - minDistance);
+  const defaultStop = entry * (1 - defaultDistance);
   const stop = optionalNum(rawStop);
-  if (stop > 0 && stop < entry) return stop;
-  return entry * 0.9;
+  if (stop > 0 && stop < tightestStop) return stop;
+  return defaultStop;
+}
+
+function startOfLocalDayMs(date = new Date()) {
+  const copy = new Date(date);
+  copy.setHours(0, 0, 0, 0);
+  return copy.getTime();
+}
+
+function countNewPositionsSince(portfolio, sinceMs) {
+  return (Array.isArray(portfolio?.action_history) ? portfolio.action_history : []).filter((action) => {
+    if (String(action?.side || "").toLowerCase() !== "buy") return false;
+    const reason = String(action?.reason || "");
+    if (reason.startsWith("trend_overlay")) return false;
+    if (!reason.startsWith("new_position") && !reason.startsWith("rotation_in")) return false;
+    const ts = Date.parse(action?.ts || "");
+    return Number.isFinite(ts) && ts >= sinceMs;
+  }).length;
+}
+
+function getHarvestExitPolicy(settings = SETTINGS_DEFAULTS) {
+  const untilMs = Date.parse(settings?.harvest_freeze_until || "");
+  const frozen = Number.isFinite(untilMs)
+    ? Date.now() < untilMs
+    : settings?.harvest_discretionary_exits_enabled !== true;
+  return {
+    frozen,
+    allow_trims: settings?.harvest_allow_trims === true && !frozen,
+    allow_exits: !frozen,
+    hard_invalidation_only: true,
+    freeze_until: settings?.harvest_freeze_until || null
+  };
+}
+
+function harvestExitIsHardInvalidation(candidate) {
+  const blob = JSON.stringify({
+    action: candidate?.action,
+    reason: candidate?.reason,
+    why_now: candidate?.why_now,
+    thesis_state: candidate?.thesis_state,
+    what_changed: candidate?.what_changed,
+    setup_type: candidate?.setup_type,
+    summary: candidate?.summary,
+    evidence: candidate?.evidence,
+    risks: candidate?.risks,
+    narrative_data: candidate?.narrative_data,
+    trigger_reason: candidate?.trigger_reason
+  }).toLowerCase();
+  return HARVEST_HARD_INVALIDATION_MARKERS.some((marker) => blob.includes(marker));
+}
+
+function filterHarvestExitCandidates(candidates, settings = SETTINGS_DEFAULTS) {
+  const policy = getHarvestExitPolicy(settings);
+  const source = Array.isArray(candidates) ? candidates : [];
+  if (policy.frozen) return [];
+  return source.filter((candidate) => {
+    const action = String(candidate?.action || "").toLowerCase();
+    if (action === "trim" && !policy.allow_trims) return false;
+    if (action === "trim") return false;
+    if (policy.hard_invalidation_only && !harvestExitIsHardInvalidation(candidate)) return false;
+    const fraction = toNum(candidate?.suggested_exit_fraction, 1);
+    if (fraction > 0 && fraction < 0.99 && !policy.allow_trims) {
+      candidate.suggested_exit_fraction = 1;
+    }
+    return true;
+  });
+}
+
+function harvestOperatingRules(settings = SETTINGS_DEFAULTS) {
+  const policy = getHarvestExitPolicy(settings);
+  const freezeNote = policy.frozen
+    ? `HARVEST FREEZE ACTIVE until ${policy.freeze_until || "operator re-enable"}. Classify every position as hold or monitor. exit_candidates MUST be [].`
+    : "Only full exits on hard thesis invalidation. Never trim. Empty exit_candidates is the correct default.";
+  return [
+    "HOLD-UNTIL-INVALIDATION DESK:",
+    "- Default action is hold or monitor. Empty exit_candidates is correct on most cycles.",
+    "- Do NOT trim because a position is up, old, boring, or a better opportunity exists.",
+    "- Do NOT exit on MOVER/SURGE, distribution flow, or unrealized gains.",
+    "- Only action=exit (never trim) when the thesis is dead: TREASURY_DISTRIBUTION, SECURITY_RISK/honeypot, RUG_LIQUIDITY_PULL, LIQUIDITY_DRAIN, or explicit thesis invalidation with 2+ evidence refs.",
+    "- suggested_exit_fraction must be 1.0. No partial harvests.",
+    freezeNote
+  ].join("\n");
+}
+
+function scoutDeskRules(settings = SETTINGS_DEFAULTS) {
+  const maxCandidates = resolveScoutMaxCandidates(settings);
+  return [
+    "SWING-DESK RULES:",
+    `- Return at most ${maxCandidates} candidate. 0 is better than a weak name.`,
+    "- This desk holds for days at fund size. Only propose a name you would still want in 72 hours.",
+    "- Do not chase 24h movers: skip change_24h_pct >= 15 with liquidity < 250k.",
+    "- Do not propose names already up > 20% in 24h unless an E3D LONG thesis conviction >= 65 AND liquidity > 500k.",
+    "- SKIP thin-liq late pumps (the FARM pattern). SKIP MOVER/SURGE as new entries."
+  ].join("\n");
+}
+
+function filterScoutCandidatesForDesk(candidates, portfolio) {
+  const settings = portfolio?.settings || SETTINGS_DEFAULTS;
+  const minLiq = toNum(settings.min_liquidity_usd, SETTINGS_DEFAULTS.min_liquidity_usd);
+  const lateMovePct = toNum(settings.late_move_skip_24h_pct, SETTINGS_DEFAULTS.late_move_skip_24h_pct);
+  const lateMoveMinLiq = toNum(settings.late_move_min_liquidity_usd, SETTINGS_DEFAULTS.late_move_min_liquidity_usd);
+  const chasePct = toNum(settings.chase_skip_24h_pct, SETTINGS_DEFAULTS.chase_skip_24h_pct);
+  const chaseLiqOverride = toNum(settings.chase_ok_liquidity_usd, SETTINGS_DEFAULTS.chase_ok_liquidity_usd);
+  const maxCandidates = resolveScoutMaxCandidates(settings);
+
+  const kept = [];
+  for (const candidate of Array.isArray(candidates) ? candidates : []) {
+    const liq = toNum(candidate?.liquidity_data?.liquidity_usd ?? candidate?.market_data_quality?.normalized?.liquidity_usd, 0);
+    const change24 = toNum(candidate?.market_data?.change_24h_pct, 0);
+    const setup = String(candidate?.setup_type || candidate?.source || "").toLowerCase();
+    const conviction = toNum(candidate?.conviction_score, 0);
+    const thesisBacked = setup.includes("thesis") && conviction >= 65;
+
+    if (liq > 0 && liq < minLiq) {
+      log("scout_desk_filter", { symbol: candidate?.token?.symbol, reason: "liquidity_below_min", liquidity_usd: liq });
+      continue;
+    }
+    if (change24 >= lateMovePct && liq < lateMoveMinLiq) {
+      log("scout_desk_filter", { symbol: candidate?.token?.symbol, reason: "late_thin_pump", change_24h_pct: change24, liquidity_usd: liq });
+      continue;
+    }
+    if (change24 >= chasePct && !(thesisBacked && liq >= chaseLiqOverride)) {
+      log("scout_desk_filter", { symbol: candidate?.token?.symbol, reason: "chasing_24h_move", change_24h_pct: change24, liquidity_usd: liq });
+      continue;
+    }
+    if (setup.includes("flow_only") || setup === "flow-only" || candidate?.flow_only === true) {
+      log("scout_desk_filter", { symbol: candidate?.token?.symbol, reason: "flow_only_disabled" });
+      continue;
+    }
+    kept.push(candidate);
+  }
+  if (kept.length > maxCandidates) return kept.slice(0, maxCandidates);
+  return kept;
 }
 
 function sanitizeTargets(targets, entryPrice) {
@@ -1175,23 +1366,97 @@ function equityUsd(portfolio) {
   return cash + marketValue;
 }
 
+function isTrendSleevePosition(position) {
+  return String(position?.sleeve || "") === "trend_overlay";
+}
+
+function countThesisPositions(portfolio) {
+  return Object.values(portfolio?.positions || {}).filter((pos) => !isTrendSleevePosition(pos)).length;
+}
+
+function deriveLiquidityQuality(candidate) {
+  const explicit = optionalNum(candidate?.liquidity_quality);
+  if (explicit != null) return explicit;
+  const liq = toNum(
+    candidate?.liquidity_data?.liquidity_usd
+      ?? candidate?.liquidity_usd
+      ?? candidate?.market?.liquidity_usd
+      ?? candidate?.market_data_quality?.normalized?.liquidity_usd,
+    0
+  );
+  if (liq <= 0) return 50;
+  if (liq < 100000) return 0;
+  if (liq < 250000) return 40;
+  if (liq < 500000) return 65;
+  if (liq < 1000000) return 80;
+  return 100;
+}
+
+function deriveFraudRisk(candidate) {
+  const explicit = optionalNum(candidate?.fraud_risk);
+  if (explicit != null) return explicit;
+  const decision = String(candidate?.token_risk_scan?.decision || "").toLowerCase();
+  if (decision === "block") return 80;
+  if (decision === "warn") return 25;
+  return 15;
+}
+
+function estimateAtrPct(candidate, settings = SETTINGS_DEFAULTS) {
+  const flow = candidate?._dex_flow || candidate?.flow || {};
+  const change24 = Math.abs(toNum(candidate?.market_data?.change_24h_pct ?? flow.price_change_24h_pct, 0));
+  const change6 = Math.abs(toNum(flow.price_change_6h_pct, 0));
+  const change1 = Math.abs(toNum(flow.price_change_1h_pct, 0));
+  const raw = Math.max(change24, change6 * 2, change1 * 4, 8);
+  return Math.max(8, Math.min(45, raw));
+}
+
+function computeStopDistancePct(candidate, settings = SETTINGS_DEFAULTS) {
+  const atrPct = estimateAtrPct(candidate, settings);
+  const multiple = Math.max(1, toNum(settings.atr_stop_multiple, SETTINGS_DEFAULTS.atr_stop_multiple));
+  const minPct = Math.max(0.05, toNum(settings.min_stop_distance_pct, SETTINGS_DEFAULTS.min_stop_distance_pct));
+  const maxPct = Math.max(minPct, toNum(settings.max_stop_distance_pct, SETTINGS_DEFAULTS.max_stop_distance_pct));
+  const distance = (atrPct / 100) * multiple;
+  return Math.max(minPct, Math.min(maxPct, distance));
+}
+
+function hydrateCandidateTradingMetrics(candidate, portfolio) {
+  if (!candidate || typeof candidate !== "object") return candidate;
+  const settings = portfolio?.settings || SETTINGS_DEFAULTS;
+  const liquidityQuality = deriveLiquidityQuality(candidate);
+  const fraudRisk = deriveFraudRisk(candidate);
+  const atrPct = estimateAtrPct(candidate, settings);
+  const stopDistancePct = computeStopDistancePct(candidate, settings);
+  const setup = String(candidate.setup_type || candidate.source || "").toLowerCase();
+  const e3dIdea = setup.includes("thesis") || setup.includes("e3d_candidate") || setup.includes("candidate");
+  candidate.liquidity_quality = liquidityQuality;
+  candidate.fraud_risk = fraudRisk;
+  candidate._atr_pct = atrPct;
+  candidate._stop_distance_pct = stopDistancePct;
+  candidate._e3d_idea = e3dIdea;
+  const entry = toNum(candidate?.market_data?.current_price ?? candidate?.invalidation_price, 0);
+  if (entry > 0 && !(optionalNum(candidate.invalidation_price) > 0 && optionalNum(candidate.invalidation_price) < entry * (1 - toNum(settings.min_stop_distance_pct, 0.15)))) {
+    candidate.invalidation_price = entry * (1 - stopDistancePct);
+  }
+  candidate._score = computePositionScoreLike(candidate);
+  return candidate;
+}
+
 function computePositionScoreLike(candidate) {
   if (!candidate || typeof candidate !== "object") return 0;
 
-  const opportunity = toNum(candidate.opportunity_score, 0);
-  const conviction = toNum(candidate.conviction_score, 0);
-  const liquidityQuality = toNum(candidate.liquidity_quality, 0);
-  const fraudPenalty = toNum(candidate.fraud_risk, 0);
-  const marketMomentum = toNum(candidate?.market_data?.change_24h_pct, 0);
+  const conviction = toNum(candidate.conviction_score ?? candidate.conviction, 0);
+  const liquidityQuality = deriveLiquidityQuality(candidate);
+  const fraudPenalty = deriveFraudRisk(candidate);
   const slippagePenalty = toNum(candidate?.execution_data?.estimated_slippage_bps, 0) / 10;
+  const setup = String(candidate.setup_type || candidate.source || "").toLowerCase();
+  const e3dBonus = (setup.includes("thesis") || setup.includes("e3d_candidate") || setup.includes("candidate")) ? 15 : 0;
 
   return (
-    opportunity * 0.35 +
-    conviction * 0.3 +
-    liquidityQuality * 0.2 +
-    marketMomentum * 0.1 -
+    conviction * 0.35 +
+    liquidityQuality * 0.30 +
+    e3dBonus -
     fraudPenalty * 0.25 -
-    slippagePenalty * 0.05
+    slippagePenalty * 0.10
   );
 }
 
@@ -1252,13 +1517,16 @@ function computeMarketRegime(scoutPayload, approved, portfolio) {
   const approvedFraudRisk = average(approvedCandidates.map((item) => toNum(item?.fraud_risk, NaN)));
 
   const compositeMomentum = average([candidateMomentum, approvedMomentum, heldMomentum]);
+  const bookRegime = _cycleQuantContext?.macro?.book_regime || null;
 
   let regime = "neutral";
-  if (approvedCandidates.length === 0 && candidates.length > 0 && candidateMomentum < -5) {
+  if (bookRegime === "risk_on" || bookRegime === "risk_off" || bookRegime === "neutral") {
+    regime = bookRegime;
+  } else if (approvedCandidates.length === 0 && candidates.length > 0 && candidateMomentum < -5) {
     regime = "risk_off";
-  } else if (compositeMomentum >= 12 && approvedScore >= 25 && approvedFraudRisk < 20) {
+  } else if (compositeMomentum >= 5 && (approvedScore >= 20 || !Number.isFinite(approvedScore)) && !(approvedFraudRisk >= 20)) {
     regime = "risk_on";
-  } else if (compositeMomentum <= -8 || approvedFraudRisk >= toNum(portfolio?.settings?.reject_fraud_risk_gte, 35)) {
+  } else if (compositeMomentum <= -5 || approvedFraudRisk >= toNum(portfolio?.settings?.reject_fraud_risk_gte, 35)) {
     regime = "risk_off";
   }
 
@@ -1270,7 +1538,10 @@ function computeMarketRegime(scoutPayload, approved, portfolio) {
     approved_momentum_24h_pct: approvedMomentum,
     held_momentum_24h_pct: heldMomentum,
     approved_score_avg: approvedScore,
-    approved_fraud_risk_avg: approvedFraudRisk
+    approved_fraud_risk_avg: approvedFraudRisk,
+    btc_trend: _cycleQuantContext?.macro?.btc_trend || null,
+    book_regime: bookRegime,
+    source: bookRegime ? "btc_20d_trend" : "alt_composite"
   };
 }
 
@@ -1281,10 +1552,10 @@ function regimePolicy(regime, settings = SETTINGS_DEFAULTS) {
     return {
       regime: normalizedRegime,
       allow_buys: true,
-      allow_rotations: true,
+      allow_rotations: false,
       allocation_multiplier: 1.35,
-      max_buys_per_cycle: Math.min(settings.max_buys_per_cycle + 2, 5),
-      max_rotations_per_cycle: settings.max_rotations_per_cycle
+      max_buys_per_cycle: Math.max(1, toNum(settings.max_buys_per_cycle, 1)),
+      max_rotations_per_cycle: 0
     };
   }
 
@@ -1302,10 +1573,10 @@ function regimePolicy(regime, settings = SETTINGS_DEFAULTS) {
   return {
     regime: "neutral",
     allow_buys: true,
-    allow_rotations: true,
+    allow_rotations: false,
     allocation_multiplier: 1,
-    max_buys_per_cycle: Math.max(1, settings.max_buys_per_cycle),
-    max_rotations_per_cycle: settings.max_rotations_per_cycle
+    max_buys_per_cycle: Math.max(1, toNum(settings.max_buys_per_cycle, 1)),
+    max_rotations_per_cycle: 0
   };
 }
 
@@ -1522,16 +1793,24 @@ function classifyExitReasonForPolicy(reason) {
   return root || "unknown";
 }
 
-function computeRecentClosedTradeMetrics(portfolio, windowMs = null) {
+function computeRecentClosedTradeMetrics(portfolio, windowMs = null, options = {}) {
   const settings = portfolio?.settings || SETTINGS_DEFAULTS;
   const resolvedWindowMs = windowMs ?? Math.max(1, toNum(settings.recent_performance_window_hours, 24)) * 60 * 60 * 1000;
   const cutoff = Date.now() - resolvedWindowMs;
+  const minHoldHours = toNum(options?.minHoldHours, 0);
   const closed = (Array.isArray(portfolio?.closed_trades) ? portfolio.closed_trades : [])
     .filter((trade) => trade?.side === "sell")
     .filter((trade) => Number.isFinite(toNum(trade?.pnl_usd, NaN)))
     .filter((trade) => {
       const ts = Date.parse(trade?.ts || "");
       return Number.isFinite(ts) && ts >= cutoff;
+    })
+    .filter((trade) => {
+      if (!(minHoldHours > 0)) return true;
+      const opened = Date.parse(trade?.opened_at || "");
+      const closedAt = Date.parse(trade?.ts || "");
+      if (!Number.isFinite(opened) || !Number.isFinite(closedAt)) return false;
+      return (closedAt - opened) >= minHoldHours * 60 * 60 * 1000;
     });
   const wins = closed.filter((trade) => toNum(trade.pnl_usd, 0) > 0);
   const losses = closed.filter((trade) => toNum(trade.pnl_usd, 0) < 0);
@@ -1564,18 +1843,27 @@ function computeRecentPerformanceThrottleMultiplier(profitFactor) {
 function buildRegimeSentinelPolicy(portfolio, quantContext) {
   const perf = readLatestJsonReport("performance-daily-");
   const reportPerf24 = perf?.windows?.["24h"]?.metrics || {};
-  const rollingPerf24 = computeRecentClosedTradeMetrics(portfolio);
-  const perf24 = rollingPerf24.closed_trade_count > 0 ? rollingPerf24 : { ...reportPerf24, source: "performance_daily_report" };
+  const settings = portfolio?.settings || SETTINGS_DEFAULTS;
+  const harvestPolicy = getHarvestExitPolicy(settings);
+  const rollingPerf24 = computeRecentClosedTradeMetrics(portfolio, null, {
+    minHoldHours: toNum(settings.throttle_min_hold_hours, 24)
+  });
+  const holdFilteredEmpty = toNum(settings.throttle_min_hold_hours, 24) > 0 && rollingPerf24.closed_trade_count === 0;
+  const perf24 = rollingPerf24.closed_trade_count > 0
+    ? rollingPerf24
+    : (holdFilteredEmpty ? { ...rollingPerf24, source: "hold_filtered_empty" } : { ...reportPerf24, source: "performance_daily_report" });
   const reviewStats = buildRecentReviewStats(200);
   const macro = quantContext?.macro || {};
-  const settings = portfolio?.settings || SETTINGS_DEFAULTS;
-  const base = regimePolicy(macro.regime || portfolio?.stats?.market_regime || "neutral", settings);
+  const base = regimePolicy(
+    macro.book_regime || portfolio?.stats?.market_regime || macro.regime || "neutral",
+    settings
+  );
   const reasonCodes = [];
   let allocationMultiplier = toNum(base.allocation_multiplier, 1);
   let allowBuys = Boolean(base.allow_buys);
-  let allowRotations = Boolean(base.allow_rotations);
+  let allowRotations = false;
   let maxBuys = toNum(base.max_buys_per_cycle, settings.max_buys_per_cycle);
-  let maxRotations = toNum(base.max_rotations_per_cycle, settings.max_rotations_per_cycle);
+  let maxRotations = 0;
   const equity = equityUsd(portfolio);
   const hasSufficientSample = toNum(perf24.closed_trade_count, 0) >= 10;
   const hasMaterialLoss = toNum(perf24.realized_pnl_usd, 0) <= (-0.005 * equity);
@@ -1624,12 +1912,12 @@ function buildRegimeSentinelPolicy(portfolio, quantContext) {
     confidence: Math.min(0.95, 0.55 + reasonCodes.length * 0.08),
     allow_new_buys: allowBuys,
     allow_buys: allowBuys,
-    allow_rotations: allowRotations,
-    allow_harvest_exits: true,
+    allow_rotations: false,
+    allow_harvest_exits: harvestPolicy.allow_exits,
     max_buys_per_cycle: maxBuys,
-    max_rotations_per_cycle: maxRotations,
+    max_rotations_per_cycle: 0,
     allocation_multiplier: allocationMultiplier,
-    tighten_stops: Boolean(macro.tighten_stops || reasonCodes.includes("negative_recent_profit_factor")),
+    tighten_stops: Boolean(macro.tighten_stops),
     reason_codes: reasonCodes,
     recent_performance: {
       win_rate: perf24.win_rate ?? null,
@@ -1844,9 +2132,10 @@ function sleep(ms) {
 function parseCliArgs(argv) {
   const args = {
     loop: false,
-    intervalMs: 5 * 60 * 1000,
+    intervalMs: DEFAULT_PIPELINE_INTERVAL_SECONDS * 1000,
     maxIterations: Infinity,
-    debug: PIPELINE_DEBUG_MODE
+    debug: PIPELINE_DEBUG_MODE,
+    trendOnly: false
   };
 
   for (let i = 0; i < argv.length; i += 1) {
@@ -1861,15 +2150,21 @@ function parseCliArgs(argv) {
       continue;
     }
 
+    if (arg === "--trend-only") {
+      args.trendOnly = true;
+      args.loop = false;
+      continue;
+    }
+
     if (arg === "--interval-seconds" && argv[i + 1]) {
-      args.intervalMs = Math.max(1000, toNum(argv[i + 1], 300) * 1000);
+      args.intervalMs = Math.max(1000, toNum(argv[i + 1], DEFAULT_PIPELINE_INTERVAL_SECONDS) * 1000);
       i += 1;
       continue;
     }
 
     if (arg.startsWith("--interval-seconds=")) {
       const value = arg.split("=")[1];
-      args.intervalMs = Math.max(1000, toNum(value, 300) * 1000);
+      args.intervalMs = Math.max(1000, toNum(value, DEFAULT_PIPELINE_INTERVAL_SECONDS) * 1000);
       continue;
     }
 
@@ -3472,7 +3767,7 @@ function buildCognitiveState(portfolio) {
       // E3D-provided risk metadata, carried through so it can override the LLM's
       // output (which never reports these) before buy ranking/gating runs on it.
       fraud_risk:        optionalNum(c?.fraud_risk),
-      liquidity_quality: optionalNum(c?.liquidity_quality),
+      liquidity_quality: optionalNum(c?.liquidity_quality) ?? deriveLiquidityQuality({ market: market, liquidity_data: { liquidity_usd: market.liquidity_usd } }),
       drill_down:   ["token_info", "transactions"]
     });
   }
@@ -3500,6 +3795,8 @@ function buildCognitiveState(portfolio) {
       conviction:   sig.conviction,
       why_now:      sig.summaries.join("; ") || [...sig.types].join(", "),
       market,
+      liquidity_quality: deriveLiquidityQuality({ market, liquidity_data: { liquidity_usd: market.liquidity_usd } }),
+      fraud_risk: 15,
       drill_down:   toNum(market.liquidity_usd, 0) === 0 ? ["token_info"] : []
     });
   }
@@ -4195,7 +4492,7 @@ function decorateRiskReviewWithEvidence(risk = {}, proposal = {}) {
 function buildHarvestEvidenceReviewContext(portfolio, portfolioIntelligence = null, options = {}) {
   const createdAt = options.createdAt || nowIso();
   const dossier = portfolioIntelligence || buildPortfolioIntelligenceDossier(portfolio);
-  const positions = Object.values(portfolio?.positions || {});
+  const positions = Object.values(portfolio?.positions || {}).filter((pos) => !isTrendSleevePosition(pos));
   const heldAddresses = positions.map((p) => cleanAddress(p?.contract_address || "")).filter(Boolean);
   const addrSet = new Set(heldAddresses);
   const { allStories: cycleHarvestStories, tokenUniverse } = getOrFetchCycleMarketContext();
@@ -5076,6 +5373,7 @@ function runScoutWithTools(portfolio, portfolioIntelligence = null) {
     "You are Scout, an elite crypto trading research agent for a quantitative hedge fund.",
     "You have been given a pre-computed cognitive state: the top-ranked candidates with their signals and market data.",
     "Return STRICT JSON only — one object, no markdown, no commentary.",
+    scoutDeskRules(portfolio?.settings || SETTINGS_DEFAULTS),
     "",
     "DECISION FLOW:",
     "1. Review the cognitive_state candidates in order of rank.",
@@ -5091,7 +5389,7 @@ function runScoutWithTools(portfolio, portfolioIntelligence = null) {
     "2. source=multi_signal — 2+ independent signals on same token",
     "3. THESIS conviction >= 65 — structured investment thesis",
     "4. source=single_signal — only if signal is strong (SMART_MONEY, ACCUMULATION) and market data is clean",
-    `5. FLOW-ONLY (last resort): buy_sell_ratio_1h >= 3.5, liquidity > 150k, vol > 75k, mcap > 5M. Max ${SCOUT_FLOW_ONLY_PER_CYCLE_LIMIT}.`,
+    "5. FLOW-ONLY is DISABLED. Do not propose flow-only names. Return 0 candidates rather than a flow pick.",
     "",
     "",
     "SCORECARD: Each candidate in the cognitive state has a scorecard{} with composite_score (0–100) and decision (pass/watch/weak/fail).",
@@ -5759,6 +6057,7 @@ function runScoutDirect(portfolio, portfolioIntelligence = null) {
   const systemPrompt = [
     "You are Scout, an elite crypto trading research agent for a quantitative hedge fund.",
     "You have been given pre-fetched E3D market intelligence data. Return STRICT JSON only — one object, no markdown, no commentary.",
+    scoutDeskRules(portfolio?.settings || SETTINGS_DEFAULTS),
     "",
     "SIGNAL PRIORITY — work down this list and stop when you find qualified candidates:",
     "1. E3D AGENT CANDIDATES — pre-computed multi-story convergence. The E3D system has already correlated signals across time. These are the highest-quality setups; always prioritize them.",
@@ -5772,7 +6071,7 @@ function runScoutDirect(portfolio, portfolioIntelligence = null) {
     "- PRE-PUMP (your alpha window — buy here): STAGING, CLUSTER, FUNNEL, NEW_WALLETS, ACCUMULATION, SMART_MONEY, SMART_MONEY_LEADER, STEALTH_ACCUMULATION, DEEP_DIVE, THESIS. These fire BEFORE price moves. A STAGING or CLUSTER story with flat price is your best entry. SMART_MONEY_LEADER means tracked profitable wallets are accumulating together — check cohort_quality_score (≥75 = high conviction) and late_crowding (true = weakened signal).",
     "- BREAKOUT (early-mid entry, still valid): BREAKOUT_CONFIRMED, FLOW, HOTLINKS — price is moving but momentum is fresh. On BREAKOUT_CONFIRMED check participation_type: broad = organic demand confirmed; thin-liquidity = likely pump, skip.",
     "- POST-PUMP (already happened — do NOT buy as a new entry): MOVER, SURGE — the move is over. These appear in LATE SIGNALS section. Exception: SURGE with participation_type=broad and vol/TVL ≥ 0.1 is an early momentum signal, not late — treat it like BREAKOUT_CONFIRMED in that case.",
-    "- PUMP EXHAUSTION (exit signal when you already hold): If you held a token and now see MOVER + declining price, that is the dump phase. Harvest should exit, not hold.",
+    "- PUMP EXHAUSTION is Harvest's job, and Harvest holds until the thesis is dead. Do not buy MOVER/SURGE as a new entry.",
     "- DISQUALIFIERS: TREASURY_DISTRIBUTION means a team/foundation wallet is moving tokens to an exchange — immediate sell pressure, do NOT propose. SECURITY_RISK with is_honeypot=true means the token cannot be sold — never propose.",
     "",
     "WHERE ALPHA COMES FROM:",
@@ -5787,7 +6086,7 @@ function runScoutDirect(portfolio, portfolioIntelligence = null) {
     "TIER 1 (full size, highest conviction): E3D candidate or thesis (conviction >= 65) + flow_signal=accumulation or strong_accumulation + funding=neutral or squeeze_potential.",
     "TIER 2 (standard size): Story signal (ACCUMULATION/SMART_MONEY/SMART_MONEY_LEADER/THESIS/BREAKOUT_CONFIRMED) with in_token_universe=true + liquidity_usd > 200000 + volume_24h_usd > 50000.",
     "TIER 3 (small size, max 1 per cycle): Signal-backed setup (story or thesis) with good conviction but below TIER 2 liquidity/volume thresholds. NEVER use TIER 3 for pure flow-only entries.",
-    `FLOW-ONLY ENTRY (only when E3D AGENT CANDIDATES shows 'none currently' AND E3D THESES shows 'none currently' AND zero buy-signal stories have in_token_universe=true): require ALL of — buy_sell_ratio_1h >= 3.5, liquidity_usd > 150000, volume_24h_usd > 75000, market_cap_usd > 5000000. Maximum ${SCOUT_FLOW_ONLY_PER_CYCLE_LIMIT} candidate${SCOUT_FLOW_ONLY_PER_CYCLE_LIMIT === 1 ? "" : "s"}. If any threshold is not met, return 0 candidates — do NOT force an entry.`,
+    "FLOW-ONLY ENTRY is DISABLED. If E3D candidates and theses are empty, return 0 candidates.",
     "SKIP: flow_signal=distribution or strong_distribution. funding_signal=overcrowded_long. market_cap_usd < 2000000 (cannot size or exit safely). price_usd = 0 or volume_24h_usd = 0.",
     "MACRO GATE: If new_positions_ok=false, only propose TIER 1 setups with conviction >= 80.",
     "",
@@ -6042,7 +6341,7 @@ function runScoutDirect(portfolio, portfolioIntelligence = null) {
       const qualifiedFlow = accum.filter(t => (t.buy_sell_ratio_1h||0) >= 3.5 && (t.liquidity_usd||0) > 150000 && (t.volume_24h_usd||0) > 75000 && (t.market_cap_usd||0) > 5000000);
       return `Flow coverage: ${withFlow.length}/${data.tokenUniverse.length} tokens have DexScreener data. Accumulation signals: ${accum.length} tokens. Distribution signals: ${distrib.length} tokens.` +
         (accum.length ? `\nAccumulation tokens (buy_sell_ratio_1h): ${accum.slice(0, 8).map(t => `${t.symbol}(${t.flow_signal},ratio=${t.buy_sell_ratio_1h},liq=$${(t.liquidity_usd||0).toFixed(0)},mcap=$${((t.market_cap_usd||0)/1e6).toFixed(1)}M,vol24=$${((t.volume_24h_usd||0)/1e3).toFixed(0)}k)`).join(", ")}` : "") +
-        `\nFLOW-ONLY eligible (ratio>=3.5, liq>$150k, vol24>$75k, mcap>$5M): ${qualifiedFlow.length} tokens${qualifiedFlow.length ? " — " + qualifiedFlow.map(t => t.symbol).join(", ") : ""}. Use ONLY when E3D candidates AND theses are both empty. Max ${SCOUT_FLOW_ONLY_PER_CYCLE_LIMIT} pick${SCOUT_FLOW_ONLY_PER_CYCLE_LIMIT === 1 ? "" : "s"}.`;
+        "\nFLOW-ONLY is disabled. Do not use DEX flow as a standalone entry.";
     })(),
     JSON.stringify(data.tokenUniverse.slice(0, 100)),
   ];
@@ -6376,7 +6675,8 @@ function buildFastPathExitDecision(entry, signal, createdAt, expiresAt) {
   };
 }
 
-function applyHarvestFastPathExits(result, reviewContext, exitSignals, createdAt, expiresAt) {
+function applyHarvestFastPathExits(result, reviewContext, exitSignals, createdAt, expiresAt, settings = SETTINGS_DEFAULTS) {
+  if (getHarvestExitPolicy(settings).frozen) return result;
   if (!exitSignals.size) return result;
   for (const entry of reviewContext.entries) {
     const signal = exitSignals.get(entry.address);
@@ -6545,26 +6845,25 @@ function runHarvestDirect(portfolio, portfolioIntelligence = null) {
     "Return STRICT JSON only — one object, no markdown.",
     "Use only the supplied packets, token fields, evidence_packet_id values, and evidence_id values. Do not invent evidence or cite evidence from a different packet.",
     `Classify every held position as hold, monitor, trim, or exit based on ALL available evidence. position_reviews[] MUST contain exactly one entry per held position (${positions.length} total) — never skip a position.`,
-    "Only add a position to exit_candidates if action is trim or exit.",
-    "EVIDENCE RULE: Every trim/exit review and every exit_candidate MUST include at least 2 evidence_id strings in evidence[] copied exactly from that same packet. If you do not have 2 valid evidence refs, use action='monitor' instead.",
-    "MASS EXIT RULE: Do not propose trim or exit for more than half the portfolio in a single cycle unless you have direct exit-risk story matches (LIQUIDITY_DRAIN, RUG_LIQUIDITY_PULL, TREASURY_DISTRIBUTION, SECURITY_RISK) for those positions. When evidence is weak or absent, use monitor, not exit.",
+    harvestOperatingRules(portfolio?.settings || SETTINGS_DEFAULTS),
+    "Only add a position to exit_candidates if action is exit (never trim on this desk).",
+    "EVIDENCE RULE: Every exit review and every exit_candidate MUST include at least 2 evidence_id strings in evidence[] copied exactly from that same packet. If you do not have 2 valid evidence refs, use action='monitor' instead.",
+    "MASS EXIT RULE: Do not propose exit for more than half the portfolio in a single cycle unless you have direct exit-risk story matches (LIQUIDITY_DRAIN, RUG_LIQUIDITY_PULL, TREASURY_DISTRIBUTION, SECURITY_RISK) for those positions. When evidence is weak or absent, use monitor, not exit.",
     "",
     "SIGNAL TIMING — know whether you're in the setup, the move, or the dump:",
     "- PRE-PUMP HOLD CONFIRMS (bullish for holding): STAGING, CLUSTER, FUNNEL, ACCUMULATION, SMART_MONEY, SMART_MONEY_LEADER, FLOW — fresh accumulation means the thesis is intact. SMART_MONEY_LEADER with late_crowding=false is a strong hold signal.",
     "- EXIT TRIGGERS: TREASURY_DISTRIBUTION means a team/foundation wallet is moving tokens to an exchange — this is sell pressure, lean toward exit or trim immediately. SECURITY_RISK with is_honeypot=true means the token cannot be sold — flag as critical, seek liquidity exit at any price.",
-    "- PUMP EXHAUSTION (exit signal): MOVER or SURGE story on a position that is declining = the pump narrative is over, you are now in the dump phase. EXIT unless a fresh ACCUMULATION/SMART_MONEY story ALSO exists for this token.",
-    "- If a position has _coingecko.change_7d_pct > 200% AND is now down from entry: the pump happened before entry. Exit — there is no thesis, only a late buy into a pump.",
+    "- PUMP EXHAUSTION is NOT an automatic exit. MOVER/SURGE on a still-working thesis is a hold. Exit only if the original thesis is dead AND a hard invalidation story is present.",
+    "- If a position has _coingecko.change_7d_pct > 200% AND is now down from entry AND no thesis remains: that is invalidation, not a trim.",
     "",
-    "QUANT EXIT SIGNALS — apply these to every position:",
-    "- flow_signal=strong_distribution or distribution: bearish order flow — lean toward trim or exit unless strong hold-confirm story exists",
-    "- flow_signal=strong_accumulation or accumulation: bullish order flow — lean toward hold; only exit if story evidence is strong",
-    "- funding_signal=overcrowded_long: longs are crowded — reduce exposure on rally; set tighter stop",
-    "- funding_signal=squeeze_potential: shorts crowded — hold/buy the dip; squeeze may lift price",
-    "- tighten_stops=true (macro): take partial profits on all positions > 15% gain; tighten stops to -5%",
-    "- regime=extreme_fear: only exit confirmed deteriorating positions; avoid panic-selling healthy ones",
-    "- unrealized_pnl_pct > 25%: consider partial profit-taking unless Tier 1 conviction",
-    "- unrealized_pnl_pct < -8%: flag for stop review; exit if thesis invalid and no recovery signal",
-    "- decision_layer_signal (if present in packet): high-weight structural signal from the E3D OTA pipeline. avoid or confirm_risk with risk_score > 0.65 is a strong exit indicator; reduce_exposure_signal means trim exposure.",
+    "QUANT SIGNALS — use these to hold or monitor, not to nibble:",
+    "- flow_signal=strong_distribution: monitor; exit only with a hard invalidation story",
+    "- flow_signal=strong_accumulation or accumulation: hold",
+    "- funding_signal=overcrowded_long: monitor, do not automatically trim",
+    "- funding_signal=squeeze_potential: hold",
+    "- unrealized_pnl_pct > 25%: hold unless a pre-declared target_1 already exists (code takes that partial once)",
+    "- unrealized_pnl_pct < -8%: monitor; the stop engine handles structural invalidation",
+    "- decision_layer_signal avoid/confirm_risk with risk_score > 0.65: treat as hard invalidation only if SECURITY_RISK, TREASURY_DISTRIBUTION, or LIQUIDITY_DRAIN is also present",
     "",
     `Output shape: {scan_timestamp, portfolio_summary, position_reviews[], exit_candidates[], stories_checked[]}`,
     `Each position_review: {source_agent:"harvest", created_at:"${createdAt}", expires_at:"${expiresAt}", evidence_packet_id, token:{symbol,name,chain:"ethereum",contract_address,category}, position:{quantity,avg_entry_price,current_price,market_value_usd,cost_basis_usd,unrealized_pnl_usd,unrealized_pnl_pct}, action:"hold"|"monitor"|"trim"|"exit", thesis_state, thesis_summary, what_changed, why_now, confidence:integer(0-100), conviction_score:integer(0-100), opportunity_score:integer(0-100), review_priority, summary, evidence:["evi_..."], risks[], what_would_change_my_mind[], next_best_alternative, current_regime, market_data:{current_price,change_24h_pct,price_source}, liquidity_data:{liquidity_usd,liquidity_source}, narrative_data:{story_strength,thesis_health,flow_direction}, portfolio_data:{current_token_exposure_pct,current_category_exposure_pct,current_total_exposure_pct,portfolio_timestamp,portfolio_source:"system"}}`,
@@ -6639,7 +6938,7 @@ function runHarvestDirect(portfolio, portfolioIntelligence = null) {
       const parsed = JSON.parse(jsonStr);
       return applyHarvestFastPathExits(
         finalizeHarvestLLMResult(parsed, portfolio, reviewContext, dossier, createdAt, expiresAt, harvestLlmBatches),
-        reviewContext, _positionExitSignals, createdAt, expiresAt
+        reviewContext, _positionExitSignals, createdAt, expiresAt, portfolio?.settings || SETTINGS_DEFAULTS
       );
     } catch (parseErr) {
       // LLM may have hit max_tokens mid-response — try to repair truncated JSON
@@ -6648,7 +6947,7 @@ function runHarvestDirect(portfolio, portfolioIntelligence = null) {
         log("harvest_json_repaired", { raw_length: rawText.length, attempt });
         return applyHarvestFastPathExits(
           finalizeHarvestLLMResult(repaired, portfolio, reviewContext, dossier, createdAt, expiresAt, harvestLlmBatches),
-          reviewContext, _positionExitSignals, createdAt, expiresAt
+          reviewContext, _positionExitSignals, createdAt, expiresAt, portfolio?.settings || SETTINGS_DEFAULTS
         );
       } catch (_) {
         log("harvest_json_parse_failed", { attempt, raw_length: rawText.length });
@@ -6663,7 +6962,7 @@ function runHarvestWithTools(portfolio, portfolioIntelligence = null) {
   const createdAt = nowIso();
   const expiresAt = new Date(Date.now() + 12 * 60 * 60 * 1000).toISOString();
 
-  const positions = Object.values(portfolio?.positions || {});
+  const positions = Object.values(portfolio?.positions || {}).filter((pos) => !isTrendSleevePosition(pos));
   if (positions.length === 0) {
     const emptyResult = {
       scan_timestamp: createdAt,
@@ -6718,30 +7017,29 @@ function runHarvestWithTools(portfolio, portfolioIntelligence = null) {
   const systemPrompt = [
     "You are Harvest, a crypto portfolio exit-scan agent for a quantitative hedge fund.",
     "Use the provided tools to research each held position, then return STRICT JSON only — one object, no markdown, no commentary.",
+    harvestOperatingRules(portfolio?.settings || SETTINGS_DEFAULTS),
     "",
     "RESEARCH STRATEGY:",
     "1. Call e3d_get_stories to find any stories about your held tokens (check by contract_address).",
     "2. Call e3d_get_token_info(address) for positions with large unrealized P&L or high risk.",
     "3. Call e3d_get_transactions(address) to check for whale exits or unusual activity on any concerning position.",
-    "You do NOT need to call tools for every position. Prioritize positions with: large loss (pnl_pct < -8%), large gain (pnl_pct > 25%), or high category risk.",
+    "You do NOT need to call tools for every position. Prioritize positions with hard invalidation risk.",
     "You MUST classify ALL held positions — never skip one.",
     "",
-    "EXIT SIGNALS (lean toward trim or exit):",
-    "- TREASURY_DISTRIBUTION story: team wallet moving to exchange — immediate sell pressure.",
+    "EXIT SIGNALS (full exit only — never trim):",
+    "- TREASURY_DISTRIBUTION story: team wallet moving to exchange — thesis dead.",
     "- SECURITY_RISK with is_honeypot=true: cannot be sold — emergency exit at any price.",
-    "- MOVER/SURGE story on a declining position: pump is over, now in dump phase.",
-    "- flow_signal=strong_distribution: bearish order flow.",
-    "- unrealized_pnl_pct < -8% with thesis failing or no supporting story.",
-    "- change_7d_pct > 200% AND position is now declining: entered a late pump, exit.",
+    "- RUG_LIQUIDITY_PULL or LIQUIDITY_DRAIN: cannot exit later, exit now.",
+    "- Explicit thesis invalidation with 2+ evidence reasons.",
     "",
     "HOLD SIGNALS:",
-    "- STAGING, CLUSTER, ACCUMULATION, SMART_MONEY, FUNNEL: fresh accumulation, thesis intact.",
-    "- SMART_MONEY_LEADER with late_crowding=false: strong hold signal.",
-    "- flow_signal=accumulation or strong_accumulation: bullish order flow.",
-    "- unrealized_pnl_pct > 25%: consider partial profit-taking (action=trim) unless Tier 1 conviction.",
+    "- STAGING, CLUSTER, ACCUMULATION, SMART_MONEY, FUNNEL: thesis intact.",
+    "- SMART_MONEY_LEADER with late_crowding=false: strong hold.",
+    "- flow_signal=accumulation or strong_accumulation: hold.",
+    "- Unrealized gains are not an exit signal. Hold them.",
     "",
-    "MASS EXIT RULE: Do not propose trim/exit for more than half the portfolio in one cycle unless you have direct exit-risk story evidence (LIQUIDITY_DRAIN, RUG_LIQUIDITY_PULL, TREASURY_DISTRIBUTION, SECURITY_RISK).",
-    "EVIDENCE RULE: Every trim/exit MUST have at least 2 reasons in evidence[]. If you cannot find 2 reasons, use action=monitor instead.",
+    "MASS EXIT RULE: Do not propose exit for more than half the portfolio in one cycle unless you have direct exit-risk story evidence (LIQUIDITY_DRAIN, RUG_LIQUIDITY_PULL, TREASURY_DISTRIBUTION, SECURITY_RISK).",
+    "EVIDENCE RULE: Every exit MUST have at least 2 reasons in evidence[]. If you cannot find 2 reasons, use action=monitor instead.",
     macroLine, policyLine,
     "",
     `Output shape: {scan_timestamp, portfolio_summary, position_reviews[], exit_candidates[], stories_checked[]}`,
@@ -6888,7 +7186,7 @@ function buildScoutPrompt(portfolio, portfolioIntelligence = null) {
   const taskPrompt = [
     `Scout task — ${createdAt}. Return STRICT JSON only (one object, no markdown).`,
     `Follow the full Research Protocol in TOOLS.md: disqualifier sweep first, then buy signals, then per-candidate deep checks.`,
-    `Return up to 3 buy candidates. Use real values from your research — no placeholder zeros.`,
+    `Return up to ${resolveScoutMaxCandidates(portfolio?.settings || SETTINGS_DEFAULTS)} buy candidate. 0 is better than a weak name. Use real values from your research — no placeholder zeros.`,
     `Exclude held tokens: ${JSON.stringify(exclusions.held_symbols)}`,
     `Excluded addresses: ${JSON.stringify(exclusions.held_addresses)}`,
     `Output fields: scan_timestamp, candidates[], holdings_updates[], stories_checked[].`,
@@ -6913,9 +7211,10 @@ function buildHarvestPrompt(portfolio, portfolioIntelligence = null) {
 
   return [
     "You are Harvest. Return STRICT JSON only.",
+    harvestOperatingRules(portfolio?.settings || SETTINGS_DEFAULTS),
     "Use only the supplied harvest evidence packets and cite evidence_id strings copied from the matching packet.",
     `Review every held position exactly once (${reviewContext.entries.length} total).`,
-    `Trim/exit requires at least 2 valid evidence refs from the same packet; otherwise use monitor.`,
+    `Exit requires at least 2 valid evidence refs from the same packet; otherwise use monitor. Never trim.`,
     `Each position_review and each exit_candidate must include evidence_packet_id.`,
     `Portfolio baseline: ${JSON.stringify(baseline)}`,
     ...mapsPrecheckLines,
@@ -7151,13 +7450,22 @@ function deterministicBuyGate(proposal, portfolio) {
 
   if (!isEvmAddress(addr)) blockers.push("invalid_contract_address");
   if (!(price > 0)) blockers.push("missing_or_invalid_price");
-  if (!(liquidity >= 100000)) blockers.push("liquidity_below_100k");
+  const minLiquidity = toNum(portfolio?.settings?.min_liquidity_usd, SETTINGS_DEFAULTS.min_liquidity_usd);
+  const minConfidence = toNum(portfolio?.settings?.min_buy_confidence, SETTINGS_DEFAULTS.min_buy_confidence);
+  const change24h = optionalNum(proposal?.market_data?.change_24h_pct);
+  if (!(liquidity >= minLiquidity)) blockers.push("liquidity_below_100k");
   if (!(marketCap >= 2000000)) blockers.push("market_cap_below_2m");
   if (!(volume24h >= 10000)) blockers.push("volume_24h_below_10k");
   if (!(slippageBps != null && slippageBps <= 300)) blockers.push("slippage_above_300bps_or_missing");
   if (fragilityScore != null && fragilityScore >= 70) blockers.push("fragility_score_high");
   if (fraudRisk != null && fraudRisk >= toNum(portfolio?.settings?.reject_fraud_risk_gte, SETTINGS_DEFAULTS.reject_fraud_risk_gte)) blockers.push("fraud_risk_high");
-  if (confidence != null && confidence <= 55) blockers.push("confidence_too_low");
+  if (confidence != null && confidence <= minConfidence) blockers.push("confidence_too_low");
+  if (change24h != null && change24h >= toNum(portfolio?.settings?.late_move_skip_24h_pct, 15) && (liquidity || 0) < toNum(portfolio?.settings?.late_move_min_liquidity_usd, 250000)) {
+    blockers.push("late_thin_pump");
+  }
+  if (change24h != null && change24h >= toNum(portfolio?.settings?.chase_skip_24h_pct, 20) && (liquidity || 0) < toNum(portfolio?.settings?.chase_ok_liquidity_usd, 500000)) {
+    blockers.push("chasing_24h_move");
+  }
   if (flowSignal === "distribution" || flowSignal === "strong_distribution") blockers.push("bearish_order_flow");
   if (fundingAvoid) blockers.push("overcrowded_long_funding");
   if (curatedNegativeReasons.includes("smart_wallet_distribution")) blockers.push("curated_signal_distribution");
@@ -7400,12 +7708,10 @@ function buildPositionSizingDecision(action, portfolio, tradeKind = "buy") {
   const reasonCodes = [];
   const blockers = [];
 
-  const regimeMultiplier = policy.regime === "risk_on" ? 1.3 : policy.regime === "risk_off" ? 0.4 : 0.85;
+  const regimeMultiplier = policy.regime === "risk_on" ? 1.3 : policy.regime === "risk_off" ? 0.4 : 1;
   const liquidityMultiplier = liquidity <= 0 ? 0.75 : liquidity < 100000 ? 0.65 : 1;
-  const performanceMultiplier = policy.reason_codes?.includes("negative_recent_profit_factor")
-    ? computeRecentPerformanceThrottleMultiplier(policy?.recent_performance?.profit_factor)
-    : 1;
-  const drawdownMultiplier = drawdown > 0.05 ? 0.7 : drawdown > 0.03 ? 0.85 : 1;
+  const performanceMultiplier = 1;
+  const drawdownMultiplier = drawdown > 0.15 ? 0.7 : drawdown > 0.10 ? 0.85 : 1;
   const totalMultiplier = Math.min(1, regimeMultiplier * liquidityMultiplier * performanceMultiplier * drawdownMultiplier);
 
   if (policy.regime === "risk_off") reasonCodes.push("risk_off_size_reduction");
@@ -7420,8 +7726,15 @@ function buildPositionSizingDecision(action, portfolio, tradeKind = "buy") {
   if (tradeKind === "buy" && !policy.allow_buys) blockers.push("policy_blocks_new_buys");
 
   const approvedPct = toNum(candidate?._risk?.approved_size_pct, 0) / 100;
-  const basePct = approvedPct > 0 ? approvedPct : settings.risk_per_trade_pct;
+  const stopPct = Math.max(
+    toNum(settings.min_stop_distance_pct, 0.15),
+    toNum(candidate?._stop_distance_pct, toNum(settings.default_stop_distance_pct, 0.20))
+  );
+  const rPct = toNum(settings.risk_r_pct, SETTINGS_DEFAULTS.risk_r_pct);
+  const rNotionalPct = stopPct > 0 ? rPct / stopPct : toNum(settings.risk_per_trade_pct, 0.08);
+  const basePct = approvedPct > 0 ? approvedPct : rNotionalPct;
   const recommendedPct = Math.min(basePct * totalMultiplier, settings.max_position_pct);
+  reasonCodes.push(`r_sizing_stop_${(stopPct * 100).toFixed(1)}pct`);
   let maxAllocationUsd = Math.min(toNum(action?.allocation_usd, equity * recommendedPct), equity * recommendedPct, portfolio.cash_usd);
 
   if (tradeKind === "buy") {
@@ -7445,6 +7758,8 @@ function buildPositionSizingDecision(action, portfolio, tradeKind = "buy") {
       regime_multiplier: regimeMultiplier,
       liquidity_multiplier: liquidityMultiplier,
       performance_multiplier: performanceMultiplier,
+      stop_distance_pct: stopPct,
+      risk_r_pct: rPct,
       drawdown_multiplier: drawdownMultiplier
     },
     blocker_list: blockers
@@ -7464,9 +7779,12 @@ function applySizingToBuyAction(action, sizing) {
 
 function applySizingToExitAction(action, sizing) {
   if (sizing.blocker_list?.includes("fraud_risk_blocker")) return null;
+  const allowTrims = SETTINGS_DEFAULTS.harvest_allow_trims === true;
   return {
     ...action,
-    suggested_exit_fraction: toNum(sizing.recommended_exit_fraction, action.suggested_exit_fraction),
+    suggested_exit_fraction: allowTrims
+      ? toNum(sizing.recommended_exit_fraction, action.suggested_exit_fraction)
+      : 1,
     position_sizing: sizing
   };
 }
@@ -7479,7 +7797,12 @@ function buildPaperTradeTicket(candidate, allocationUsd, review, reason) {
   const ticket = {
     created_at: nowIso(),
     assumed_entry: assumedEntry,
-    stop: saneStopPrice(candidate?.invalidation_price, assumedEntry),
+    stop: saneStopPrice(
+      candidate?.invalidation_price,
+      assumedEntry,
+      SETTINGS_DEFAULTS,
+      candidate?._stop_distance_pct
+    ),
     targets: deepClone(sanitizeTargets(candidate?.targets, assumedEntry)),
     thesis_summary: candidate?.summary ?? candidate?.thesis_summary ?? null,
     edge_source: candidate?.edge_source ?? null,
@@ -7826,9 +8149,23 @@ function updateHoldingsFromScout(portfolio, updates) {
 // it gets force-exited here before any further cycle logic runs.
 const FORCE_EXIT_PATTERN = NONTRADEABLE_RE;
 
+// A partial-target sell pays the same fixed fee bps plus spread/impact slippage as a full-size
+// trade regardless of how small the leg is. Below min_partial_sell_usd that structure eats a
+// disproportionate share of the leg's notional (observed ~58% under $50 vs ~2% above $250), and
+// the tiny remainder left behind typically just gets fee-charged again later by stub_flatten. So
+// once a leg would land under the floor, take the whole position instead of slicing off dust.
+function resolvePartialSellAction(pos, marketValueUsd, targetPct, minPartialSellUsd, reason) {
+  const legUsd = marketValueUsd * targetPct;
+  if (minPartialSellUsd > 0 && legUsd > 0 && legUsd < minPartialSellUsd) {
+    return { type: "sell", symbol: pos.symbol, fraction: 1.0, reason: `${reason}_full_min_leg` };
+  }
+  return { type: "sell", symbol: pos.symbol, fraction: targetPct, reason };
+}
+
 function evaluateSellActions(portfolio) {
   const actions = [];
   const targetPct = portfolio.settings.target_partial_pct;
+  const minPartialSellUsd = toNum(portfolio.settings.min_partial_sell_usd, SETTINGS_DEFAULTS.min_partial_sell_usd);
 
   // Never evaluate stops/targets against a divergent (corrupt or latched-stale) mark: snap any
   // position whose price drifted beyond the deviation limit back to the authoritative e3d anchor first.
@@ -7838,10 +8175,23 @@ function evaluateSellActions(portfolio) {
     const price = toNum(pos.current_price, 0);
     if (!(price > 0)) continue;
 
+    if (isTrendSleevePosition(pos)) continue;
+
     // Force-exit stablecoins and wrapped/base assets that slipped into the portfolio.
     // These provide no trading alpha and consume position slots.
     if (FORCE_EXIT_PATTERN.test(pos.symbol || "")) {
       actions.push({ type: "sell", symbol: pos.symbol, fraction: 1.0, reason: "non_tradeable_force_exit" });
+      continue;
+    }
+
+    const stubUsd = toNum(portfolio.settings.stub_flatten_usd, 0);
+    if (stubUsd > 0 && toNum(pos.market_value_usd, 0) > 0 && toNum(pos.market_value_usd, 0) < stubUsd) {
+      actions.push({
+        type: "sell",
+        symbol: pos.symbol,
+        fraction: 1.0,
+        reason: "stub_flatten"
+      });
       continue;
     }
 
@@ -7869,33 +8219,21 @@ function evaluateSellActions(portfolio) {
       pos.partials_taken = { target_1: false, target_2: false, target_3: false };
     }
 
+    const marketValueUsd = toNum(pos.market_value_usd, price * toNum(pos.quantity, 0));
+
     if (!pos.partials_taken?.target_1 && targetHit(price, pos.targets?.target_1)) {
-      actions.push({
-        type: "sell",
-        symbol: pos.symbol,
-        fraction: targetPct,
-        reason: "target_1"
-      });
+      actions.push(resolvePartialSellAction(pos, marketValueUsd, targetPct, minPartialSellUsd, "target_1"));
       pos.partials_taken.target_1 = true;
     }
 
-    if (!pos.partials_taken?.target_2 && targetHit(price, pos.targets?.target_2)) {
-      actions.push({
-        type: "sell",
-        symbol: pos.symbol,
-        fraction: targetPct,
-        reason: "target_2"
-      });
+    const takeLaterTargets = portfolio.settings.take_only_first_target_partial !== true;
+    if (takeLaterTargets && !pos.partials_taken?.target_2 && targetHit(price, pos.targets?.target_2)) {
+      actions.push(resolvePartialSellAction(pos, marketValueUsd, targetPct, minPartialSellUsd, "target_2"));
       pos.partials_taken.target_2 = true;
     }
 
-    if (!pos.partials_taken?.target_3 && targetHit(price, pos.targets?.target_3)) {
-      actions.push({
-        type: "sell",
-        symbol: pos.symbol,
-        fraction: targetPct,
-        reason: "target_3"
-      });
+    if (takeLaterTargets && !pos.partials_taken?.target_3 && targetHit(price, pos.targets?.target_3)) {
+      actions.push(resolvePartialSellAction(pos, marketValueUsd, targetPct, minPartialSellUsd, "target_3"));
       pos.partials_taken.target_3 = true;
     }
   }
@@ -8161,10 +8499,19 @@ function openPosition(portfolio, candidate, allocationUsd, reason = "buy", optio
 
   const symbol = candidate.token.symbol;
   const strategyVersion = options.strategyVersion || candidate?.strategy_version || PAPER_ORDER_STRATEGY_VERSION;
-  const stopPrice = saneStopPrice(candidate.invalidation_price, price);
+  const stopPrice = saneStopPrice(
+    candidate.invalidation_price,
+    price,
+    portfolio?.settings || SETTINGS_DEFAULTS,
+    candidate?._stop_distance_pct
+  );
   const targets = sanitizeTargets(candidate.targets, price);
 
-  // Guard: don't open a new position slot when already at the limit
+  const sleeve = options.sleeve || candidate?.sleeve || "thesis";
+  const thesisCap = toNum(portfolio.settings.max_thesis_positions, portfolio.settings.max_open_positions);
+  if (!portfolio.positions[symbol] && sleeve !== "trend_overlay" && countThesisPositions(portfolio) >= thesisCap) {
+    return null;
+  }
   if (!portfolio.positions[symbol] && Object.keys(portfolio.positions).length >= portfolio.settings.max_open_positions) {
     return null;
   }
@@ -8190,6 +8537,7 @@ function openPosition(portfolio, candidate, allocationUsd, reason = "buy", optio
     existing.targets = targets;
     existing.score = candidate._score ?? computePositionScoreLike(candidate);
     existing.category = candidate.token.category || existing.category || "unknown";
+    existing.sleeve = existing.sleeve || sleeve;
     existing.strategy_version = strategyVersion;
     existing.last_updated_at = nowIso();
     existing.training_candidate_id = existing.training_candidate_id || training.candidate_id;
@@ -8209,6 +8557,7 @@ function openPosition(portfolio, candidate, allocationUsd, reason = "buy", optio
       symbol,
       contract_address: candidate.token.contract_address,
       category: candidate.token.category || "unknown",
+      sleeve,
       quantity,
       avg_entry_price: totalCashDebitUsd / quantity,
       cost_basis_usd: totalCashDebitUsd,
@@ -8296,11 +8645,22 @@ function evaluateBuyActions(portfolio, approved) {
   const settings = portfolio.settings;
 
   const ranked = rankApprovedCandidates(approved, portfolio);
+  const thesisOpen = countThesisPositions(portfolio);
+  const thesisCap = toNum(settings.max_thesis_positions, settings.max_open_positions);
   const openPositions = Object.keys(portfolio.positions).length;
 
-  if (openPositions >= settings.max_open_positions) return actions;
+  if (thesisOpen >= thesisCap || openPositions >= settings.max_open_positions) return actions;
 
-  let remainingSlots = settings.max_open_positions - openPositions;
+  const maxNewPerDay = Math.max(0, Math.trunc(toNum(settings.max_new_positions_per_day, 1)));
+  if (maxNewPerDay > 0 && countNewPositionsSince(portfolio, startOfLocalDayMs()) >= maxNewPerDay) {
+    log("buy_engine_daily_cap", {
+      max_new_positions_per_day: maxNewPerDay,
+      used_today: countNewPositionsSince(portfolio, startOfLocalDayMs())
+    });
+    return actions;
+  }
+
+  let remainingSlots = Math.max(0, thesisCap - thesisOpen);
   let buysUsed = 0;
 
   for (const c of ranked) {
@@ -8309,7 +8669,12 @@ function evaluateBuyActions(portfolio, approved) {
 
     const eq = equityUsd(portfolio);
     const approvedPct = toNum(c?._risk?.approved_size_pct, 0) / 100;
-    const desiredPct = approvedPct > 0 ? approvedPct : settings.risk_per_trade_pct;
+    const stopPct = Math.max(
+      toNum(settings.min_stop_distance_pct, 0.15),
+      toNum(c?._stop_distance_pct, toNum(settings.default_stop_distance_pct, 0.20))
+    );
+    const rNotionalPct = stopPct > 0 ? toNum(settings.risk_r_pct, 0.02) / stopPct : settings.risk_per_trade_pct;
+    const desiredPct = approvedPct > 0 ? approvedPct : rNotionalPct;
     const allocPct = Math.min(desiredPct, settings.max_position_pct);
 
     let allocationUsd = Math.min(portfolio.cash_usd, eq * allocPct);
@@ -8335,6 +8700,145 @@ function evaluateBuyActions(portfolio, approved) {
   }
 
   return actions;
+}
+
+function buildTrendSleeveCandidate(vehicle, priceUsd) {
+  const price = toNum(priceUsd, 0);
+  const candidate = {
+    sleeve: "trend_overlay",
+    setup_type: "trend_overlay",
+    source: "trend_overlay",
+    conviction_score: 80,
+    opportunity_score: 80,
+    fraud_risk: 0,
+    liquidity_quality: 100,
+    _atr_pct: 8,
+    _stop_distance_pct: 0.20,
+    token: {
+      symbol: vehicle.symbol,
+      name: vehicle.name,
+      chain: "ethereum",
+      contract_address: vehicle.contract_address,
+      category: "trend_overlay"
+    },
+    market_data: {
+      current_price: price,
+      change_24h_pct: 0,
+      volume_24h_usd: 1_000_000_000,
+      market_cap_usd: 1_000_000_000,
+      price_source: "coingecko"
+    },
+    liquidity_data: {
+      liquidity_usd: 5_000_000_000,
+      liquidity_source: "trend_sleeve"
+    },
+    execution_data: {
+      estimated_slippage_bps: 5,
+      quote_source: "trend_sleeve"
+    }
+  };
+  candidate._score = computePositionScoreLike(candidate);
+  return candidate;
+}
+
+function executeTrendSleeve(portfolio, quantContext) {
+  const settings = portfolio?.settings || SETTINGS_DEFAULTS;
+  if (settings.trend_sleeve_enabled === false) return { buys: [], sells: [] };
+  const bookRegime = quantContext?.macro?.book_regime || portfolio?.stats?.market_regime || "neutral";
+  const targetPct = toNum(settings.trend_sleeve_target_pct, 0.12);
+  const equity = equityUsd(portfolio);
+  const buys = [];
+  const sells = [];
+
+  if (bookRegime !== "risk_on") {
+    for (const vehicle of TREND_SLEEVE_VEHICLES) {
+      const pos = portfolio.positions[vehicle.symbol];
+      if (!pos || !isTrendSleevePosition(pos)) continue;
+      const trade = executeSell(portfolio, {
+        type: "sell",
+        symbol: vehicle.symbol,
+        fraction: 1,
+        reason: "trend_overlay:risk_off"
+      });
+      if (trade) sells.push(trade);
+    }
+    if (sells.length) log("trend_sleeve_flatten", { regime: bookRegime, sold: sells.map((t) => t.symbol) });
+    return { buys, sells };
+  }
+
+  const priceByKey = {
+    eth: toNum(quantContext?.macro?.eth?.price ?? quantContext?.macro?.eth_trend?.price, 0),
+    btc: toNum(quantContext?.macro?.btc?.price ?? quantContext?.macro?.btc_trend?.price, 0)
+  };
+
+  for (const vehicle of TREND_SLEEVE_VEHICLES) {
+    const price = priceByKey[vehicle.cg_key];
+    if (!(price > 0)) continue;
+    const existing = portfolio.positions[vehicle.symbol];
+    const currentValue = toNum(existing?.market_value_usd, 0);
+    const targetUsd = equity * targetPct;
+    if (existing && !isTrendSleevePosition(existing)) continue;
+    if (currentValue >= targetUsd * 0.8) continue;
+    const allocationUsd = Math.min(portfolio.cash_usd, targetUsd - currentValue);
+    if (allocationUsd < settings.min_trade_usd) continue;
+    const candidate = buildTrendSleeveCandidate(vehicle, price);
+    const trade = openPosition(portfolio, candidate, allocationUsd, "trend_overlay:risk_on", {
+      sleeve: "trend_overlay",
+      strategyVersion: PAPER_ORDER_STRATEGY_VERSION
+    });
+    if (trade) {
+      if (portfolio.positions[vehicle.symbol]) portfolio.positions[vehicle.symbol].sleeve = "trend_overlay";
+      buys.push(trade);
+    }
+  }
+  if (buys.length || sells.length) {
+    log("trend_sleeve", {
+      regime: bookRegime,
+      bought: buys.map((t) => t.symbol),
+      sold: sells.map((t) => t.symbol)
+    });
+  }
+  return { buys, sells };
+}
+
+function maybeRecordHorizonMarks(portfolio) {
+  const horizons = [
+    { key: "h24", hours: 24 },
+    { key: "h72", hours: 72 },
+    { key: "h168", hours: 168 }
+  ];
+  const marks = [];
+  for (const pos of Object.values(portfolio?.positions || {})) {
+    const openedMs = pos?.opened_at ? new Date(pos.opened_at).getTime() : NaN;
+    if (!Number.isFinite(openedMs)) continue;
+    const ageHours = (Date.now() - openedMs) / 3600000;
+    const entry = toNum(pos.avg_entry_price, 0);
+    const price = toNum(pos.current_price, 0);
+    if (!(entry > 0) || !(price > 0)) continue;
+    pos.horizon_marks = pos.horizon_marks && typeof pos.horizon_marks === "object" ? pos.horizon_marks : {};
+    for (const horizon of horizons) {
+      if (ageHours < horizon.hours || pos.horizon_marks[horizon.key]) continue;
+      const returnPct = ((price - entry) / entry) * 100;
+      const mark = {
+        ts: nowIso(),
+        horizon: horizon.key,
+        hours: horizon.hours,
+        price,
+        return_pct: Number(returnPct.toFixed(4)),
+        unrealized_pnl_usd: Number((toNum(pos.market_value_usd, 0) - toNum(pos.cost_basis_usd, 0)).toFixed(4)),
+        sleeve: pos.sleeve || "thesis"
+      };
+      pos.horizon_marks[horizon.key] = mark;
+      recordAuxiliaryEvent("horizon_mark", "pipeline", portfolio, {
+        symbol: pos.symbol,
+        contract_address: pos.contract_address,
+        ...mark
+      });
+      marks.push({ symbol: pos.symbol, ...mark });
+    }
+  }
+  if (marks.length) log("horizon_marks", { count: marks.length, marks });
+  return marks;
 }
 
 function computePortfolioStats(portfolio) {
@@ -8802,7 +9306,7 @@ function buildManagerReport(cycleState, portfolio) {
   const apiErrorRate = apiResponses > 0 ? apiErrors / apiResponses : 0;
   const llmMetaValues = [scoutMeta, harvestMeta].filter(Boolean);
 
-  if (cycleDurationSeconds > 300) {
+  if (cycleDurationSeconds > 1800) {
     pushManagerFlag(pipelineFlags, "warning", "pipeline", "PIPELINE_SLOW_CYCLE", "The cycle exceeded the target duration.");
   }
   if (llmMetaValues.some((meta) => String(meta.finish_reason || "").toLowerCase() === "length")) {
@@ -9116,11 +9620,26 @@ async function runCycle(runContext = {}) {
     new_positions_ok: _cycleQuantContext.macro?.new_positions_ok,
     tighten_stops: _cycleQuantContext.macro?.tighten_stops,
     btc_24h: _cycleQuantContext.macro?.btc?.change_24h_pct ?? null,
+    btc_trend: _cycleQuantContext.macro?.btc_trend || null,
+    book_regime: _cycleQuantContext.macro?.book_regime || null,
     fear_greed: _cycleQuantContext.macro?.fear_greed?.value ?? null,
     token_flow_count: Object.keys(_cycleQuantContext.token_flow || {}).length,
     funding_rates_count: Object.keys(_cycleQuantContext.funding_rates || {}).length,
   });
   log("maps_context", _cycleMapsContext || null);
+  if (_cycleQuantContext?.macro?.book_regime) {
+    portfolio.stats.market_regime = _cycleQuantContext.macro.book_regime;
+  }
+  const earlyTrend = executeTrendSleeve(portfolio, _cycleQuantContext);
+  if (earlyTrend.buys.length || earlyTrend.sells.length) {
+    computePortfolioStats(portfolio);
+    savePortfolio(portfolio);
+    log("trend_sleeve_checkpoint_saved", {
+      buys: earlyTrend.buys.map((t) => t.symbol),
+      sells: earlyTrend.sells.map((t) => t.symbol),
+      regime: portfolio.stats.market_regime
+    });
+  }
   // Use flow_graph.created_at (a Maps-sourced timestamp) to detect a stuck Maps cycle.
   // fetched_at is always "just now" so it cannot detect stale Maps data.
   const mapsDataTimestamp = _cycleMapsContext?.flow_graph?.created_at ?? null;
@@ -9186,7 +9705,10 @@ async function runCycle(runContext = {}) {
     // 1. SCOUT — pre-fetch E3D data, then call LLM directly (no tool loop needed)
     const scoutPayload = runScoutDirect(portfolio, portfolioIntelligence);
     validateScoutPayload(scoutPayload);
-    scoutPayload.candidates = filterScoutCandidatesAgainstPortfolio(scoutPayload.candidates || [], portfolio);
+    scoutPayload.candidates = filterScoutCandidatesForDesk(
+      filterScoutCandidatesAgainstPortfolio(scoutPayload.candidates || [], portfolio),
+      portfolio
+    ).map((candidate) => hydrateCandidateTradingMetrics(candidate, portfolio));
     log("scout", scoutPayload);
     log("agent_coverage", buildAgentCoverageLog("scout", scoutPayload));
     for (const candidate of scoutPayload.candidates || []) {
@@ -9221,6 +9743,17 @@ async function runCycle(runContext = {}) {
     }
     log("harvest", harvestPayload);
     log("agent_coverage", buildAgentCoverageLog("harvest", harvestPayload));
+    const harvestExitPolicy = getHarvestExitPolicy(portfolio.settings);
+    log("harvest_exit_policy", harvestExitPolicy);
+    const harvestExitsBeforeFilter = Array.isArray(harvestPayload.exit_candidates) ? harvestPayload.exit_candidates.length : 0;
+    harvestPayload.exit_candidates = filterHarvestExitCandidates(harvestPayload.exit_candidates || [], portfolio.settings);
+    if (harvestExitsBeforeFilter !== harvestPayload.exit_candidates.length) {
+      log("harvest_exits_filtered", {
+        before: harvestExitsBeforeFilter,
+        after: harvestPayload.exit_candidates.length,
+        frozen: harvestExitPolicy.frozen
+      });
+    }
     for (const candidate of harvestPayload.exit_candidates || []) {
       recordHarvestDecisionEvent(candidate, candidate, portfolio, trainingContext, portfolioIntelligence.prompt_snapshot);
     }
@@ -9434,6 +9967,17 @@ async function runCycle(runContext = {}) {
     if (buyTrades.length) log("buy_trades", buyTrades);
     for (const trade of buyTrades) sendTradeEmail(trade);
 
+    const trendResult = executeTrendSleeve(portfolio, _cycleQuantContext);
+    if (trendResult.sells.length) {
+      sellTrades.push(...trendResult.sells);
+      for (const trade of trendResult.sells) sendTradeEmail(trade);
+    }
+    if (trendResult.buys.length) {
+      buyTrades.push(...trendResult.buys);
+      for (const trade of trendResult.buys) sendTradeEmail(trade);
+    }
+    maybeRecordHorizonMarks(portfolio);
+
     // 9. RECOMPUTE MARKET VALUE AFTER ACTIONS
     for (const pos of Object.values(portfolio.positions)) {
       pos.market_value_usd = pos.quantity * toNum(pos.current_price, pos.avg_entry_price);
@@ -9616,6 +10160,40 @@ async function main() {
     correlation_id: pipelineRunId
   });
 
+  if (cli.trendOnly) {
+    const portfolio = loadPortfolio();
+    setTrainingContext({
+      pipeline_run_id: pipelineRunId,
+      cycle_id: crypto.randomUUID(),
+      cycle_index: 0,
+      market_regime: portfolio.stats.market_regime || "unknown"
+    });
+    _cycleQuantContext = buildCycleQuantContext(portfolio);
+    const bookRegime = _cycleQuantContext?.macro?.book_regime || "neutral";
+    portfolio.stats.market_regime = bookRegime;
+    log("trend_only_start", {
+      book_regime: bookRegime,
+      btc_trend: _cycleQuantContext?.macro?.btc_trend || null,
+      eth_trend: _cycleQuantContext?.macro?.eth_trend || null
+    });
+    const trendResult = executeTrendSleeve(portfolio, _cycleQuantContext);
+    maybeRecordHorizonMarks(portfolio);
+    const stats = computePortfolioStats(portfolio);
+    savePortfolio(portfolio);
+    console.log("✅ Trend sleeve pass complete\n");
+    console.log(JSON.stringify({
+      book_regime: bookRegime,
+      btc_trend: _cycleQuantContext?.macro?.btc_trend || null,
+      buys: trendResult.buys.map((t) => ({ symbol: t.symbol, notional: t.gross_notional_usd, reason: t.reason })),
+      sells: trendResult.sells.map((t) => ({ symbol: t.symbol, pnl: t.pnl_usd, reason: t.reason })),
+      cash_usd: portfolio.cash_usd,
+      equity_usd: stats.equity_usd,
+      symbols: Object.keys(portfolio.positions)
+    }, null, 2));
+    setTrainingContext(null);
+    return;
+  }
+
   if (!cli.loop) {
     await runCycle({ pipeline_run_id: pipelineRunId, cycle_id: crypto.randomUUID(), cycle_index: 1, debugMode });
     recordOperatorAction({
@@ -9706,11 +10284,20 @@ export {
   buildPaperFillExecution,
   buildFrequentAddressRepairWarning,
   buildPipelineWarningsForCycle,
+  evaluateSellActions,
   executeSell,
   resolveScoutEvidenceRefMinimum,
   resolveScoutMaxCandidates,
   normalizePortfolioCooldowns,
   openPosition,
   resolveCooldownHoursForExitReason,
-  setCooldown
+  setCooldown,
+  computePositionScoreLike,
+  deriveLiquidityQuality,
+  deriveFraudRisk,
+  estimateAtrPct,
+  computeStopDistancePct,
+  hydrateCandidateTradingMetrics,
+  executeTrendSleeve,
+  maybeRecordHorizonMarks
 };
