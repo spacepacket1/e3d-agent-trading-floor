@@ -1934,7 +1934,7 @@ function App() {
   const [lastUpdated, setLastUpdated] = useState(null);
   const [page, setPage] = useState(getPageFromHash());
   const [pipelineStatus, setPipelineStatus] = useState(null);
-  const [intervalSeconds, setIntervalSeconds] = useState(300);
+  const [intervalSeconds, setIntervalSeconds] = useState(21600);
   const [pipelineMessage, setPipelineMessage] = useState(null);
   const [pipelineError, setPipelineError] = useState(null);
   const [authMode, setAuthMode] = useState("api_key");
@@ -2874,7 +2874,7 @@ function App() {
             "Reset all"
           )
         ),
-        React.createElement("div", { className: "pipeline-controls-note" }, "Starts the E3D Trading Agents loop with your chosen interval."),
+        React.createElement("div", { className: "pipeline-controls-note" }, "Starts the swing-hold desk. Default interval is 6 hours (21600s). Do not set this back to 300 unless you want the scalper back."),
         pipelineMessage ? React.createElement("div", { className: "pipeline-controls-message" }, pipelineMessage) : null,
         pipelineError ? React.createElement("div", { className: "pipeline-controls-error" }, pipelineError) : null,
         pipelineStatus?.pid ? React.createElement("div", { className: "pipeline-controls-meta" }, `PID ${pipelineStatus.pid}`) : null

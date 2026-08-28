@@ -21,7 +21,7 @@ scripts/e3dActionOutcomeExport.js
 
 ## 1. Executive Summary
 
-The E3D trading app already runs agentic reasoning over E3D-derived intelligence. It contains scout, harvest, risk, executor, portfolio, sizing, liquidity, market-regime, and paper-trade logic. It also already records rich local telemetry into ClickHouse via the `training_events` table.
+The E3D trading app already runs agentic reasoning over E3D-derived intelligence. It contains scout, harvest, risk, executor, portfolio, sizing, liquidity, market-regime, and paper-trade logic. It also already records rich local telemetry into `logs/training-events.jsonl` on every cycle.
 
 The next feature is to add a **one-way exporter** that maps those local trading-app records into clean, product-facing E3D Action/Outcome records in the AWS E3D ClickHouse database.
 
@@ -125,8 +125,8 @@ Create `scripts/e3dActionOutcomeExport.js` in the `e3d-agent-trading-floor` repo
 
 The script must:
 
-1. Read local trading app records from local ClickHouse.
-2. Select relevant `training_events` records.
+1. Read local trading app records from `logs/training-events.jsonl`.
+2. Select relevant event records by `event_type`.
 3. Parse each event’s `payload` JSON.
 4. Map internal event records into stable E3D-facing schemas.
 5. Insert mapped records into AWS E3D ClickHouse tables.
@@ -155,7 +155,7 @@ Do **not** mutate local trading-app state based on AWS data.
 This feature is a **one-way export bridge**:
 
 ```text
-Local trading app ClickHouse → AWS E3D ClickHouse
+logs/training-events.jsonl → AWS E3D ClickHouse
 ```
 
 ---
@@ -167,7 +167,9 @@ Local trading app ClickHouse → AWS E3D ClickHouse
 ```text
 pipeline.js
   ↓
-local ClickHouse: e3d.training_events
+logs/training-events.jsonl              ← primary source (always written)
+  OR
+local ClickHouse: e3d.training_events   ← optional source (--source-clickhouse flag)
   ↓
 scripts/e3dActionOutcomeExport.js
   ↓
@@ -182,21 +184,41 @@ E3D UI / newsletter / future APIs
 
 ### 6.2 Local Source
 
-Default source:
+**Primary source: `logs/training-events.jsonl`**
 
-```text
-http://127.0.0.1:8123
-Database: e3d
-Table: training_events
-```
+`pipeline.js` always appends to `logs/training-events.jsonl` via
+`fs.appendFileSync` before attempting ClickHouse. The ClickHouse write is a
+best-effort side-channel that has never reliably succeeded: the pipeline's
+`clickHouseQuery` sends no auth headers, ClickHouse requires a password, and
+all insert attempts fail silently with a logged `clickhouse_sync_error`. As a
+result, `logs/training-events.jsonl` is the authoritative record of all
+training events (18,000+ rows as of 2026-05-20).
+
+The exporter **reads from the JSONL file by default**.
 
 Allow override via environment variables:
 
 ```bash
+TRAINING_EVENT_LOG=logs/training-events.jsonl   # default; override if log path changes
+```
+
+**ClickHouse source (opt-in):** Pass `--source-clickhouse` to read from local
+ClickHouse instead. This is only useful if the pipeline is later reconfigured to
+supply credentials. The JSONL filters (`--since-hours`, `--from-ts`, `--to-ts`)
+apply identically against the `ts` field whether source is JSONL or ClickHouse.
+
+If `--source-clickhouse` is set, read credentials from:
+
+```bash
 LOCAL_CLICKHOUSE_HTTP_URL=http://127.0.0.1:8123
 LOCAL_CLICKHOUSE_DATABASE=e3d
+LOCAL_CLICKHOUSE_USER=default
+LOCAL_CLICKHOUSE_PASSWORD=
 LOCAL_TRAINING_EVENTS_TABLE=training_events
 ```
+
+On ClickHouse auth error (HTTP 516) or connection failure, exit non-zero with a
+clear message recommending the default JSONL mode.
 
 ### 6.3 AWS Destination
 
@@ -298,18 +320,21 @@ Default:
 EXPORT_OVERLAP_MINUTES=10
 ```
 
-Query concept:
+Filter concept (applied while streaming `logs/training-events.jsonl`):
 
-```sql
-SELECT *
-FROM e3d.training_events
-WHERE ts >= '{last_watermark_ts_minus_overlap}'
-  AND event_type IN (...)
-ORDER BY ts, event_id
-LIMIT 5000
+```js
+const cutoff = new Date(lastWatermarkTs).getTime() - overlapMinutes * 60 * 1000;
+const allowed = new Set(["executor_decision", "trade", "outcome"]);
+
+for (const row of readJsonlLines(TRAINING_EVENT_LOG)) {
+  if (new Date(row.ts).getTime() < cutoff) continue;
+  if (!allowed.has(row.event_type)) continue;
+  yield row;
+  if (++count >= limit) break;
+}
 ```
 
-On first run, use `--since-hours` or default to 24 hours.
+On first run, compute `cutoff` from `--since-hours` (default 24h from now).
 
 ### 8.4 Deterministic IDs
 
@@ -363,7 +388,7 @@ This allows repeat inserts of the same deterministic ID while keeping the latest
 
 ## 9. Event Types to Export
 
-### 9.1 Phase 1 Minimum
+### 9.1 Minimum Set (implement first)
 
 Export these first:
 
@@ -373,7 +398,7 @@ trade
 outcome
 ```
 
-### 9.2 Phase 2 Expansion
+### 9.2 Expansion Set (future ticket)
 
 Add:
 
@@ -622,136 +647,270 @@ Reuse logic from `pipeline.js` where appropriate, but avoid importing the full p
 
 ### 11.2 Extract Token Identity
 
-Try these locations in order:
+The token address location varies by `event_type` and `trade_kind`. Try these
+locations in order (first non-empty match wins):
 
 ```js
-payload.proposal.token.contract_address
-payload.action.candidate.token.contract_address
-payload.trade.contract_address
-payload.trade.token.contract_address
-payload.position_before.contract_address
-payload.token.contract_address
-row.candidate_id if it is an EVM address
+// executor_decision — branches by trade_kind
+if (trade_kind === "buy")      payload.action?.candidate?.token?.contract_address
+if (trade_kind === "exit")     payload.action?.token?.contract_address
+if (trade_kind === "rotation") payload.proposal?.action?.to_candidate?.token?.contract_address
+// trade and outcome events
+payload.trade?.contract_address
+payload.position_before?.contract_address
+// universal fallback — candidate_id is always an EVM address
+row.candidate_id   // always an EVM address; safe final fallback
 ```
 
-Symbol locations:
+Symbol locations (same branching pattern):
 
 ```js
-payload.proposal.token.symbol
-payload.action.candidate.token.symbol
-payload.trade.symbol
-payload.trade.token.symbol
-payload.position_before.symbol
-payload.token.symbol
+if (trade_kind === "buy")      payload.action?.candidate?.token?.symbol
+if (trade_kind === "exit")     payload.action?.token?.symbol
+if (trade_kind === "rotation") payload.proposal?.action?.to_candidate?.token?.symbol
+payload.trade?.symbol
+payload.position_before?.symbol
+payload.review?.token?.symbol  // review.token may be a string or object; check typeof
 ```
 
-Default chain:
+Chain:
 
-```text
-ETH
+```js
+if (trade_kind === "buy")      payload.action?.candidate?.token?.chain
+if (trade_kind === "exit")     payload.action?.token?.chain
+if (trade_kind === "rotation") payload.proposal?.action?.to_candidate?.token?.chain
+// default
+"ethereum"
 ```
 
 ### 11.3 Map `executor_decision` → `E3DAgentActions`
 
-Source fields:
+**Verified payload structure** (from real training_events data):
 
+The top-level payload keys are:
+`candidate_id`, `trade_kind`, `decision`, `proposal`, `review`, `action`, `portfolio_snapshot`
+
+`payload.trade_kind` is one of `"buy"`, `"exit"`, `"rotation"`. The structure of
+`payload.action` and `payload.proposal` differ by `trade_kind`.
+
+**`payload.review`** always present; its relevant fields:
 ```js
-row.event_type === "executor_decision"
-row.actor === "executor"
-payload.trade_kind
-payload.decision
-payload.proposal
-payload.review
-payload.action
+payload.review.executor_decision  // "paper_trade", "reject", etc.
+payload.review.reason_summary     // human-readable pass/fail reason
+payload.review.blocker_list       // Array<string> — rejection reasons (may be empty)
+payload.review.approved_size_pct  // portfolio allocation percentage (not USD)
+payload.review.max_slippage_bps   // approved slippage cap
 ```
 
-Map:
+Note: `payload.review.token` may be a string (symbol only) or an object with
+`.contract_address`. Always check `typeof` before reading sub-fields.
+
+**`payload.action`** structure by `trade_kind`:
+
+```
+buy:
+  payload.action.type === "buy"
+  payload.action.candidate.token.{contract_address, symbol, chain}
+  payload.action.candidate.confidence
+  payload.action.candidate.conviction_score
+  payload.action.candidate.why_now
+  payload.action.candidate.liquidity_data.liquidity_usd
+  payload.action.candidate.execution_data.estimated_slippage_bps
+  payload.action.candidate.market_data.current_price
+  payload.action.candidate.evidence_packet_id
+
+exit:
+  payload.action.source_agent === "harvest"
+  payload.action.token.{contract_address, symbol, chain}
+  payload.action.confidence
+  payload.action.conviction_score
+  payload.action.thesis_summary
+  payload.action.why_now
+  payload.action.fraud_risk
+  payload.action.liquidity_data.liquidity_usd
+  payload.action.execution_data.estimated_slippage_bps
+  payload.action.market_data.current_price
+  payload.action.evidence_packet_id
+
+rotation:
+  payload.proposal.action.to_candidate.token.{contract_address, symbol, chain}
+  payload.proposal.action.to_candidate.confidence
+  payload.proposal.action.to_candidate.conviction_score
+  payload.proposal.action.to_candidate.why_now
+  payload.proposal.action.to_candidate.liquidity_data.liquidity_usd
+  payload.proposal.action.to_candidate.execution_data.estimated_slippage_bps
+  payload.proposal.action.to_candidate.market_data.current_price
+  payload.proposal.action.to_candidate.evidence_packet_id
+  payload.proposal.action.from_symbol  // token being sold in the rotation
+```
+
+**NOTE:** `payload.action.paper_trade_ticket` is a plain string
+(`"generated_paper_trade_id"`), not an object. Do not attempt to read sub-fields
+from it.
+
+**NOTE:** `source_story_ids` and `source_signal_types` do not exist in
+`executor_decision` payloads. Set both to `[]`. They may be enriched later from
+`candidate` events.
+
+**NOTE:** `risk_decision_id` is present in the payload string but is always
+`null` in executor_decision events. Set to `""`. The real risk_decision_id lives
+in `risk_engine_decision` events and can be joined via `candidate_id` in a
+future enrichment phase.
+
+**NOTE:** `allocation_usd` is not stored directly. Derive it as:
+```js
+allocation_usd = (payload.review?.approved_size_pct / 100)
+               * (payload.portfolio_snapshot?.cash_usd || 0)
+```
+If `portfolio_snapshot` is missing, set `allocation_usd = 0`.
+
+**`risk_score`:** Not available in `executor_decision`. The risk score lives in
+`risk_decision` events (`payload.risk_review.risk_score`). For phase 1, set
+`risk_score = 0` in `E3DAgentActions` and note it can be back-filled by joining
+on `candidate_id + cycle_id` from `risk_decision` events.
+
+---
+
+**Mapping:**
 
 ```js
+// Helper: resolve the per-trade_kind candidate object
+function getCandidateObj(payload) {
+  const tk = payload.trade_kind;
+  if (tk === "buy")      return payload.action?.candidate;
+  if (tk === "exit")     return payload.action;          // action IS the harvest proposal
+  if (tk === "rotation") return payload.proposal?.action?.to_candidate;
+  return null;
+}
+
+// Map fields
+const cand = getCandidateObj(payload);
+
 agent_stage      = "executor"
-agent_decision   = normalizeExecutorDecision(payload.decision || payload.review?.decision)
+agent_decision   = payload.review?.executor_decision || payload.decision || "unknown"
 action_type      = inferActionType(agent_decision, payload.trade_kind)
-simulated_side   = inferSide(payload.trade_kind, payload.action, payload.review)
-entry_price      = payload.action?.paper_trade_ticket?.assumed_entry || payload.action?.price || 0
-allocation_usd   = payload.action?.paper_trade_ticket?.allocation_usd || payload.action?.allocation_usd || 0
-confidence_score = payload.proposal?.conviction_score || payload.proposal?.confidence || payload.review?.confidence || 0
-risk_score       = payload.proposal?.fraud_risk || payload.review?.risk_score || 0
-liquidity_usd    = payload.proposal?.liquidity_data?.liquidity_usd || payload.action?.paper_trade_ticket?.liquidity_usd || 0
-slippage_bps     = payload.proposal?.execution_data?.estimated_slippage_bps || payload.action?.paper_trade_ticket?.max_slippage_bps || 0
-thesis_summary   = payload.action?.paper_trade_ticket?.thesis_summary || payload.proposal?.thesis_summary || payload.proposal?.summary || ""
-reason_summary   = payload.review?.reason || payload.action?.reason || payload.proposal?.why_now || ""
-reject_reason    = payload.review?.reject_reason || payload.review?.reason_code || ""
-source_story_ids = payload.proposal?.story_ids || []
-source_signal_types = payload.proposal?.signal_types || []
-evidence_packet_id = payload.proposal?.evidence_packet_id || payload.action?.paper_trade_ticket?.evidence_packet_id || ""
-risk_decision_id = payload.action?.paper_trade_ticket?.risk_decision_id || payload.proposal?.risk_decision_id || ""
-payload_json = JSON.stringify(payload)
+simulated_side   = inferSide(payload.trade_kind, agent_decision)
+entry_price      = cand?.market_data?.current_price || 0
+allocation_usd   = ((payload.review?.approved_size_pct || 0) / 100)
+                   * (payload.portfolio_snapshot?.cash_usd || 0)
+confidence_score = cand?.conviction_score || cand?.confidence || 0
+risk_score       = 0   // not in executor_decision; see note above
+liquidity_usd    = cand?.liquidity_data?.liquidity_usd || 0
+slippage_bps     = cand?.execution_data?.estimated_slippage_bps
+                   || payload.review?.max_slippage_bps || 0
+thesis_summary   = cand?.thesis_summary || cand?.why_now || ""
+reason_summary   = payload.review?.reason_summary || ""
+reject_reason    = (payload.review?.blocker_list || []).join("; ")
+source_story_ids    = []    // not in executor_decision
+source_signal_types = []    // not in executor_decision
+evidence_packet_id  = cand?.evidence_packet_id || ""
+risk_decision_id    = ""    // always null in executor_decision; enrich later
+payload_json        = JSON.stringify(payload)
+```
+
+**`inferActionType(agent_decision, trade_kind)`** examples:
+```js
+"paper_trade" + "buy"      → "PAPER_BUY"
+"paper_trade" + "exit"     → "PAPER_SELL"
+"paper_trade" + "rotation" → "PAPER_BUY"   // the incoming leg
+"reject"                   → "REJECT"
+"wait"                     → "WAIT"
+```
+
+**`inferSide(trade_kind, agent_decision)`** examples:
+```js
+"buy"      → "buy"
+"rotation" → "buy"
+"exit"     → "sell"
+"reject"   → "none"
+"wait"     → "none"
 ```
 
 ### 11.4 Map `trade` → `E3DAgentOutcomes`
 
-Source fields:
+**Verified payload structure** (from real training_events data):
 
 ```js
-row.event_type === "trade"
-payload.trade_id
-payload.position_id
-payload.candidate_id
-payload.quoted_price
-payload.fill_price
-payload.slippage_bps_applied
-payload.fee_bps_applied
-payload.trade
+payload.trade_id                   // String — unique trade ID
+payload.position_id                // String — position ID
+payload.candidate_id               // String — EVM address
+payload.quoted_price               // Float — pre-slippage price
+payload.fill_price                 // Float — actual fill (quoted * slippage applied)
+payload.slippage_bps_applied       // Float — e.g. 100
+payload.fee_bps_applied            // Float — e.g. 12.5
+payload.fee_usd                    // Float
+payload.slippage_usd               // Float
+payload.trade.ts                   // ISO timestamp
+payload.trade.side                 // "buy" or "sell"
+payload.trade.symbol               // String
+payload.trade.contract_address     // EVM address
+payload.trade.avg_entry_price      // Float — position avg entry at time of trade
+payload.trade.pnl_usd              // Float — realized P&L (non-zero on sell)
+payload.trade.proceeds_usd         // Float (sells)
+payload.trade.cost_portion_usd     // Float (sells — cost basis of the sold fraction)
+payload.trade.fraction             // Float — portion of position traded (e.g. 0.5)
+payload.trade.trade_lifecycle      // "open" | "close" | "partial"
 ```
 
 Map:
 
 ```js
-outcome_type = "paper_trade"
+outcome_type   = "paper_trade"
 outcome_window = "trade"
-entry_price = payload.trade?.avg_entry_price || payload.quoted_price || payload.fill_price || 0
-current_price = payload.fill_price || payload.trade?.price || 0
-exit_price = payload.trade?.side === "sell" ? current_price : 0
-pnl_usd = payload.trade?.pnl_usd || 0
-pnl_pct = derive if possible
-outcome_label = payload.trade?.side || "trade"
-verdict = "recorded"
-payload_json = JSON.stringify(payload)
+entry_price    = payload.trade?.avg_entry_price || payload.quoted_price || 0
+current_price  = payload.fill_price || 0
+exit_price     = payload.trade?.side === "sell" ? payload.fill_price : 0
+pnl_usd        = payload.trade?.pnl_usd || 0
+pnl_pct        = (entry_price > 0 && exit_price > 0)
+                 ? ((exit_price - entry_price) / entry_price) * 100
+                 : 0
+outcome_label  = payload.trade?.side || "trade"
+verdict        = "recorded"
+payload_json   = JSON.stringify(payload)
 ```
+
+Token identity: use `payload.trade.contract_address` and `payload.trade.symbol`.
 
 ### 11.5 Map `outcome` → `E3DAgentOutcomes`
 
-Source fields:
+**Verified payload structure** (from real training_events data):
 
 ```js
-row.event_type === "outcome"
-payload.trade_id
-payload.position_id
-payload.candidate_id
-payload.outcome_label
-payload.pnl_usd
-payload.exit_price
-payload.entry_price
-payload.holding_days
-payload.position_before
-payload.trade
+payload.trade_id                       // String
+payload.position_id                    // String
+payload.candidate_id                   // EVM address
+payload.outcome_label                  // "profit" | "loss"
+payload.pnl_usd                        // Float — realized P&L
+payload.exit_price                     // Float — fill price at close
+payload.entry_price                    // Float — position avg entry price
+payload.holding_days                   // Float — e.g. 0.458
+payload.position_before.contract_address  // EVM address
+payload.position_before.symbol            // String
+payload.position_before.avg_entry_price   // Float
+payload.position_before.quantity          // Float
+payload.position_before.market_value_usd  // Float
 ```
 
 Map:
 
 ```js
-outcome_type = "realized_outcome"
+outcome_type   = "realized_outcome"
 outcome_window = "realized"
-entry_price = payload.entry_price || payload.position_before?.avg_entry_price || 0
-exit_price = payload.exit_price || payload.trade?.fill_price || payload.trade?.price || 0
-current_price = exit_price
-pnl_usd = payload.pnl_usd || 0
-pnl_pct = derive using entry/exit if possible
-holding_days = payload.holding_days || 0
-outcome_label = payload.outcome_label || (pnl_usd >= 0 ? "profit" : "loss")
-verdict = pnl_usd >= 0 ? "validated" : "invalidated"
-payload_json = JSON.stringify(payload)
+entry_price    = payload.entry_price || payload.position_before?.avg_entry_price || 0
+exit_price     = payload.exit_price || 0
+current_price  = exit_price
+pnl_usd        = payload.pnl_usd || 0
+pnl_pct        = (entry_price > 0 && exit_price > 0)
+                 ? ((exit_price - entry_price) / entry_price) * 100
+                 : 0
+holding_days   = payload.holding_days || 0
+outcome_label  = payload.outcome_label || (pnl_usd >= 0 ? "profit" : "loss")
+verdict        = pnl_usd >= 0 ? "validated" : "invalidated"
+payload_json   = JSON.stringify(payload)
 ```
+
+Token identity: use `payload.position_before.contract_address` and
+`payload.position_before.symbol`.
 
 ### 11.6 Map Rejections
 
@@ -795,6 +954,7 @@ node scripts/e3dActionOutcomeExport.js --no-state
 node scripts/e3dActionOutcomeExport.js --from-ts="2026-05-19T00:00:00-07:00"
 node scripts/e3dActionOutcomeExport.js --to-ts="2026-05-20T00:00:00-07:00"
 node scripts/e3dActionOutcomeExport.js --create-tables-only
+node scripts/e3dActionOutcomeExport.js --source-clickhouse   # opt-in; default is JSONL
 node scripts/e3dActionOutcomeExport.js --verbose
 ```
 
@@ -806,6 +966,7 @@ dry_run = false
 since_hours on first run = 24
 overlap_minutes = 10
 lock_stale_minutes = 30
+source = jsonl   (JSONL is default; --source-clickhouse switches to ClickHouse)
 ```
 
 ---
@@ -854,7 +1015,12 @@ On error:
 
 ## 14. ClickHouse HTTP Implementation
 
-Implement local and AWS query helpers using `curl` via Node `child_process.execFileSync`, consistent with existing `pipeline.js`, or use native `fetch` if the Node version supports it and repo standards allow it.
+This section covers the **AWS destination only**. The local source is read from
+`logs/training-events.jsonl` (plain file I/O, no HTTP required).
+
+Implement an AWS ClickHouse HTTP helper using `curl` via Node
+`child_process.execFileSync`, consistent with existing `pipeline.js`, or use
+native `fetch` if the Node version supports it and repo standards allow it.
 
 Recommended helper interface:
 
@@ -897,9 +1063,15 @@ max rows per insert = 1000
 
 The exporter should be conservative.
 
-### If local ClickHouse is unavailable
+### If `logs/training-events.jsonl` is missing or unreadable
 
 - Log error.
+- Exit non-zero.
+- Do not modify state watermark.
+
+### If `--source-clickhouse` is set and local ClickHouse is unavailable
+
+- Log error with suggestion to omit `--source-clickhouse`.
 - Exit non-zero.
 - Do not modify state watermark.
 
@@ -936,6 +1108,7 @@ The exporter should be conservative.
 - `--dry-run` reads local events and prints/logs mapped action/outcome counts.
 - `--dry-run` does not insert into AWS.
 - `--dry-run` does not update state watermark.
+- `--dry-run` works without any ClickHouse connection (JSONL is the default source).
 
 ### 17.3 Export
 
@@ -986,9 +1159,13 @@ The exporter should be conservative.
 
 ### Phase 3: Read Local Events
 
-- Query local `training_events`.
-- Support `--since-hours`, `--from-ts`, `--to-ts`, `--limit`.
-- Apply event type filter.
+- Read from `logs/training-events.jsonl` by default (stream line-by-line, parse JSON).
+- If `--source-clickhouse` is set, query local `training_events` via ClickHouse HTTP instead.
+- Support `--since-hours`, `--from-ts`, `--to-ts`, `--limit` filters on the `ts` field.
+- Apply event type filter (`executor_decision`, `trade`, `outcome` for phase 1).
+- On ClickHouse connection failure or auth error (HTTP 516), exit non-zero with
+  a clear message: "ClickHouse unavailable — run without --source-clickhouse to
+  use the default JSONL source."
 
 ### Phase 4: Mapping
 
@@ -1008,8 +1185,13 @@ The exporter should be conservative.
 Run:
 
 ```bash
+# Step 1: dry-run from JSONL — verifies mapping logic, no connections needed
 node scripts/e3dActionOutcomeExport.js --since-hours=24 --dry-run --verbose
-node scripts/e3dActionOutcomeExport.js --since-hours=24 --create-tables-only
+
+# Step 2: create destination tables in AWS
+node scripts/e3dActionOutcomeExport.js --create-tables-only
+
+# Step 3: first real export from JSONL into AWS
 node scripts/e3dActionOutcomeExport.js --since-hours=24
 ```
 
@@ -1025,6 +1207,19 @@ SELECT * FROM e3d.E3DAgentOutcomes ORDER BY measured_at DESC LIMIT 10;
 ### Phase 7: Cron
 
 Install cron every 5 minutes after manual validation.
+
+Suggested repo commands:
+
+```bash
+# Print the exact cron line without changing crontab
+npm run export:e3d:cron:print
+
+# Install only after Phase 6 manual validation has passed
+npm run export:e3d:cron:install
+
+# Remove the exporter cron entry if needed
+npm run export:e3d:cron:remove
+```
 
 ---
 
@@ -1205,8 +1400,49 @@ recordOutcomeEvent
 buildTrainingEventRecord
 ```
 
-Do not import or execute `pipeline.js` from the exporter if doing so triggers pipeline side effects. Prefer copying tiny pure helper functions into the exporter or creating a new shared utility module only if safe.
+Do not import or execute `pipeline.js` from the exporter if doing so triggers
+pipeline side effects. Prefer copying tiny pure helper functions into the
+exporter or creating a new shared utility module only if safe.
+
+**Verified payload facts (do not deviate):**
+
+1. `executor_decision` payload top-level keys:
+   `candidate_id`, `trade_kind`, `decision`, `proposal`, `review`, `action`, `portfolio_snapshot`
+
+2. `payload.review` keys that actually exist:
+   `executor_decision`, `reason_summary`, `blocker_list` (Array), `approved_size_pct`,
+   `max_slippage_bps`, `risk_checks` (Array), `entry_status`, `live_execution_allowed`
+   — **NOT** `decision`, `reason`, `reject_reason`, `risk_score`
+
+3. `payload.action.paper_trade_ticket` is a **plain string**, not an object.
+   Do not read sub-fields from it.
+
+4. `source_story_ids` and `source_signal_types` do **not** exist in
+   `executor_decision` events. Set both to `[]`.
+
+5. `risk_decision_id` is always `null` in `executor_decision`. Set to `""`.
+
+6. `allocation_usd` must be derived:
+   `(review.approved_size_pct / 100) * portfolio_snapshot.cash_usd`
+
+7. `trade` events have a top-level `fee_bps_applied` and `fee_usd` — these are
+   real values, not zero.
+
+8. **ClickHouse has never received pipeline data.** `pipeline.js` sends no auth
+   headers in `clickHouseQuery`. The local ClickHouse requires a password (HTTP
+   516). Every insert attempt has failed and been swallowed silently as
+   `clickhouse_sync_error` in `pipeline.jsonl` (802 such errors logged). The
+   `training_events` table is effectively empty. **`logs/training-events.jsonl`
+   is the only authoritative data source.** The exporter reads JSONL by default.
+   `--source-clickhouse` is an opt-in flag for future use.
+
+9. `logs/training-events.jsonl` contains 18,000+ rows with these event type
+   counts (as of 2026-05-20):
+   `executor_decision: 1291`, `trade: 1090`, `outcome: 222`,
+   `risk_decision: 2973`, `risk_engine_decision: 228`, `candidate: 2111`,
+   `cycle_start: 3478`, `cycle_end: 2723`, `manager_report: 1993`
 
 Keep the first version boring and reliable.
 
-The exporter is infrastructure. It should be easy to understand, easy to rerun, and safe to schedule.
+The exporter is infrastructure. It should be easy to understand, easy to rerun,
+and safe to schedule.

@@ -23,12 +23,14 @@ function buildPortfolio(overrides = {}) {
   };
 }
 
-function sellTrade(hoursAgo, pnlUsd, reason = "target_hit") {
+function sellTrade(hoursAgo, pnlUsd, reason = "target_hit", holdHours = 48) {
+  const closedAt = Date.now() - (hoursAgo * 60 * 60 * 1000);
   return {
     side: "sell",
     pnl_usd: pnlUsd,
     reason,
-    ts: new Date(Date.now() - (hoursAgo * 60 * 60 * 1000)).toISOString()
+    ts: new Date(closedAt).toISOString(),
+    opened_at: new Date(closedAt - (holdHours * 60 * 60 * 1000)).toISOString()
   };
 }
 
@@ -100,5 +102,12 @@ const recentMetrics = computeRecentClosedTradeMetrics(buildPortfolio({
 assert.equal(recentMetrics.window_hours, 48);
 assert.equal(recentMetrics.closed_trade_count, 2);
 assert.equal(recentMetrics.realized_pnl_usd, 20);
+
+const dustClipPolicy = buildRegimeSentinelPolicy(buildPortfolio({
+  cash_usd: 50000,
+  closed_trades: Array.from({ length: 20 }, (_, index) => sellTrade((index % 10) + 1, -20, "harvest_exit", 2))
+}), { macro: { regime: "neutral" } });
+assert(dustClipPolicy.reason_codes.includes("throttle_skipped_low_sample"));
+assert(!dustClipPolicy.reason_codes.includes("negative_recent_profit_factor"));
 
 console.log("verifyRegimeSentinelThrottle: ok");

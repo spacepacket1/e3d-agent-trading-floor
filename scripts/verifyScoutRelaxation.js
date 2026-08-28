@@ -30,13 +30,13 @@ function buildEntry(overrides = {}) {
   };
 }
 
-assert.equal(SETTINGS_DEFAULTS.scout_max_candidates, 6);
-assert.equal(resolveScoutMaxCandidates(SETTINGS_DEFAULTS), 6);
+assert.equal(SETTINGS_DEFAULTS.scout_max_candidates, 1);
+assert.equal(resolveScoutMaxCandidates(SETTINGS_DEFAULTS), 1);
 assert.equal(resolveScoutMaxCandidates({ scout_max_candidates: 8 }), 8);
 assert.equal(resolveScoutMaxCandidates({ scout_max_candidates: 0 }), 1);
 
 const syntheticShortlist = Array.from({ length: 8 }, (_, index) => ({ symbol: `TOK${index + 1}` }));
-assert.equal(syntheticShortlist.slice(0, resolveScoutMaxCandidates(SETTINGS_DEFAULTS)).length, 6);
+assert.equal(syntheticShortlist.slice(0, resolveScoutMaxCandidates(SETTINGS_DEFAULTS)).length, 1);
 
 const highConfidenceFlowOnly = buildEntry({
   packet_summary: { flow_only: true },

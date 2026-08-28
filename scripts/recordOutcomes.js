@@ -109,6 +109,7 @@ function emitOutcomeEnrichments(entry) {
         price_1h_pct: outcomes.price_1h_pct ?? null,
         price_4h_pct: outcomes.price_4h_pct ?? null,
         price_24h_pct: outcomes.price_24h_pct ?? null,
+        price_72h_pct: outcomes.price_72h_pct ?? null,
         price_7d_pct: outcomes.price_7d_pct ?? null,
         e3d_thesis_confirmed: outcomes.e3d_thesis_confirmed ?? null,
         e3d_confirmation_score: outcomes.e3d_confirmation_score ?? null,
@@ -171,8 +172,12 @@ async function main() {
   let updatedCount = 0;
 
   for (const entry of entries) {
-    if (entry?.outcomes?.recorded_at) {
-      // Entry already price-recorded — but may still need enrichment or rejection events
+    const cycleTs = new Date(entry?.cycle_ts || 0).getTime();
+    const ageSec = (nowMs - cycleTs) / 1000;
+    const outcomes = { ...(entry.outcomes || {}) };
+    const horizonsComplete = outcomes.price_24h_pct != null && outcomes.price_72h_pct != null && outcomes.price_7d_pct != null;
+
+    if (entry?.outcomes?.recorded_at && horizonsComplete) {
       if (!entry.outcomes.enrichment_written) {
         const n = emitOutcomeEnrichments(entry);
         if (n > 0) {
@@ -192,18 +197,15 @@ async function main() {
       continue;
     }
 
-    const cycleTs = new Date(entry?.cycle_ts || 0).getTime();
-    const ageSec = (nowMs - cycleTs) / 1000;
     if (ageSec < 3600) continue; // not yet 1h old
 
     const tradedCandidates = (entry?.scout?.candidates || []).filter(c => c?.market_at_signal?.price_usd > 0 && c?.address);
     if (!tradedCandidates.length) {
-      entry.outcomes = { ...entry.outcomes, recorded_at: new Date().toISOString(), outcome_label: "neutral" };
+      entry.outcomes = { ...outcomes, recorded_at: new Date().toISOString(), outcome_label: "neutral" };
       updatedCount++;
       continue;
     }
 
-    // Fetch current prices for traded candidates
     const priceChanges = [];
     for (const c of tradedCandidates) {
       const currentPrice = fetchTokenPrice(c.address);
@@ -215,22 +217,21 @@ async function main() {
     if (!priceChanges.length) continue;
 
     const avgChange = priceChanges.reduce((a, b) => a + b, 0) / priceChanges.length;
-
-    const outcomes = { ...entry.outcomes };
     outcomes.recorded_at = new Date().toISOString();
 
     if (ageSec >= 3600  && outcomes.price_1h_pct  == null) outcomes.price_1h_pct  = avgChange;
     if (ageSec >= 14400 && outcomes.price_4h_pct  == null) outcomes.price_4h_pct  = avgChange;
     if (ageSec >= 86400 && outcomes.price_24h_pct == null) outcomes.price_24h_pct = avgChange;
+    if (ageSec >= 259200 && outcomes.price_72h_pct == null) outcomes.price_72h_pct = avgChange;
     if (ageSec >= 604800 && outcomes.price_7d_pct == null) outcomes.price_7d_pct  = avgChange;
 
     if (ageSec >= 14400 && outcomes.signal_detected_before_move == null) {
       outcomes.signal_detected_before_move = (outcomes.price_4h_pct ?? 0) > 10;
     }
 
-    const bestPct = outcomes.price_24h_pct ?? outcomes.price_4h_pct ?? outcomes.price_1h_pct;
-    if (bestPct != null) {
-      outcomes.outcome_label = bestPct > 5 ? "win" : bestPct < -5 ? "loss" : "neutral";
+    const scoredPct = outcomes.price_72h_pct ?? outcomes.price_24h_pct ?? outcomes.price_4h_pct ?? outcomes.price_1h_pct;
+    if (scoredPct != null) {
+      outcomes.outcome_label = scoredPct > 5 ? "win" : scoredPct < -5 ? "loss" : "neutral";
     } else {
       outcomes.outcome_label = "pending";
     }

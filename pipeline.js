@@ -26,6 +26,11 @@ import {
 import { fetchMapsContext } from "./scripts/mapsClient.js";
 import { buildMapsNavigatorPrecheck } from "./scripts/mapsHarvestPrecheck.js";
 import { applyMapsRouteScoreAdjustment, buildScoutMapsRoute } from "./scripts/mapsScoutRoute.js";
+import {
+  applyMandateScoutBias,
+  buildMandateTrace,
+  getActiveCapitalMandate
+} from "./scripts/capitalMandates.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -2779,6 +2784,8 @@ let _cycleMapsContext = null;
 let _cycleRegimePolicy = null;
 let _cycleSignalSnapshot = null;
 let _cycleArbitrageSignals = [];
+let _cycleActiveCapitalMandate = null;
+let _cycleActiveCapitalMandateTrace = null;
 // Story types actually returned by the E3D API this cycle — used to make coverage scoring fair.
 // Coverage only grades against types that were present in the data, not the full expected list.
 let _cycleAvailableStoryTypes = null;
@@ -4479,6 +4486,12 @@ function applyEvidenceMetadata(target, source = {}) {
   if (metadata.evidence_warnings.length) target.evidence_warnings = metadata.evidence_warnings;
   if (metadata.evidence_refs.length) target.evidence_refs = metadata.evidence_refs;
   if (metadata.evidence_summary) target.evidence_summary = deepClone(metadata.evidence_summary);
+  const mandateTrace = source.mandate_trace || source.capital_mandate || source.paper_trade_ticket?.mandate_trace || null;
+  if (mandateTrace?.mandate_id && mandateTrace?.correlation_id) {
+    target.mandate_id = mandateTrace.mandate_id;
+    target.correlation_id = mandateTrace.correlation_id;
+    target.mandate_trace = deepClone(mandateTrace);
+  }
   return target;
 }
 
@@ -7917,7 +7930,9 @@ function attachPaperOrderLifecycle(trade, options = {}) {
       pipeline_run_id: context.pipeline_run_id || null,
       cycle_id: context.cycle_id || null,
       cycle_index: context.cycle_index ?? null,
-      token_risk_scan_id: trade.token_risk_scan_id || trade.paper_trade_ticket?.token_risk_scan_id || null
+      token_risk_scan_id: trade.token_risk_scan_id || trade.paper_trade_ticket?.token_risk_scan_id || null,
+      mandate_id: trade.mandate_id || trade.paper_trade_ticket?.mandate_id || null,
+      correlation_id: trade.correlation_id || trade.paper_trade_ticket?.correlation_id || null
     },
     evidence_packet_id: trade.evidence_packet_id || trade.paper_trade_ticket?.evidence_packet_id || null,
     evidence_summary: trade.evidence_summary || trade.paper_trade_ticket?.evidence_summary || null,
@@ -8429,7 +8444,8 @@ function executeRotation(portfolio, action, review = null) {
     evaluated_at: evaluationTs,
     portfolio,
     intent: buildBuyRiskIntent(candidate, allocationUsd, "rotation"),
-    analytics: buildPortfolioRiskAnalytics(portfolio, evaluationTs)
+    analytics: buildPortfolioRiskAnalytics(portfolio, evaluationTs),
+    capital_mandate: _cycleActiveCapitalMandate
   });
   recordRiskEngineDecisionEvent(rotationRiskDecision, portfolio, getTrainingContext(), {
     candidate_id: candidate?.training_candidate_id || candidate?.token?.contract_address || candidate?.token?.symbol || null,
@@ -8437,6 +8453,9 @@ function executeRotation(portfolio, action, review = null) {
     trade_kind: "rotation"
   });
   if (rotationRiskDecision.decision === "block") return { sellTrade, buyTrade: null };
+  if (_cycleActiveCapitalMandateTrace) {
+    candidate.mandate_trace = _cycleActiveCapitalMandateTrace;
+  }
 
   const rotationTokenRiskScan = buildCandidateTokenRiskScan(candidate, portfolio, {
     evaluated_at: evaluationTs,
@@ -8782,6 +8801,27 @@ function executeTrendSleeve(portfolio, quantContext) {
     const allocationUsd = Math.min(portfolio.cash_usd, targetUsd - currentValue);
     if (allocationUsd < settings.min_trade_usd) continue;
     const candidate = buildTrendSleeveCandidate(vehicle, price);
+    if (_cycleActiveCapitalMandate) {
+      const evaluationTs = nowIso();
+      const trendRiskDecision = evaluateRiskDecision({
+        mode: "paper",
+        enforcement_mode: "enforced",
+        evaluated_at: evaluationTs,
+        portfolio,
+        intent: buildBuyRiskIntent(candidate, allocationUsd, "trend_overlay"),
+        analytics: buildPortfolioRiskAnalytics(portfolio, evaluationTs),
+        capital_mandate: _cycleActiveCapitalMandate
+      });
+      recordRiskEngineDecisionEvent(trendRiskDecision, portfolio, getTrainingContext(), {
+        candidate_id: candidate?.token?.contract_address || candidate?.token?.symbol || null,
+        proposed_allocation_usd: allocationUsd,
+        trade_kind: "trend_overlay"
+      });
+      if (trendRiskDecision.decision === "block") continue;
+      if (_cycleActiveCapitalMandateTrace) {
+        candidate.mandate_trace = _cycleActiveCapitalMandateTrace;
+      }
+    }
     const trade = openPosition(portfolio, candidate, allocationUsd, "trend_overlay:risk_on", {
       sleeve: "trend_overlay",
       strategyVersion: PAPER_ORDER_STRATEGY_VERSION
@@ -9575,11 +9615,18 @@ async function runCycle(runContext = {}) {
   _cycleRegimePolicy = null;
   _cycleSignalSnapshot = null;
   _cycleArbitrageSignals = [];
+  _cycleActiveCapitalMandate = null;
+  _cycleActiveCapitalMandateTrace = null;
   _cycleAvailableStoryTypes = null;
   _lastCognitiveState = null;
   _cycleScoutToolCalls = [];
 
   const portfolio = loadPortfolio();
+  const activeMandate = getActiveCapitalMandate();
+  const activeMandateTrace = buildMandateTrace(activeMandate);
+  _cycleActiveCapitalMandate = activeMandate;
+  _cycleActiveCapitalMandateTrace = activeMandateTrace;
+  if (activeMandateTrace) log("capital_mandate_active", activeMandateTrace);
   pruneCooldowns(portfolio);
   const trainingContext = {
     pipeline_run_id: runContext.pipeline_run_id || crypto.randomUUID(),
@@ -9705,10 +9752,10 @@ async function runCycle(runContext = {}) {
     // 1. SCOUT — pre-fetch E3D data, then call LLM directly (no tool loop needed)
     const scoutPayload = runScoutDirect(portfolio, portfolioIntelligence);
     validateScoutPayload(scoutPayload);
-    scoutPayload.candidates = filterScoutCandidatesForDesk(
+    scoutPayload.candidates = applyMandateScoutBias(filterScoutCandidatesForDesk(
       filterScoutCandidatesAgainstPortfolio(scoutPayload.candidates || [], portfolio),
       portfolio
-    ).map((candidate) => hydrateCandidateTradingMetrics(candidate, portfolio));
+    ).map((candidate) => hydrateCandidateTradingMetrics(candidate, portfolio)), activeMandate);
     log("scout", scoutPayload);
     log("agent_coverage", buildAgentCoverageLog("scout", scoutPayload));
     for (const candidate of scoutPayload.candidates || []) {
@@ -9915,7 +9962,8 @@ async function runCycle(runContext = {}) {
         evaluated_at: evaluationTs,
         portfolio,
         intent: buildBuyRiskIntent(item.action.candidate, allocationUsd, "buy"),
-        analytics: buildPortfolioRiskAnalytics(portfolio, evaluationTs)
+        analytics: buildPortfolioRiskAnalytics(portfolio, evaluationTs),
+        capital_mandate: activeMandate
       });
       recordRiskEngineDecisionEvent(riskDecision, portfolio, getTrainingContext(), {
         candidate_id: item.action.candidate?.training_candidate_id || item.action.candidate?.token?.contract_address || item.action.candidate?.token?.symbol || null,

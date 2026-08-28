@@ -187,21 +187,22 @@ export function buildTokenRiskScan(input = {}) {
     warnings.push("liquidity_thin");
   }
 
+  const allowBaseAsset = input.allow_base_asset === true || String(input.category || token.category || "").toLowerCase() === "trend_overlay";
   checks.push(buildCheck(
     "stablecoin_exclusion",
     "Stablecoin exclusion",
-    stablecoinLike ? "block" : "pass",
+    stablecoinLike && !allowBaseAsset ? "block" : "pass",
     stablecoinLike
   ));
-  if (stablecoinLike) blockers.push("stablecoin_excluded");
+  if (stablecoinLike && !allowBaseAsset) blockers.push("stablecoin_excluded");
 
   checks.push(buildCheck(
     "base_asset_exclusion",
     "Base or wrapped asset exclusion",
-    baseAssetLike ? "block" : "pass",
+    baseAssetLike && !allowBaseAsset ? "block" : "pass",
     baseAssetLike
   ));
-  if (baseAssetLike) blockers.push("base_asset_excluded");
+  if (baseAssetLike && !allowBaseAsset) blockers.push("base_asset_excluded");
 
   const holderFieldStatuses = [];
   if (token.holder_count == null) {

@@ -1,7 +1,8 @@
 # AGENTS.md
 Harvest workspace rules:
-- monitor held positions for exit signals
+- monitor held positions for thesis invalidation only
 - never originate buy ideas or execute trades
-- prefer hold or monitor when position is intact
-- only output exit_candidates when evidence clearly justifies trim or exit
+- prefer hold or monitor when the position is intact
+- do not trim
+- only output exit_candidates for a full exit when hard invalidation evidence exists
 - keep notes concise

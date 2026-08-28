@@ -4,11 +4,18 @@
 // All calls are synchronous curl, matching the pipeline.js pattern.
 
 import { execFileSync } from "child_process";
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname  = path.dirname(__filename);
 
 const DEXSCREENER_BASE   = "https://api.dexscreener.com/latest/dex";
 const COINGECKO_URL      = "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum&vs_currencies=usd&include_24hr_change=true";
 const FEAR_GREED_URL     = "https://api.alternative.me/fng/?limit=1";
 const BINANCE_PREMIUM_URL = "https://fapi.binance.com/fapi/v1/premiumIndex";
+const REGULATORY_FLAG_PATH = path.join(__dirname, "state", "regulatory-flag.json");
 
 // Tokens known to trade as Binance USDT perpetuals.
 // ETH-wrapped variants map to the ETH perp since they track it closely.
@@ -164,6 +171,145 @@ function fetchCryptoMacro() {
   };
 }
 
+function summarizeTrendFromPrices(prices) {
+  const pts = (Array.isArray(prices) ? prices : [])
+    .map((row) => Number(Array.isArray(row) ? row[1] : row))
+    .filter((n) => Number.isFinite(n) && n > 0);
+  if (pts.length < 10) return null;
+  const window = pts.slice(-21);
+  const first = window[0];
+  const last = window[window.length - 1];
+  const sma = window.reduce((sum, n) => sum + n, 0) / window.length;
+  const return20dPct = ((last / first) - 1) * 100;
+  const absRets = [];
+  for (let i = 1; i < window.length; i += 1) {
+    absRets.push(Math.abs(window[i] / window[i - 1] - 1));
+  }
+  const atrPct = absRets.length ? (absRets.reduce((sum, n) => sum + n, 0) / absRets.length) * 100 : 0;
+  const signal = return20dPct > 0 && last >= sma ? "long" : "flat";
+  return {
+    price: last,
+    sma20: Number(sma.toFixed(2)),
+    return_20d_pct: Number(return20dPct.toFixed(3)),
+    atr_pct: Number(atrPct.toFixed(3)),
+    signal,
+    samples: window.length
+  };
+}
+
+export function fetchAssetTrend(coinId) {
+  const url = `https://api.coingecko.com/api/v3/coins/${encodeURIComponent(coinId)}/market_chart?vs_currency=usd&days=21&interval=daily`;
+  const data = curlJson(url, 12);
+  return summarizeTrendFromPrices(data?.prices);
+}
+
+export function buildBookRegimeFromTrends(btcTrend, ethTrend, fallback24hPct = 0) {
+  if (btcTrend?.signal === "long") return "risk_on";
+  if (btcTrend && Number(btcTrend.return_20d_pct) < -5) return "risk_off";
+  if (!btcTrend && fallback24hPct < -4) return "risk_off";
+  if (!btcTrend && fallback24hPct > 4) return "risk_on";
+  return "neutral";
+}
+
+// ── Cross-asset macro (DXY + equity index) ──────────────────────────────────
+// Adds dollar-strength and broad-equity readings alongside the crypto-native macro
+// above. Same never-throw/null-on-failure contract as fetchFearAndGreed/fetchCryptoMacro.
+
+const YAHOO_QUOTE_BASE = "https://query1.finance.yahoo.com/v8/finance/chart";
+
+// Yahoo's unofficial quote endpoint. Free, no key, but undocumented and occasionally
+// rate-limited/restructured — treated as primary with a stooq fallback below.
+function fetchYahooQuote(ticker) {
+  const url = `${YAHOO_QUOTE_BASE}/${encodeURIComponent(ticker)}`;
+  const data = curlJson(url, 10);
+  const meta = data?.chart?.result?.[0]?.meta;
+  if (!meta || typeof meta.regularMarketPrice !== "number") return null;
+
+  const prevClose = typeof meta.previousClose === "number" ? meta.previousClose : meta.chartPreviousClose;
+  if (typeof prevClose !== "number" || prevClose === 0) return null;
+
+  // Yahoo reports the current regular-session window in currentTradingPeriod — use it
+  // directly rather than a fuzzy staleness heuristic to determine whether the instrument
+  // is trading right now (equities close nights/weekends/holidays; crypto never does).
+  const nowSec = Math.floor(Date.now() / 1000);
+  const regular = meta.currentTradingPeriod?.regular;
+  const marketOpen = !!(regular && nowSec >= regular.start && nowSec <= regular.end);
+
+  return {
+    value: meta.regularMarketPrice,
+    change_24h_pct: +(((meta.regularMarketPrice - prevClose) / prevClose) * 100).toFixed(3),
+    as_of: meta.regularMarketTime ? new Date(meta.regularMarketTime * 1000).toISOString() : null,
+    market_open: marketOpen,
+    source: "yahoo",
+  };
+}
+
+// Fallback: stooq's free daily CSV ("Date,Open,High,Low,Close,Volume"). EOD granularity
+// only — known to be intermittently blocked by a bot-verification challenge, so this is
+// best-effort; a failure here just means the caller falls back to null, same as any other
+// quant data source in this file.
+function fetchStooqDailyChange(stooqSymbol) {
+  try {
+    const text = execFileSync("curl", [
+      "-sf", "--max-time", "10", "-L", "-A", "e3d-trading-floor/1.0",
+      `https://stooq.com/q/d/l/?s=${encodeURIComponent(stooqSymbol)}&i=d`,
+    ], { encoding: "utf8", maxBuffer: 1024 * 1024, stdio: ["ignore", "pipe", "pipe"] });
+    const lines = (text || "").trim().split("\n").filter(Boolean);
+    if (lines.length < 3) return null; // header + at least 2 data rows needed
+    const rows = lines.slice(1).map((l) => l.split(","));
+    const last = rows[rows.length - 1];
+    const prev = rows[rows.length - 2];
+    const lastClose = parseFloat(last[4]);
+    const prevClose = parseFloat(prev[4]);
+    if (!Number.isFinite(lastClose) || !Number.isFinite(prevClose) || prevClose === 0) return null;
+    return {
+      value: lastClose,
+      change_24h_pct: +(((lastClose - prevClose) / prevClose) * 100).toFixed(3),
+      as_of: last[0] ? new Date(last[0]).toISOString() : null,
+      market_open: false, // stooq is EOD-only — never treated as a live session read
+      source: "stooq",
+    };
+  } catch {
+    return null;
+  }
+}
+
+// DXY proxy (US Dollar Index). Yahoo ticker DX-Y.NYB, stooq fallback symbol dx.f.
+export function fetchDollarIndex() {
+  return fetchYahooQuote("DX-Y.NYB") || fetchStooqDailyChange("dx.f");
+}
+
+// Broad equity/tech index (Nasdaq-100). Yahoo ticker ^NDX, stooq fallback symbol ^ndx.
+export function fetchEquityIndex() {
+  return fetchYahooQuote("^NDX") || fetchStooqDailyChange("^ndx");
+}
+
+// ── Manual regulatory/political-event flag ──────────────────────────────────
+// A coarse, operator-set override for event-driven regulatory/political catalysts
+// (legislation progress, SEC actions, ETF approvals, etc.) that the pipeline has no
+// automated visibility into — deliberately NOT automated (no news feed, no keyword
+// scanning). Set/cleared only via `scripts/setRegulatoryFlag.js`, run by a human; never
+// written by the pipeline or any LLM agent. Expires on its own so a flag set for one
+// event can't silently keep biasing the system days later if nobody clears it.
+const VALID_REGULATORY_STANCES = new Set(["risk_on", "risk_off"]);
+
+export function readRegulatoryFlag() {
+  try {
+    const text = fs.readFileSync(REGULATORY_FLAG_PATH, "utf8");
+    const flag = JSON.parse(text);
+    if (!flag || !VALID_REGULATORY_STANCES.has(flag.stance)) return null;
+    if (!flag.expires_at || new Date(flag.expires_at).getTime() <= Date.now()) return null;
+    return {
+      stance: flag.stance,
+      reason: typeof flag.reason === "string" ? flag.reason.slice(0, 200) : null,
+      set_at: flag.set_at || null,
+      expires_at: flag.expires_at,
+    };
+  } catch {
+    return null; // missing file, bad/malformed JSON, expired, or any other error
+  }
+}
+
 // ── Binance funding rates ─────────────────────────────────────────────────────
 
 // Fetches ALL perpetual mark prices + funding rates in one call.
@@ -230,26 +376,45 @@ export function buildCycleQuantContext(portfolio) {
     if (s) tokenFlow[addr] = s;
   }
 
-  // 2. Macro — two small calls (Fear&Greed + CoinGecko)
-  const fearGreed = fetchFearAndGreed();
-  const macro     = fetchCryptoMacro();
+  // 2. Macro — two small calls (Fear&Greed + CoinGecko), plus cross-asset (DXY + Nasdaq-100)
+  const fearGreed   = fetchFearAndGreed();
+  const macro       = fetchCryptoMacro();
+  const btcTrend    = fetchAssetTrend("bitcoin");
+  const ethTrend    = fetchAssetTrend("ethereum");
+  const dxy         = fetchDollarIndex();
+  const equityIndex = fetchEquityIndex();
+  const regulatory  = readRegulatoryFlag();
+  const bookRegime  = buildBookRegimeFromTrends(btcTrend, ethTrend, macro?.btc_24h_pct);
 
   // 3. Binance funding — one call for all perps, then filter to held symbols
   const allFunding   = fetchAllBinanceFunding();
   const fundingRates = lookupFundingRates(heldSymbols, allFunding);
 
-  // 4. Unified regime combining fear/greed + BTC momentum
-  const fgValue = fearGreed?.value   ?? 50;
-  const btc24h  = macro?.btc_24h_pct ?? 0;
-  const regime =
-    (fgValue >= 80 || btc24h >  10) ? "extreme_greed" :
-    (fgValue >= 60 || btc24h >   4) ? "greed"         :
-    (fgValue <= 20 || btc24h <  -8) ? "extreme_fear"  :
-    (fgValue <= 35 || btc24h <  -4) ? "fear"          :
-                                      "neutral";
+  // 4. Unified regime combining fear/greed + BTC momentum + cross-asset (DXY/equity) +
+  // the manual regulatory flag. Cross-asset conditions only fire when change_24h_pct is
+  // present — a failed fetch (null) is excluded from the blend rather than treated as
+  // "0% change" (neutral), which would silently mask a data outage as a calm market. A
+  // closed-market reading (e.g. a Friday equity close carried through the weekend) is
+  // still a valid, intentional signal here — it's the last real session move, not a stale
+  // value — so market_open does not gate this blend; it's surfaced separately (prompt/log)
+  // for observability only.
+  const fgValue      = fearGreed?.value   ?? 50;
+  const btc24h       = macro?.btc_24h_pct ?? 0;
+  const dxySpike      = dxy?.change_24h_pct != null && dxy.change_24h_pct > 0.5;      // strong dollar day
+  const equitySelloff = equityIndex?.change_24h_pct != null && equityIndex.change_24h_pct < -2;
+  const equityRally   = equityIndex?.change_24h_pct != null && equityIndex.change_24h_pct > 2;
+  const regulatoryRiskOn  = regulatory?.stance === "risk_on";
+  const regulatoryRiskOff = regulatory?.stance === "risk_off";
 
-  const newPositionsOk = fgValue < 75 && btc24h > -4;
-  const tightenStops   = fgValue > 75 || btc24h < -5;
+  const regime =
+    (fgValue >= 80 || btc24h >  10 || equityRally || regulatoryRiskOn)    ? "extreme_greed" :
+    (fgValue >= 60 || btc24h >   4)                                      ? "greed"         :
+    (fgValue <= 20 || btc24h <  -8 || equitySelloff || regulatoryRiskOff) ? "extreme_fear"  :
+    (fgValue <= 35 || btc24h <  -4 || dxySpike)                          ? "fear"          :
+                                                                            "neutral";
+
+  const newPositionsOk = bookRegime !== "risk_off" && fgValue < 80 && btc24h > -5 && !equitySelloff && !regulatoryRiskOff;
+  const tightenStops   = bookRegime === "risk_off" || fgValue > 80 || btc24h < -8 || dxySpike || equitySelloff || regulatoryRiskOff;
 
   return {
     fetched_at: new Date().toISOString(),
@@ -257,6 +422,12 @@ export function buildCycleQuantContext(portfolio) {
       fear_greed:       fearGreed,
       btc:              macro ? { price: macro.btc_price, change_24h_pct: macro.btc_24h_pct } : null,
       eth:              macro ? { price: macro.eth_price, change_24h_pct: macro.eth_24h_pct, outperforming_btc: macro.eth_outperforming_btc } : null,
+      btc_trend:        btcTrend,
+      eth_trend:        ethTrend,
+      book_regime:      bookRegime,
+      dxy:              dxy ? { value: dxy.value, change_24h_pct: dxy.change_24h_pct, source: dxy.source } : null,
+      equity_index:     equityIndex ? { value: equityIndex.value, change_24h_pct: equityIndex.change_24h_pct, source: equityIndex.source } : null,
+      regulatory:       regulatory ? { stance: regulatory.stance, reason: regulatory.reason, expires_at: regulatory.expires_at } : null,
       regime,
       new_positions_ok: newPositionsOk,
       tighten_stops:    tightenStops,

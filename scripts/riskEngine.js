@@ -1,19 +1,24 @@
 import crypto from "crypto";
 import { evaluateLiveCapabilityStatus, LIVE_CAPABLE_MODES } from "./custodyControls.js";
 import { buildOperatorActionRecord, buildOperatorPermissionPolicy } from "./auditTrail.js";
+import {
+  buildMandateTrace,
+  currentMandateStatus,
+  validateMandateConstraintsAgainstPolicy
+} from "./capitalMandates.js";
 
 export const RISK_ENGINE_SCHEMA_VERSION = "1.0";
 export const RISK_POLICY_VERSION = "risk-policy-v1";
 
 export const DEFAULT_RISK_POLICY = Object.freeze({
   daily_realized_loss_limit_usd: 2500,
-  daily_equity_drawdown_limit_pct: 0.05,
+  daily_equity_drawdown_limit_pct: 0.12,
   rolling_24h_loss_limit_usd: 3500,
-  max_position_size_pct: 0.10,
-  max_token_exposure_pct: 0.10,
-  max_category_exposure_pct: 0.30,
-  max_strategy_exposure_pct: 0.50,
-  max_open_positions: 8,
+  max_position_size_pct: 0.12,
+  max_token_exposure_pct: 0.12,
+  max_category_exposure_pct: 0.70,
+  max_strategy_exposure_pct: 0.75,
+  max_open_positions: 6,
   max_daily_turnover_usd: 250000,
   cooldown_after_stop_loss_hours: 12,
   token_repeated_loss_stop_count: 2,
@@ -318,6 +323,13 @@ function addLimit(checkedLimits, blockers, warnings, limit) {
   else if (limit.status === "warn") warnings.push(limit.key);
 }
 
+function mandateList(value, lowercase = false) {
+  return [...new Set((Array.isArray(value) ? value : [])
+    .map((item) => cleanText(item))
+    .filter(Boolean)
+    .map((item) => lowercase ? item.toLowerCase() : item))];
+}
+
 export function resolveRiskPolicy(portfolio = {}, overrides = null) {
   const settings = portfolio?.settings || {};
   const embedded = settings?.risk_engine || {};
@@ -403,6 +415,8 @@ export function evaluateRiskDecision(input = {}) {
   const warnings = [];
   const checked_limits = [];
   const isBuy = side === "buy";
+  const capitalMandate = currentMandateStatus(input.capital_mandate) === "active" ? input.capital_mandate : null;
+  const mandateTrace = buildMandateTrace(capitalMandate);
   const mode = cleanText(input?.mode || "paper");
   const riskOverrideRequested = Boolean(input.policy);
   const riskOverridePermission = riskOverrideRequested ? buildOperatorPermissionPolicy({
@@ -603,6 +617,98 @@ export function evaluateRiskDecision(input = {}) {
     isBuy && policy.market_risk_off_blocks_new_buys && marketRegime === "risk_off" ? "block" : "pass"
   ));
 
+  if (capitalMandate) {
+    const constraints = capitalMandate.constraints || {};
+    const constraintValidation = validateMandateConstraintsAgainstPolicy(constraints, policy);
+    addLimit(checked_limits, blockers, warnings, buildCheckedLimit(
+      "mandate_constraint_validation",
+      "Capital mandate constraints tighten Risk policy",
+      { must_not_relax_risk_policy: true },
+      {
+        mandate_id: capitalMandate.mandate_id,
+        correlation_id: capitalMandate.correlation_id,
+        errors: constraintValidation.errors
+      },
+      constraintValidation.valid ? "pass" : "block"
+    ));
+
+    const allowedSymbols = mandateList(constraints.allowed_symbols).map((value) => value.toLowerCase());
+    const excludedSymbols = mandateList(constraints.excluded_symbols).map((value) => value.toLowerCase());
+    const allowedAddresses = mandateList(constraints.allowed_contract_addresses, true);
+    const excludedAddresses = mandateList(constraints.excluded_contract_addresses, true);
+    const allowedCategories = mandateList(constraints.allowed_categories).map((value) => value.toLowerCase());
+    const excludedCategories = mandateList(constraints.excluded_categories).map((value) => value.toLowerCase());
+    const symbolKey = String(symbol || "").toLowerCase();
+    const categoryKey = String(category || "").toLowerCase();
+
+    addLimit(checked_limits, blockers, warnings, buildCheckedLimit(
+      "mandate_allowed_universe",
+      "Capital mandate allowed universe",
+      {
+        allowed_symbols: allowedSymbols,
+        allowed_contract_addresses: allowedAddresses,
+        allowed_categories: allowedCategories
+      },
+      { symbol, contract_address: contractAddress, category },
+      isBuy && (
+        (allowedSymbols.length > 0 && !allowedSymbols.includes(symbolKey))
+        || (allowedAddresses.length > 0 && !allowedAddresses.includes(contractAddress))
+        || (allowedCategories.length > 0 && !allowedCategories.includes(categoryKey))
+      ) ? "block" : "pass"
+    ));
+    addLimit(checked_limits, blockers, warnings, buildCheckedLimit(
+      "mandate_excluded_universe",
+      "Capital mandate excluded universe",
+      {
+        excluded_symbols: excludedSymbols,
+        excluded_contract_addresses: excludedAddresses,
+        excluded_categories: excludedCategories
+      },
+      { symbol, contract_address: contractAddress, category },
+      isBuy && (
+        (symbolKey && excludedSymbols.includes(symbolKey))
+        || (contractAddress && excludedAddresses.includes(contractAddress))
+        || (categoryKey && excludedCategories.includes(categoryKey))
+      ) ? "block" : "pass"
+    ));
+
+    const addMandateMax = (key, label, limitField, actualField, actualValue, limitValue) => {
+      if (limitValue == null) return;
+      const limitNum = toNum(limitValue, NaN);
+      if (!Number.isFinite(limitNum)) return;
+      addLimit(checked_limits, blockers, warnings, buildCheckedLimit(
+        key,
+        label,
+        { [limitField]: limitNum, mandate_id: capitalMandate.mandate_id },
+        { [actualField]: actualValue },
+        isBuy && actualValue > limitNum ? "block" : "pass"
+      ));
+    };
+    const addMandateMin = (key, label, limitField, actualField, actualValue, limitValue) => {
+      if (limitValue == null) return;
+      const limitNum = toNum(limitValue, NaN);
+      if (!Number.isFinite(limitNum)) return;
+      addLimit(checked_limits, blockers, warnings, buildCheckedLimit(
+        key,
+        label,
+        { [limitField]: limitNum, mandate_id: capitalMandate.mandate_id },
+        { [actualField]: actualValue },
+        isBuy && actualValue > 0 && actualValue < limitNum ? "block" : "pass"
+      ));
+    };
+
+    addMandateMax("mandate_max_trade_notional", "Capital mandate max trade notional", "max_trade_notional_usd", "requested_notional_usd", requestedNotionalUsd, constraints.max_trade_notional_usd);
+    addMandateMax("mandate_max_position_size", "Capital mandate max position size", "max_position_size_pct", "projected_position_size_pct", equityUsd > 0 ? round(projectedPositionValueUsd / equityUsd, 6) : 0, constraints.max_position_size_pct);
+    addMandateMax("mandate_max_token_exposure", "Capital mandate max token exposure", "max_token_exposure_pct", "projected_token_exposure_pct", equityUsd > 0 ? round(projectedTokenExposureUsd / equityUsd, 6) : 0, constraints.max_token_exposure_pct);
+    addMandateMax("mandate_max_category_exposure", "Capital mandate max category exposure", "max_category_exposure_pct", "projected_category_exposure_pct", equityUsd > 0 ? round(projectedCategoryExposureUsd / equityUsd, 6) : 0, constraints.max_category_exposure_pct);
+    addMandateMax("mandate_max_strategy_exposure", "Capital mandate max strategy exposure", "max_strategy_exposure_pct", "projected_strategy_exposure_pct", equityUsd > 0 ? round(projectedStrategyExposureUsd / equityUsd, 6) : 0, constraints.max_strategy_exposure_pct);
+    addMandateMax("mandate_max_open_positions", "Capital mandate max open positions", "max_open_positions", "projected_open_positions", projectedOpenPositions, constraints.max_open_positions);
+    addMandateMax("mandate_max_daily_turnover", "Capital mandate max daily turnover", "max_daily_turnover_usd", "projected_daily_turnover_usd", projectedDailyTurnoverUsd, constraints.max_daily_turnover_usd);
+    addMandateMin("mandate_min_liquidity", "Capital mandate minimum liquidity", "min_liquidity_usd", "liquidity_usd", liquidityUsd, constraints.min_liquidity_usd);
+    addMandateMax("mandate_max_spread", "Capital mandate maximum spread", "max_spread_bps", "spread_bps", spreadBps, constraints.max_spread_bps);
+    addMandateMax("mandate_max_slippage", "Capital mandate maximum slippage", "max_slippage_bps", "slippage_bps", slippageBps, constraints.max_slippage_bps);
+  }
+
   const inputSnapshot = {
     policy_version: RISK_POLICY_VERSION,
     mode,
@@ -618,6 +724,7 @@ export function evaluateRiskDecision(input = {}) {
     evidence_ref_count: evidenceRefCount,
     evidence_blockers: evidenceBlockers,
     evidence_warnings: evidenceWarnings,
+    capital_mandate: mandateTrace,
     requested_notional_usd: requestedNotionalUsd,
     liquidity_usd: liquidityUsd,
     spread_bps: spreadBps,
@@ -683,10 +790,12 @@ export function evaluateRiskDecision(input = {}) {
     evidence_ref_count: evidenceRefCount,
     evidence_blockers: evidenceBlockers,
     evidence_warnings: evidenceWarnings,
+    capital_mandate: mandateTrace,
     requested_notional_usd: requestedNotionalUsd,
     requested_quantity: round(toNum(intent?.requested_quantity, 0), 8),
     live_submission_enabled: false,
     live_submission_attempted: false,
+    capital_mandate: mandateTrace,
     live_capability: liveCapability,
     risk_override: riskOverrideRecord,
     operator_permission: riskOverridePermission,

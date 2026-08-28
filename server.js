@@ -17,6 +17,11 @@ import { evaluateLiveCapabilityStatus } from "./scripts/custodyControls.js";
 import { generateOperationsMonitorReport } from "./scripts/operationsMonitor.js";
 import { resolveRiskPolicy } from "./scripts/riskEngine.js";
 import { buildOperatorPermissionPolicy, readOperatorActionRecords, recordOperatorAction } from "./scripts/auditTrail.js";
+import {
+  getActiveCapitalMandate,
+  revokeCapitalMandate,
+  submitCapitalMandate
+} from "./scripts/capitalMandates.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -59,12 +64,11 @@ const TRADE_REVIEWS_LOG = path.join(LOG_DIR, "trade-reviews.jsonl");
 const RUN_LEDGER_LOG = path.join(LOG_DIR, "run-ledger.jsonl");
 // Trading no longer runs as this server's own continuous --loop child (see
 // AUTO_START_PIPELINE in com.e3d.pipeline.plist) — it runs via a shared-LLM windowed
-// scheduler (ai.e3d.qwen-adapter-window-runner) that invokes `pipeline.js --once` during
-// a ~16-minute trading window once per hour, rotating with maps/story windows for the
-// single-worker LLM. A cycle can legitimately be up to ~1h + its own runtime apart from
-// the previous one, so treat anything within 90 minutes of the last completed cycle as
+// scheduler (ai.e3d.qwen-adapter-window-runner) that invokes `pipeline.js --once`
+// four times a day (00/06/12/18 local), rotating with maps/story windows for the
+// single-worker LLM. Treat anything within 7 hours of the last completed cycle as
 // still "running" even with no locally-tracked child process.
-const PIPELINE_CYCLE_STALENESS_MS = 90 * 60 * 1000;
+const PIPELINE_CYCLE_STALENESS_MS = 7 * 60 * 60 * 1000;
 const DASHBOARD_HEARTBEAT_FILE = path.join(LOG_DIR, "dashboard-heartbeat.json");
 const RETRAINING_READINESS_FILE = path.join(REPORTS_DIR, "retraining-readiness.json");
 const MONGO_CONTAINER_NAME = process.env.E3D_MONGO_CONTAINER || "e3d-mongo";
@@ -1899,7 +1903,7 @@ function stopPipelineProcess(signal = "SIGTERM") {
   return true;
 }
 
-function startPipelineProcess(intervalSeconds = 300) {
+function startPipelineProcess(intervalSeconds = 21600) {
   // Stop any currently managed process
   if (pipelineProcess) stopPipelineProcess();
 
@@ -1911,7 +1915,7 @@ function startPipelineProcess(intervalSeconds = 300) {
   clearPidFile();
   clearInterval(_recoveryPollTimer);
 
-  const safeIntervalSeconds = Math.max(1, Number(intervalSeconds) || 300);
+  const safeIntervalSeconds = Math.max(1, Number(intervalSeconds) || 21600);
 
   // Redirect pipeline stdout/stderr to log files so the process outlives the server.
   const outFd = fs.openSync(PIPELINE_STDOUT_LOG, "a");
@@ -2413,7 +2417,7 @@ async function handleRequest(req, res) {
     res.writeHead(204, {
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "GET,POST,PUT,PATCH,DELETE,OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Requested-With",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Requested-With, Idempotency-Key",
       "Access-Control-Max-Age": "86400"
     });
     res.end();
@@ -2529,9 +2533,64 @@ async function handleRequest(req, res) {
     return;
   }
 
+  if (url.pathname === "/api/mandates/capital" && req.method === "GET") {
+    sendJson(res, 200, {
+      ok: true,
+      active_mandate: getActiveCapitalMandate()
+    });
+    return;
+  }
+
+  if (url.pathname === "/api/mandates/capital" && req.method === "POST") {
+    const body = await readRequestJson();
+    const mandate = body.capital_mandate && typeof body.capital_mandate === "object"
+      ? body.capital_mandate
+      : body;
+    try {
+      const portfolio = readJsonFile(PORTFOLIO_FILE, DEFAULT_PORTFOLIO_STATE);
+      const ack = submitCapitalMandate(mandate, {
+        riskPolicy: resolveRiskPolicy(portfolio)
+      });
+      sendJson(res, 200, {
+        ok: true,
+        endpoint: "/api/mandates/capital",
+        ...ack
+      });
+    } catch (err) {
+      sendJson(res, err?.statusCode || 400, {
+        ok: false,
+        error: err?.message || "CAPITAL_MANDATE_REJECTED",
+        details: err?.details || []
+      });
+    }
+    return;
+  }
+
+  if (url.pathname.startsWith("/api/mandates/capital/") && url.pathname.endsWith("/revoke") && req.method === "POST") {
+    const mandateId = decodeURIComponent(url.pathname.slice("/api/mandates/capital/".length, -"/revoke".length)).trim();
+    try {
+      const body = await readRequestJson();
+      const ack = revokeCapitalMandate(mandateId, {
+        revokedAt: body.revoked_at || new Date().toISOString()
+      });
+      sendJson(res, 200, {
+        ok: true,
+        endpoint: `/api/mandates/capital/${encodeURIComponent(mandateId)}/revoke`,
+        ...ack
+      });
+    } catch (err) {
+      sendJson(res, err?.statusCode || 400, {
+        ok: false,
+        error: err?.message || "CAPITAL_MANDATE_REVOKE_FAILED",
+        details: err?.details || []
+      });
+    }
+    return;
+  }
+
   if (url.pathname === "/api/pipeline/start" && req.method === "POST") {
     const body = await readRequestJson();
-    const intervalSeconds = body.interval_seconds ?? body.intervalSeconds ?? 300;
+    const intervalSeconds = body.interval_seconds ?? body.intervalSeconds ?? 21600;
     const operator = operatorContextFromBody(body, "dashboard pipeline start request");
     recordOperatorAction({
       action_type: "pipeline_start",
@@ -2942,7 +3001,7 @@ if (IS_MAIN_MODULE) {
   if (!recovered && process.env.AUTO_START_PIPELINE !== "false") {
     // No surviving pipeline child to reattach to — spawn a fresh one so a
     // server restart doesn't leave the cycle loop dead.
-    const intervalSeconds = Number(process.env.AUTO_START_PIPELINE_INTERVAL_SECONDS) || 300;
+    const intervalSeconds = Number(process.env.AUTO_START_PIPELINE_INTERVAL_SECONDS) || 21600;
     console.log(`[server] No pipeline recovered — auto-starting (interval ${intervalSeconds}s)`);
     startPipelineProcess(intervalSeconds);
   }

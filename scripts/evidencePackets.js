@@ -3,7 +3,7 @@ import crypto from "crypto";
 export const EVIDENCE_PACKET_SCHEMA_VERSION = "1.0";
 export const EVIDENCE_PACKET_BUILDER_VERSION = "evidence-packets-v1";
 export const SCOUT_EVIDENCE_SHORTLIST_DEFAULT_LIMIT = 12;
-export const SCOUT_FLOW_ONLY_PER_CYCLE_LIMIT = 2;
+export const SCOUT_FLOW_ONLY_PER_CYCLE_LIMIT = 0;
 export const SCOUT_FLOW_ONLY_MIN_BUY_SELL_RATIO_1H = 3.5;
 export const SCOUT_FLOW_ONLY_MIN_LIQUIDITY_USD = 150000;
 export const SCOUT_FLOW_ONLY_MIN_VOLUME_24H_USD = 75000;

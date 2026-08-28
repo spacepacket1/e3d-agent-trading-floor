@@ -8,6 +8,19 @@ import { recordOperatorAction } from "./auditTrail.js";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const ROOT = path.resolve(__dirname, "..");
+
+// cron invokes this script through the /Users/mini/e3d-agent-trading-floor symlink using its
+// absolute path. __filename is realpath-resolved by the module loader, so a naive string compare
+// against process.argv[1] (the symlinked path) never matches and the report never runs.
+function isDirectlyInvoked() {
+  if (!process.argv[1]) return false;
+  try {
+    return fs.realpathSync(process.argv[1]) === __filename;
+  } catch {
+    return path.resolve(process.argv[1]) === __filename;
+  }
+}
+
 const PORTFOLIO_FILE = path.join(ROOT, "portfolio.json");
 const LOG_DIR = path.join(ROOT, "logs");
 const REPORTS_DIR = path.join(ROOT, "reports");
@@ -480,7 +493,7 @@ function parseArgs(argv) {
   };
 }
 
-if (process.argv[1] === __filename) {
+if (isDirectlyInvoked()) {
   const report = generateDailyPerformanceReport(parseArgs(process.argv.slice(2)));
   const w24 = report.windows["24h"].metrics;
   console.log(JSON.stringify({

@@ -1,0 +1,11 @@
+2026-05-20T07:19:46-0700	docs/e3d-action-outcome-export-feature-ticket.md	1	Exporter Skeleton	codex	gpt-5.4	exec	0	0
+2026-05-20T07:25:06-0700	docs/e3d-action-outcome-export-feature-ticket.md	2	Destination Tables	codex	gpt-5.4	exec	0	0
+2026-05-20T07:27:09-0700	docs/e3d-action-outcome-export-feature-ticket.md	3	Read Local Events	codex	gpt-5.4	exec	0	0
+2026-05-20T07:31:38-0700	docs/e3d-action-outcome-export-feature-ticket.md	4	Mapping	codex	gpt-5.4	exec	0	0
+2026-05-20T07:36:03-0700	docs/e3d-action-outcome-export-feature-ticket.md	5	Insert and Dedupe	codex	gpt-5.4	exec	0	0
+2026-05-20T07:38:58-0700	docs/e3d-action-outcome-export-feature-ticket.md	6	Manual Validation	codex	gpt-5.4	exec	0	0
+2026-05-20T07:41:15-0700	docs/e3d-action-outcome-export-feature-ticket.md	7	Cron	codex	gpt-5.4	exec	0	0
+2026-06-11T11:05:35-0700	docs/maps-navigation-integration-feature-ticket.md	1	Maps API Client	codex	gpt-5.4	exec	0	0
+2026-06-11T11:07:34-0700	docs/maps-navigation-integration-feature-ticket.md	2	Cycle Context Injection	codex	gpt-5.4	exec	0	0
+2026-06-11T11:12:26-0700	docs/maps-navigation-integration-feature-ticket.md	3	Harvest Pre-Check for Route Closures and Hazards	codex	gpt-5.4	exec	0	0
+2026-06-11T11:17:08-0700	docs/maps-navigation-integration-feature-ticket.md	4	FlowGraph Edge Check for Scout Route Validation	codex	gpt-5.4	exec	0	0

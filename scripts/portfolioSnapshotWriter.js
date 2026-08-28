@@ -10,6 +10,18 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const ROOT = path.resolve(__dirname, "..");
 
+// cron invokes this script through the /Users/mini/e3d-agent-trading-floor symlink using its
+// absolute path. __filename is realpath-resolved by the module loader, so a naive string compare
+// against process.argv[1] (the symlinked path) never matches and main() silently never runs.
+function isDirectlyInvoked() {
+  if (!process.argv[1]) return false;
+  try {
+    return fs.realpathSync(process.argv[1]) === __filename;
+  } catch {
+    return path.resolve(process.argv[1]) === __filename;
+  }
+}
+
 // Load .env before reading any process.env values (same pattern as e3dActionOutcomeExport.js)
 function loadDotEnv(root) {
   let raw;
@@ -251,7 +263,7 @@ function main() {
   log("snapshot inserted");
 }
 
-if (process.argv[1] === __filename) {
+if (isDirectlyInvoked()) {
   try {
     main();
   } catch (err) {
